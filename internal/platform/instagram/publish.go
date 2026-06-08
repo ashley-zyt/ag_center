@@ -230,7 +230,7 @@ func fillReelTitle(ctx context.Context, logger *logx.Logger, text string) error 
 	logger.Print("IG5", "查找标题输入框: "+sel)
 
 	for retry := 0; retry < 3; retry++ {
-		// 1. 检查节点是否存在并等待其可见
+		// 1. 等待并确保节点可见
 		var nodes []*cdp.Node
 		findCtx, cancelFind := context.WithTimeout(ctx, 5*time.Second)
 		err := chromedp.Run(findCtx,
@@ -238,14 +238,15 @@ func fillReelTitle(ctx context.Context, logger *logx.Logger, text string) error 
 			chromedp.Nodes(sel, &nodes, chromedp.ByQuery),
 		)
 		cancelFind()
+
 		if err != nil || len(nodes) == 0 {
-			logger.Print("IG5", "未找到或输入框不可见，等待后重试")
+			logger.Print("IG5", fmt.Sprintf("第 %d 次尝试：未找到输入框，等待后重试...", retry+1))
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		// 2. 点击并聚焦
-		logger.Print("IG5", "点击聚焦输入框")
+		// 2. 强行触发物理点击和聚焦（这是激活 Lexical 内部物理 Selection 的关键起点）
+		logger.Print("IG5", "触发真实物理点击与强聚焦")
 		clickCtx, cancelClick := context.WithTimeout(ctx, 5*time.Second)
 		err = chromedp.Run(clickCtx,
 			chromedp.Click(sel, chromedp.ByQuery),
@@ -253,74 +254,107 @@ func fillReelTitle(ctx context.Context, logger *logx.Logger, text string) error 
 		)
 		cancelClick()
 		if err != nil {
-			logger.Print("IG5", "聚焦失败: "+err.Error())
+			logger.Print("IG5", "物理聚焦失败，重试...")
+			continue
+		}
+		time.Sleep(300 * time.Millisecond)
+
+		// 3. 【破局核心】：绕过键盘模拟，使用 insertText 穿透 React 内存状态锁
+		logger.Print("IG5", "执行内核级文本插入与状态同步...")
+
+		// 通过全选（selectAll）清理可能存在的残余，然后用 insertText 一口气打穿 Lexical 的 onChange 监听器
+		injectJs := fmt.Sprintf(`(function(){
+			var el = document.querySelector(%q);
+			if(!el) return false;
+			
+			el.focus();
+			
+			// 1) 强行全选
+			document.execCommand('selectAll', false, null);
+			// 2) 调用最底层的受信任文本插入原语，这等同于人工完美的粘贴/键入，
+			// 它会强制引发 Lexical 的原生同步，将 text 写入 React 的内存变量中
+			var ok = document.execCommand('insertText', false, %q);
+			
+			// 3) 额外派发原生的合成事件，做双重保险
+			var ev = new InputEvent('input', { bubbles: true, cancelable: true });
+			el.dispatchEvent(ev);
+			
+			return ok;
+		})()`, sel, text)
+
+		var injectOk bool
+		injectCtx, cancelInject := context.WithTimeout(ctx, 8*time.Second)
+		_ = chromedp.Run(injectCtx, chromedp.Evaluate(injectJs, &injectOk))
+		cancelInject()
+
+		if !injectOk {
+			logger.Print("IG5", "内核级注入失败，准备重试流程")
 			time.Sleep(1 * time.Second)
 			continue
 		}
-		time.Sleep(500 * time.Millisecond)
 
-		logger.Print("IG5", "开始写入标题...")
+		// 4. 【最终脏状态强制合拢】
+		logger.Print("IG5", "注入成功，执行表单最终锁合拢")
+		shakeCtx, cancelShake := context.WithTimeout(ctx, 5*time.Second)
+		_ = chromedp.Run(shakeCtx,
+			chromedp.SendKeys(sel, " ", chromedp.ByQuery), // 敲空格
+			chromedp.Sleep(100*time.Millisecond),
+			chromedp.KeyEvent("\u0008"), // 退格删掉
+		)
+		cancelShake()
 
-		// 3. 核心改进：通过 JS 直接注入内容，并强制触发富文本框架所需的 input 事件
-		// 这种方式比模拟全键盘粘贴更快、更稳定，且不受剪贴板权限限制
-		fillCtx, cancelFill := context.WithTimeout(ctx, 8*time.Second)
-		var injectOk bool
-		injectJs := fmt.Sprintf(`(function(){
-            var el = document.querySelector(%q);
-            if(!el) return false;
-            
-            // 全选并清理旧内容（模拟 SelectAll）
-            el.focus();
-            document.execCommand('selectAll', false, null);
-            document.execCommand('delete', false, null);
+		// ==================== 【针对右键线索的全新修复代码】 ====================
+		logger.Print("IG5", "模拟右键副作用：强行触发失焦与全局事件刷新")
+		blurCtx, cancelBlur := context.WithTimeout(ctx, 5*time.Second)
 
-            // 注入新文本
-            el.innerText = %q;
+		// 方案 A: 模拟人类点击发帖窗口的空白头部/背景，或者直接调用 el.blur()
+		// 我们通过 JS 强行让输入框失去焦点，并触发 change 事件，逼迫 React 收拢状态
+		blurJs := fmt.Sprintf(`(function(){
+			var el = document.querySelector(%q);
+			if(el) {
+				el.blur(); // 强行失焦，这会触发表单的 OnBlur 提交状态
+				
+				// 模拟派发一个受信任的 change 事件
+				var changeEvent = new Event('change', { bubbles: true });
+				el.dispatchEvent(changeEvent);
+			}
+			// 顺便让整个 body 重新计算布局，模拟右键带来的 Reflow
+			document.body.offsetHeight; 
+		})()`, sel)
 
-            // 关键：触发 Input 事件，让 Instagram 的 React/Draft.js 状态更新
-            var event = new InputEvent('input', {
-                bubbles: true,
-                cancelable: true,
-                inputType: 'insertText',
-                data: %q
-            });
-            el.dispatchEvent(event);
-            return true;
-        })()`, sel, text, text)
+		_ = chromedp.Run(blurCtx,
+			chromedp.Evaluate(blurJs, nil),
+			// 方案 B: 物理点击一下页面的其他无关安全区域（例如发帖弹窗的标题栏，防止点错按钮）
+			// 请根据你页面实际情况，点一个空白的 div 标签，比如 `div[role="dialog"]` 的头部
+			chromedp.Click(`h1, div[role="presentation"]`, chromedp.ByQuery),
+		)
+		cancelBlur()
+		// =====================================================================
 
-		_ = chromedp.Run(fillCtx, chromedp.Evaluate(injectJs, &injectOk))
-		cancelFill()
+		// 给外部指纹浏览器和 IG 前端 3 秒钟完成异步防抖更新状态
+		time.Sleep(3 * time.Second)
 
-		// 4. 兜底方案：如果 JS 注入失败，使用 chromedp 原生模拟敲击键盘
-		if !injectOk {
-			logger.Print("IG5", "JS注入失败，尝试备用原生键盘输入")
-			keyCtx, cancelKey := context.WithTimeout(ctx, 10*time.Second)
-			_ = chromedp.Run(keyCtx, chromedp.SendKeys(sel, text, chromedp.ByQuery))
-			cancelKey()
-		}
-		time.Sleep(1 * time.Second)
-
-		// 5. 检查输入结果
+		// 5. 最终验证检查
 		var currentText string
 		checkJs := fmt.Sprintf(`(function(){
-            var el = document.querySelector(%q);
-            return el ? el.textContent.trim() : '';
-        })()`, sel)
+			var el = document.querySelector(%q);
+			return el ? (el.textContent || '').trim() : '';
+		})()`, sel)
 
 		checkCtx, cancelCheck := context.WithTimeout(ctx, 5*time.Second)
 		_ = chromedp.Run(checkCtx, chromedp.Evaluate(checkJs, &currentText))
 		cancelCheck()
 
 		if len(currentText) > 0 {
-			logger.Print("IG5", "标题已成功填写: "+currentText)
+			logger.Print("IG5", "标题已成功打穿 React 状态锁: "+currentText)
 			return nil
 		}
 
-		logger.Print("IG5", "检查未通过，文字可能未成功感知，重试...")
+		logger.Print("IG5", "状态校验未通过，准备重试...")
 		time.Sleep(1 * time.Second)
 	}
 
-	return errors.New("IG5 cannot fill title input after 3 retries")
+	return errors.New("IG5 内核注入文本流失败")
 }
 
 func clickCreatePost(ctx context.Context, logger *logx.Logger) error {

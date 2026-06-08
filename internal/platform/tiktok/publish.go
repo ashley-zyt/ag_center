@@ -122,7 +122,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		}
 	}
 	logger.Print("TT6", "已填写标题，等待点击发布")
-	time.Sleep(30 * time.Second)
+	time.Sleep(120 * time.Second)
 	if err := clickPost(tabCtx, logger); err != nil {
 		return fmt.Errorf("TT6 %v", err)
 	}
