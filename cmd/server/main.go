@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/platform/facebook"
 	"minimax_pro/internal/platform/instagram"
+	"minimax_pro/internal/platform/scraper"
 	"minimax_pro/internal/platform/tiktok"
 	"minimax_pro/internal/platform/twitter"
 	"minimax_pro/internal/platform/youtube"
@@ -84,6 +86,13 @@ const (
 	accountDefaultHost  = "127.0.0.1"
 	accountDefaultPort  = 25325
 	accountDefaultWaitS = 45
+
+	// accountPostsUpdateURL is the endpoint that receives the scraped posts
+	// for a single account. The exact URL will be provided later; it can be
+	// overridden per-request via the FetchPostsRequest.UpdateAPIURL field or
+	// via the POSTS_UPDATE_API_URL environment variable. When empty, the
+	// update call is skipped and only logged.
+	accountPostsUpdateURL = "http://47.89.235.227:3366/api/v1/post_stats"
 )
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -181,6 +190,62 @@ func updateAccountStatus(ctx context.Context, id int, statusDesp string) error {
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("update status http %d", resp.StatusCode)
 	}
+	return nil
+}
+
+// postsUpdatePayload is the JSON body sent to the per-account posts update
+// endpoint after a successful scrape. Field names are chosen to be flexible;
+// the real backend contract will be provided later.
+type postsUpdatePayload struct {
+	AccountID   int            `json:"account_id"`
+	ProfileID   int            `json:"profile_id"`
+	ProfileName string         `json:"profile_name"`
+	Platform    string         `json:"platform"`
+	SourceURL   string         `json:"source_url"`
+	Posts       []scraper.Post `json:"posts"`
+}
+
+// resolvePostsUpdateURL returns the URL used to push scraped posts for a
+// single account. Priority: explicit override > env var > compile-time const.
+func resolvePostsUpdateURL(override string) string {
+	if v := strings.TrimSpace(override); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("POSTS_UPDATE_API_URL")); v != "" {
+		return v
+	}
+	return accountPostsUpdateURL
+}
+
+// callPostsUpdateAPI POSTs the scraped posts for a single account to the
+// configured update endpoint. When the URL is empty, the call is skipped and
+// only a log line is emitted, so the rest of the flow can still be tested.
+func callPostsUpdateAPI(ctx context.Context, logger *logx.Logger, endpoint string, payload postsUpdatePayload) error {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		logger.Print("POSTS_UPD", fmt.Sprintf("未配置发文数据更新接口，跳过 account_id=%d platform=%s posts=%d", payload.AccountID, payload.Platform, len(payload.Posts)))
+		return nil
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", accountCheckUA)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("posts update http %d: %s", resp.StatusCode, safeSnippet(string(raw), 300))
+	}
+	logger.Print("POSTS_UPD", fmt.Sprintf("已推送发文数据 account_id=%d platform=%s posts=%d resp=%s", payload.AccountID, payload.Platform, len(payload.Posts), safeSnippet(string(raw), 200)))
 	return nil
 }
 
@@ -412,6 +477,188 @@ func ensureAPIAndMaybeStart(ctx context.Context, logger *logx.Logger, host strin
 	return nil, path, fmt.Errorf("已尝试启动Undetectable，但在超时时间内API仍不可用")
 }
 
+// ---------- /accounts/fetch_posts ----------
+
+// fetchPostsByPlatform dispatches a fetch request to the platform-specific
+// scraper. It lives in main (not in package scraper) to avoid an import
+// cycle between scraper and the per-platform packages.
+func fetchPostsByPlatform(ctx context.Context, logger *logx.Logger, platform string, req scraper.FetchRequest) (scraper.FetchResult, error) {
+	switch strings.ToLower(strings.TrimSpace(platform)) {
+	case "twitter", "x":
+		return twitter.FetchPosts(ctx, logger, req)
+	case "youtube", "yt":
+		return youtube.FetchPosts(ctx, logger, req)
+	case "instagram", "ig":
+		return instagram.FetchPosts(ctx, logger, req)
+	case "tiktok", "tt":
+		return tiktok.FetchPosts(ctx, logger, req)
+	default:
+		return scraper.FetchResult{}, fmt.Errorf("scraper: unsupported platform %q", platform)
+	}
+}
+
+type FetchPostsAccount struct {
+	ID        int    `json:"id"`
+	Platform  string `json:"platform"`
+	SourceURL string `json:"source_url"`
+}
+
+type FetchPostsRequest struct {
+	ID               int                 `json:"id"`
+	ProfileName      string              `json:"profile_name"`
+	ActiveAccounts   []FetchPostsAccount `json:"active_accounts"`
+	Host             string              `json:"host"`
+	Port             int                 `json:"port"`
+	WaitSeconds      int                 `json:"wait_seconds"`
+	UndetectablePath string              `json:"undetectable_path"`
+	// UpdateAPIURL optionally overrides the per-account posts update endpoint.
+	UpdateAPIURL string `json:"update_api_url,omitempty"`
+}
+
+type FetchPostsAccountResult struct {
+	AccountID   int            `json:"account_id"`
+	Platform    string         `json:"platform"`
+	SourceURL   string         `json:"source_url"`
+	Status      string         `json:"status"`
+	Posts       []scraper.Post `json:"posts"`
+	PostCount   int            `json:"post_count"`
+	ErrorInfo   string         `json:"error_info,omitempty"`
+	UpdateSent  bool           `json:"update_sent"`
+	UpdateError string         `json:"update_error,omitempty"`
+}
+
+type FetchPostsResponse struct {
+	Type      string                    `json:"type"`
+	ProfileID string                    `json:"profile_id"`
+	Results   []FetchPostsAccountResult `json:"results"`
+	ErrorInfo string                    `json:"error_info,omitempty"`
+}
+
+func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
+			return
+		}
+
+		var req FetchPostsRequest
+		raw, err := decodeJSONBody(r, &req, 2<<20)
+		if err != nil {
+			logger.Print("E", "fetch_posts JSON解析失败: "+err.Error())
+			logger.Print("E", "Content-Type: "+r.Header.Get("Content-Type"))
+			if raw != "" {
+				logger.Print("E", "Body: "+safeSnippet(raw, 1200))
+			}
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
+			return
+		}
+		logger.Print("FP_REQ", "Body: "+safeSnippet(raw, 1500))
+
+		if req.ProfileName == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
+			return
+		}
+		if len(req.ActiveAccounts) == 0 {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "active_accounts is required"})
+			return
+		}
+		if req.Host == "" {
+			req.Host = accountDefaultHost
+		}
+		if req.Port == 0 {
+			req.Port = accountDefaultPort
+		}
+		if req.WaitSeconds <= 0 {
+			req.WaitSeconds = accountDefaultWaitS
+		}
+
+		updateEndpoint := resolvePostsUpdateURL(req.UpdateAPIURL)
+
+		// 1. 打开浏览器（启动 Profile）
+		logger.Print("FP1", fmt.Sprintf("开始启动Profile profile_name=%s accounts=%d", req.ProfileName, len(req.ActiveAccounts)))
+		startRes, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		if err != nil {
+			logger.Print("E", "启动Profile失败: "+err.Error())
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			return
+		}
+		logger.Print("FP2", "Profile已启动 profile_id="+startRes.ProfileID)
+
+		results := make([]FetchPostsAccountResult, 0, len(req.ActiveAccounts))
+		for i, acc := range req.ActiveAccounts {
+			res := FetchPostsAccountResult{
+				AccountID: acc.ID,
+				Platform:  acc.Platform,
+				SourceURL: acc.SourceURL,
+				Status:    "abnormal",
+				Posts:     []scraper.Post{},
+			}
+
+			trimmedURL := strings.TrimSpace(acc.SourceURL)
+			if acc.ID == 0 || strings.TrimSpace(acc.Platform) == "" || trimmedURL == "" {
+				res.ErrorInfo = "账号字段不完整 (id/platform/source_url)"
+				results = append(results, res)
+				continue
+			}
+
+			fetchCtx, cancelFetch := context.WithTimeout(r.Context(), 3*time.Minute)
+			fetchRes, fetchErr := fetchPostsByPlatform(fetchCtx, logger, acc.Platform, scraper.FetchRequest{
+				WebsocketURL: startRes.Info.WebsocketLink,
+				SourceURL:    trimmedURL,
+			})
+			cancelFetch()
+
+			if fetchErr != nil {
+				res.ErrorInfo = fetchErr.Error()
+				logger.Print("FP3", fmt.Sprintf("抓取失败 account_id=%d platform=%s err=%s", acc.ID, acc.Platform, fetchErr.Error()))
+			} else {
+				res.Posts = fetchRes.Posts
+				if res.Posts == nil {
+					res.Posts = []scraper.Post{}
+				}
+				res.PostCount = len(res.Posts)
+				res.Status = "normal"
+				logger.Print("FP3", fmt.Sprintf("抓取成功 account_id=%d platform=%s posts=%d", acc.ID, acc.Platform, res.PostCount))
+			}
+
+			// 2. 抓取后调用更新发文数据接口
+			updateErr := callPostsUpdateAPI(r.Context(), logger, updateEndpoint, postsUpdatePayload{
+				AccountID:   acc.ID,
+				ProfileID:   req.ID,
+				ProfileName: req.ProfileName,
+				Platform:    acc.Platform,
+				SourceURL:   trimmedURL,
+				Posts:       res.Posts,
+			})
+			if updateErr != nil {
+				res.UpdateSent = false
+				res.UpdateError = updateErr.Error()
+				logger.Print("E", fmt.Sprintf("更新发文数据失败 account_id=%d err=%s", acc.ID, updateErr.Error()))
+			} else {
+				res.UpdateSent = true
+			}
+
+			results = append(results, res)
+
+			if i < len(req.ActiveAccounts)-1 {
+				time.Sleep(3 * time.Second)
+			}
+		}
+
+		// 任务结束后停止 Profile，释放浏览器
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
+		_ = undetectable.NewClient(startRes.Host, startRes.Port).StopProfileBestEffort(stopCtx, startRes.ProfileID)
+		cancelStop()
+		logger.Print("FP4", "全部账号处理完成，已停止Profile")
+
+		writeJSON(w, http.StatusOK, FetchPostsResponse{
+			Type:      "success",
+			ProfileID: startRes.ProfileID,
+			Results:   results,
+		})
+	}
+}
+
 func main() {
 	logger := logx.New(os.Stdout)
 
@@ -478,6 +725,8 @@ func main() {
 			Results: results,
 		})
 	})
+
+	mux.HandleFunc("/accounts/fetch_posts", handleFetchPosts(logger))
 
 	mux.HandleFunc("/undetectable/start", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
