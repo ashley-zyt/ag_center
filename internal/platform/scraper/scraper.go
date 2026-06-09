@@ -17,8 +17,7 @@ type Post struct {
 
 // FetchRequest is the input passed to a platform-specific fetcher.
 type FetchRequest struct {
-	WebsocketURL string
-	SourceURL    string
+	SourceURL string
 }
 
 // FetchResult is the output of a platform-specific fetcher.

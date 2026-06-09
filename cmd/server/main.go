@@ -584,6 +584,21 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 		}
 		logger.Print("FP2", "Profile已启动 profile_id="+startRes.ProfileID)
 
+		// 建立与指纹浏览器的连接
+		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(r.Context(), startRes.Info.WebsocketLink, chromedp.NoModifyURL)
+		defer cancelAlloc()
+
+		// 创建浏览器实例 context
+		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx)
+		defer cancelBrowser()
+
+		// 记录所有打开的标签页 context 和 cancel，以便最后统一关闭
+		type tabInfo struct {
+			ctx    context.Context
+			cancel context.CancelFunc
+		}
+		openedTabs := make([]tabInfo, 0, len(req.ActiveAccounts))
+
 		results := make([]FetchPostsAccountResult, 0, len(req.ActiveAccounts))
 		for i, acc := range req.ActiveAccounts {
 			res := FetchPostsAccountResult{
@@ -601,10 +616,16 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 				continue
 			}
 
-			fetchCtx, cancelFetch := context.WithTimeout(r.Context(), 3*time.Minute)
+			// 2. 循环accounts打开各自的发文页面
+			// 2.1 获取一个账号的发文之后，再去打开下一个标签页获取账号发文
+			logger.Print("FP3", fmt.Sprintf("[%d/%d] 正在为 %s 打开新标签页: %s", i+1, len(req.ActiveAccounts), acc.Platform, trimmedURL))
+
+			tabCtx, cancelTab := chromedp.NewContext(browserCtx)
+			openedTabs = append(openedTabs, tabInfo{ctx: tabCtx, cancel: cancelTab})
+
+			fetchCtx, cancelFetch := context.WithTimeout(tabCtx, 3*time.Minute)
 			fetchRes, fetchErr := fetchPostsByPlatform(fetchCtx, logger, acc.Platform, scraper.FetchRequest{
-				WebsocketURL: startRes.Info.WebsocketLink,
-				SourceURL:    trimmedURL,
+				SourceURL: trimmedURL,
 			})
 			cancelFetch()
 
@@ -621,7 +642,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 				logger.Print("FP3", fmt.Sprintf("抓取成功 account_id=%d platform=%s posts=%d", acc.ID, acc.Platform, res.PostCount))
 			}
 
-			// 2. 抓取后调用更新发文数据接口
+			// 抓取后立即调用更新接口
 			updateErr := callPostsUpdateAPI(r.Context(), logger, updateEndpoint, postsUpdatePayload{
 				AccountID:   acc.ID,
 				ProfileID:   req.ID,
@@ -641,15 +662,21 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			results = append(results, res)
 
 			if i < len(req.ActiveAccounts)-1 {
-				time.Sleep(3 * time.Second)
+				time.Sleep(2 * time.Second)
 			}
 		}
 
-		// 任务结束后停止 Profile，释放浏览器
+		// 3. 各个账号获取完成以后关闭所有打开的标签页
+		logger.Print("FP4", "关闭所有打开的标签页")
+		for _, tab := range openedTabs {
+			tab.cancel()
+		}
+
+		// 再关闭浏览器（停止 Profile）
+		logger.Print("FP4", "停止Profile进程")
 		stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
 		_ = undetectable.NewClient(startRes.Host, startRes.Port).StopProfileBestEffort(stopCtx, startRes.ProfileID)
 		cancelStop()
-		logger.Print("FP4", "全部账号处理完成，已停止Profile")
 
 		writeJSON(w, http.StatusOK, FetchPostsResponse{
 			Type:      "success",
