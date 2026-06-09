@@ -11,6 +11,7 @@ import (
 	"minimax_pro/internal/platform/scraper"
 
 	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/dom"
 	"github.com/chromedp/chromedp"
 )
 
@@ -60,6 +61,15 @@ func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchReque
 
 	var posts []scraper.Post
 	for i, node := range cellNodes {
+		// 打印每一条发文的 Dom 结构 (OuterHTML)
+		var outerHTML string
+		_ = chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+			var err error
+			outerHTML, err = dom.GetOuterHTML().WithNodeID(node.NodeID).Do(ctx)
+			return err
+		}))
+		logger.Print("TW_DOM", fmt.Sprintf("发文 [%d] DOM 结构: %s", i, outerHTML))
+
 		// 每个 cellInnerDiv 内部进行字段提取
 		var title, link, publishTime, likes, comments, shares, views string
 

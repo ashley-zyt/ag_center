@@ -489,7 +489,8 @@ func (l *cdpFilterLogger) Printf(format string, v ...interface{}) {
 	if strings.Contains(msg, "could not unmarshal event") ||
 		strings.Contains(msg, "unknown command or event") ||
 		strings.Contains(msg, "Target.und_activTabChanged") ||
-		strings.Contains(msg, "ClientNavigationReason") {
+		strings.Contains(msg, "ClientNavigationReason") ||
+		strings.Contains(msg, "initialFrameNavigation") {
 		return
 	}
 	// 其余 CDP 日志暂不输出，避免干扰主流程日志
@@ -590,7 +591,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			req.WaitSeconds = accountDefaultWaitS
 		}
 
-		updateEndpoint := resolvePostsUpdateURL(req.UpdateAPIURL)
+		// updateEndpoint := resolvePostsUpdateURL(req.UpdateAPIURL)
 
 		// 1. 打开浏览器（启动 Profile）
 		logger.Print("FP1", fmt.Sprintf("开始启动Profile profile_name=%s accounts=%d", req.ProfileName, len(req.ActiveAccounts)))
@@ -663,7 +664,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 				logger.Print("FP3", fmt.Sprintf("抓取成功 account_id=%d platform=%s posts=%d", acc.ID, acc.Platform, res.PostCount))
 			}
 
-			// 抓取后立即调用更新接口
+			/* 暂时关闭更新接口调用
 			updateErr := callPostsUpdateAPI(r.Context(), logger, updateEndpoint, postsUpdatePayload{
 				AccountID:   acc.ID,
 				ProfileID:   req.ID,
@@ -679,6 +680,9 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			} else {
 				res.UpdateSent = true
 			}
+			*/
+			logger.Print("FP3", fmt.Sprintf("已跳过发文数据更新接口调用 (根据要求暂时关闭)"))
+			res.UpdateSent = false // 标记为未发送以在响应中体现
 
 			results = append(results, res)
 
