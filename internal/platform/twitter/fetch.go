@@ -34,11 +34,16 @@ func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchReque
 		return scraper.FetchResult{}, fmt.Errorf("click profile link failed: %w", err)
 	}
 
+	// 确认跳转
+	var currentURL string
+	_ = chromedp.Run(ctx, chromedp.Location(&currentURL))
+	logger.Print("TW_FETCH", "当前页面 URL: "+currentURL)
+
 	// 3. 等待发文容器出现
 	cellSel := `div[data-testid="cellInnerDiv"]`
-	logger.Print("TW_FETCH", "等待发文内容加载")
+	logger.Print("TW_FETCH", "等待发文内容加载 (最长等待 30s)")
 	if err := chromedp.Run(ctx, chromedp.WaitVisible(cellSel, chromedp.ByQuery)); err != nil {
-		return scraper.FetchResult{}, fmt.Errorf("wait for posts failed: %w", err)
+		return scraper.FetchResult{}, fmt.Errorf("wait for posts failed (possible account not logged in or profile page didn't load): %w", err)
 	}
 
 	// 预留一点渲染时间

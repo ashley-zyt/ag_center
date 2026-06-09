@@ -477,6 +477,24 @@ func ensureAPIAndMaybeStart(ctx context.Context, logger *logx.Logger, host strin
 	return nil, path, fmt.Errorf("已尝试启动Undetectable，但在超时时间内API仍不可用")
 }
 
+// ---------- CDP 日志过滤器 ----------
+
+type cdpFilterLogger struct {
+	logger *logx.Logger
+}
+
+func (l *cdpFilterLogger) Printf(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	// 过滤 Undetectable 产生的已知 CDP 协议不兼容噪音
+	if strings.Contains(msg, "could not unmarshal event") ||
+		strings.Contains(msg, "unknown command or event") ||
+		strings.Contains(msg, "Target.und_activTabChanged") ||
+		strings.Contains(msg, "ClientNavigationReason") {
+		return
+	}
+	// 其余 CDP 日志暂不输出，避免干扰主流程日志
+}
+
 // ---------- /accounts/fetch_posts ----------
 
 // fetchPostsByPlatform dispatches a fetch request to the platform-specific
@@ -588,8 +606,11 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(r.Context(), startRes.Info.WebsocketLink, chromedp.NoModifyURL)
 		defer cancelAlloc()
 
-		// 创建浏览器实例 context
-		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx)
+		// 创建浏览器实例 context，并挂载日志过滤器
+		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
+			chromedp.WithLogf((&cdpFilterLogger{logger: logger}).Printf),
+			chromedp.WithErrorf((&cdpFilterLogger{logger: logger}).Printf),
+		)
 		defer cancelBrowser()
 
 		// 记录所有打开的标签页 context 和 cancel，以便最后统一关闭
