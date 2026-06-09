@@ -10,6 +10,7 @@ import (
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/platform/scraper"
 
+	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
 )
 
@@ -49,67 +50,91 @@ func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchReque
 	// 预留一点渲染时间
 	time.Sleep(3 * time.Second)
 
-	// 使用 JS 批量提取数据，逻辑严格遵循用户提供的选择器
-	logger.Print("TW_FETCH", "正在通过 JS 提取发文数据")
-	var rawPosts []struct {
-		Title       string `json:"title"`
-		Link        string `json:"link"`
-		PublishTime string `json:"publish_time"`
-		Likes       string `json:"likes"`
-		Comments    string `json:"comments"`
-		Shares      string `json:"shares"`
-		Views       string `json:"views"`
+	// 使用原生 chromedp Actions 提取数据
+	logger.Print("TW_FETCH", "正在使用原生 chromedp 提取发文数据")
+
+	var cellNodes []*cdp.Node
+	if err := chromedp.Run(ctx, chromedp.Nodes(cellSel, &cellNodes, chromedp.ByQuery)); err != nil {
+		return scraper.FetchResult{}, fmt.Errorf("get cell nodes failed: %w", err)
 	}
 
-	// JS 逻辑严格遵循用户提供的选择器
-	js := `(function() {
-		const cells = document.querySelectorAll('div[data-testid="cellInnerDiv"]');
-		const results = [];
-		cells.forEach(cell => {
-			const titleEl = cell.querySelector('div[data-testid="tweetText"]');
-			if (!titleEl) return;
-
-			const nameAnchor = cell.querySelector('div[data-testid="User-Name"] > a');
-			const timeEl = cell.querySelector('div[data-testid="User-Name"] > a > time');
-			
-			const getVal = (sel) => {
-				const el = cell.querySelector(sel);
-				return el ? el.innerText.trim() : "";
-			};
-
-			results.push({
-				title: titleEl.innerText || "",
-				link: nameAnchor ? nameAnchor.href : "",
-				publish_time: timeEl ? timeEl.getAttribute("datetime") : "",
-				comments: getVal('button[data-testid="reply"] span'),
-				shares: getVal('button[data-testid="unretweet"] span') || getVal('button[data-testid="retweet"] span'),
-				likes: getVal('button[data-testid="unlike"] span') || getVal('button[data-testid="like"] span'),
-				views: getVal('a[aria-label*="analytics"] span') || getVal('a[aria-label*="analytics"]')
-			});
-		});
-		return results;
-	})()`
-
-	if err := chromedp.Run(ctx, chromedp.Evaluate(js, &rawPosts)); err != nil {
-		return scraper.FetchResult{}, fmt.Errorf("evaluate JS failed: %w", err)
-	}
-
-	// 转换数据格式
 	var posts []scraper.Post
-	for _, p := range rawPosts {
+	for i, node := range cellNodes {
+		// 每个 cellInnerDiv 内部进行字段提取
+		var title, link, publishTime, likes, comments, shares, views string
+
+		// 提取标题 (tweetText)
+		_ = chromedp.Run(ctx, chromedp.Text(`div[data-testid="tweetText"]`, &title, chromedp.ByQuery, chromedp.FromNode(node)))
+		if title == "" {
+			continue // 排除非发文内容（如推荐、广告等）
+		}
+
+		// 提取链接和发布时间
+		_ = chromedp.Run(ctx, chromedp.AttributeValue(`div[data-testid="User-Name"] > a`, "href", &link, nil, chromedp.ByQuery, chromedp.FromNode(node)))
+		_ = chromedp.Run(ctx, chromedp.AttributeValue(`div[data-testid="User-Name"] > a > time`, "datetime", &publishTime, nil, chromedp.ByQuery, chromedp.FromNode(node)))
+
+		// 提取互动数据
+		// 注意：X 的数据可能在 span 文本里，也可能只在按钮的 aria-label 里
+		_ = chromedp.Run(ctx, chromedp.Text(`button[data-testid="reply"] span`, &comments, chromedp.ByQuery, chromedp.FromNode(node)))
+		if comments == "" {
+			_ = chromedp.Run(ctx, chromedp.AttributeValue(`button[data-testid="reply"]`, "aria-label", &comments, nil, chromedp.ByQuery, chromedp.FromNode(node)))
+		}
+
+		// 转发（处理已转发和未转发两种状态）
+		_ = chromedp.Run(ctx, chromedp.Text(`button[data-testid="unretweet"] span`, &shares, chromedp.ByQuery, chromedp.FromNode(node)))
+		if shares == "" {
+			_ = chromedp.Run(ctx, chromedp.Text(`button[data-testid="retweet"] span`, &shares, chromedp.ByQuery, chromedp.FromNode(node)))
+		}
+		if shares == "" {
+			_ = chromedp.Run(ctx, chromedp.AttributeValue(`button[data-testid="retweet"]`, "aria-label", &shares, nil, chromedp.ByQuery, chromedp.FromNode(node)))
+			if shares == "" {
+				_ = chromedp.Run(ctx, chromedp.AttributeValue(`button[data-testid="unretweet"]`, "aria-label", &shares, nil, chromedp.ByQuery, chromedp.FromNode(node)))
+			}
+		}
+
+		// 点赞
+		_ = chromedp.Run(ctx, chromedp.Text(`button[data-testid="unlike"] span`, &likes, chromedp.ByQuery, chromedp.FromNode(node)))
+		if likes == "" {
+			_ = chromedp.Run(ctx, chromedp.Text(`button[data-testid="like"] span`, &likes, chromedp.ByQuery, chromedp.FromNode(node)))
+		}
+		if likes == "" {
+			_ = chromedp.Run(ctx, chromedp.AttributeValue(`button[data-testid="like"]`, "aria-label", &likes, nil, chromedp.ByQuery, chromedp.FromNode(node)))
+			if likes == "" {
+				_ = chromedp.Run(ctx, chromedp.AttributeValue(`button[data-testid="unlike"]`, "aria-label", &likes, nil, chromedp.ByQuery, chromedp.FromNode(node)))
+			}
+		}
+
+		// 观看量
+		_ = chromedp.Run(ctx, chromedp.Text(`a[aria-label*="analytics"] span`, &views, chromedp.ByQuery, chromedp.FromNode(node)))
+		if views == "" {
+			_ = chromedp.Run(ctx, chromedp.AttributeValue(`a[aria-label*="analytics"]`, "aria-label", &views, nil, chromedp.ByQuery, chromedp.FromNode(node)))
+		}
+
+		if i == 0 {
+			logger.Print("TW_DEBUG", fmt.Sprintf("原生样本 - 标题: %s, 时间: %s, 评论: %s, 转发: %s, 点赞: %s, 观看: %s",
+				truncate(title, 20), publishTime, comments, shares, likes, views))
+		}
+
 		posts = append(posts, scraper.Post{
-			Title:       p.Title,
-			Link:        p.Link,
-			PublishTime: p.PublishTime,
-			Likes:       parseTwitterMetric(p.Likes),
-			Comments:    parseTwitterMetric(p.Comments),
-			Shares:      parseTwitterMetric(p.Shares),
-			Views:       parseTwitterMetric(p.Views),
+			Title:       title,
+			Link:        link,
+			PublishTime: publishTime,
+			Likes:       parseTwitterMetric(likes),
+			Comments:    parseTwitterMetric(comments),
+			Shares:      parseTwitterMetric(shares),
+			Views:       parseTwitterMetric(views),
 		})
 	}
 
 	logger.Print("TW_FETCH", fmt.Sprintf("成功抓取到 %d 条发文", len(posts)))
 	return scraper.FetchResult{Posts: posts}, nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // parseTwitterMetric converts strings like "1.2K", "3M", "1,234" to integers.
@@ -118,7 +143,20 @@ func parseTwitterMetric(s string) int {
 	if s == "" {
 		return 0
 	}
+	// 移除逗号
 	s = strings.ReplaceAll(s, ",", "")
+
+	// 处理 aria-label 可能带入的非数字字符（保留数字、点和单位）
+	// 例如 "123 replies" -> "123"
+	var clean strings.Builder
+	for _, r := range s {
+		if (r >= '0' && r <= '9') || r == '.' || r == 'k' || r == 'm' || r == 'b' {
+			clean.WriteRune(r)
+		} else if clean.Len() > 0 {
+			break // 遇到空格或其他字符停止
+		}
+	}
+	s = clean.String()
 
 	multiplier := 1.0
 	if strings.HasSuffix(s, "k") {
