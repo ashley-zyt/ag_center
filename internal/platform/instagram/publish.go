@@ -112,7 +112,62 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		return errors.New("IG2 instagram not logged in in this profile")
 	}
 
-	time.Sleep(3 * time.Second)
+	// ==================== 【新增：人机验证(Captcha/Challenge)硬卡点拦截】 ====================
+	logger.Print("IG2", "检查页面是否触发人机验证风险控制")
+	captchaCtx, cancelCaptcha := context.WithTimeout(tabCtx, 5*time.Second)
+	var hasCaptcha bool
+	captchaJs := `(function(){
+		var bodyText = document.body.textContent || "";
+		// 匹配常见的各种人机交互校验文本提示
+		if (bodyText.includes("Confirm you're human") || 
+			bodyText.includes("Confirm you are human") || 
+			bodyText.includes("确认你是人类") ||
+			bodyText.includes("reCAPTCHA")) {
+			return true;
+		}
+		return false;
+	})()`
+	_ = chromedp.Run(captchaCtx, chromedp.Evaluate(captchaJs, &hasCaptcha))
+	cancelCaptcha()
+
+	if hasCaptcha {
+		return errors.New("IG2 触发安全风控：页面出现 Confirm you're human 人机验证，流程终止退出")
+	}
+	// =======================================================================================
+
+	// ==================== 【优化引入：非阻塞式检测通知弹窗】 ====================
+	logger.Print("IG2", "检查是否存在通知请求弹窗 (Turn on Notifications)")
+	dismissCtx, cancelDismiss := context.WithTimeout(tabCtx, 6*time.Second)
+	var dismissed bool
+	dismissJs := `(function(){
+		var bodyText = document.body.textContent || "";
+		if (bodyText.includes("Turn on Notifications") || bodyText.includes("开启通知")) {
+			var buttons = document.querySelectorAll('button');
+			for (var i = 0; i < buttons.length; i++) {
+				var txt = (buttons[i].textContent || "").trim();
+				if (txt === "Not Now" || txt === "稍后再说" || txt === "Not now") {
+					try {
+						buttons[i].click();
+						return true;
+					} catch(e) {
+						return false;
+					}
+				}
+			}
+		}
+		return false;
+	})()`
+	_ = chromedp.Run(dismissCtx, chromedp.Evaluate(dismissJs, &dismissed))
+	cancelDismiss()
+
+	if dismissed {
+		logger.Print("IG2", "已成功拦截并点击 Not Now，静置 5 秒等待 DOM 刷新")
+		time.Sleep(5 * time.Second)
+	} else {
+		logger.Print("IG2", "未发现通知弹窗，继续流程")
+		time.Sleep(2 * time.Second)
+	}
+	// ============================================================================
 
 	logger.Print("IG3", "点击创建新帖子按钮")
 	if err := clickCreatePost(tabCtx, logger); err != nil {
@@ -230,7 +285,6 @@ func fillReelTitle(ctx context.Context, logger *logx.Logger, text string) error 
 	logger.Print("IG5", "查找标题输入框: "+sel)
 
 	for retry := 0; retry < 3; retry++ {
-		// 1. 等待并确保节点可见
 		var nodes []*cdp.Node
 		findCtx, cancelFind := context.WithTimeout(ctx, 5*time.Second)
 		err := chromedp.Run(findCtx,
@@ -245,7 +299,6 @@ func fillReelTitle(ctx context.Context, logger *logx.Logger, text string) error 
 			continue
 		}
 
-		// 2. 强行触发物理点击和聚焦（这是激活 Lexical 内部物理 Selection 的关键起点）
 		logger.Print("IG5", "触发真实物理点击与强聚焦")
 		clickCtx, cancelClick := context.WithTimeout(ctx, 5*time.Second)
 		err = chromedp.Run(clickCtx,
@@ -259,23 +312,16 @@ func fillReelTitle(ctx context.Context, logger *logx.Logger, text string) error 
 		}
 		time.Sleep(300 * time.Millisecond)
 
-		// 3. 【破局核心】：绕过键盘模拟，使用 insertText 穿透 React 内存状态锁
 		logger.Print("IG5", "执行内核级文本插入与状态同步...")
 
-		// 通过全选（selectAll）清理可能存在的残余，然后用 insertText 一口气打穿 Lexical 的 onChange 监听器
 		injectJs := fmt.Sprintf(`(function(){
 			var el = document.querySelector(%q);
 			if(!el) return false;
 			
 			el.focus();
-			
-			// 1) 强行全选
 			document.execCommand('selectAll', false, null);
-			// 2) 调用最底层的受信任文本插入原语，这等同于人工完美的粘贴/键入，
-			// 它会强制引发 Lexical 的原生同步，将 text 写入 React 的内存变量中
 			var ok = document.execCommand('insertText', false, %q);
 			
-			// 3) 额外派发原生的合成事件，做双重保险
 			var ev = new InputEvent('input', { bubbles: true, cancelable: true });
 			el.dispatchEvent(ev);
 			
@@ -293,48 +339,36 @@ func fillReelTitle(ctx context.Context, logger *logx.Logger, text string) error 
 			continue
 		}
 
-		// 4. 【最终脏状态强制合拢】
 		logger.Print("IG5", "注入成功，执行表单最终锁合拢")
 		shakeCtx, cancelShake := context.WithTimeout(ctx, 5*time.Second)
 		_ = chromedp.Run(shakeCtx,
-			chromedp.SendKeys(sel, " ", chromedp.ByQuery), // 敲空格
+			chromedp.SendKeys(sel, " ", chromedp.ByQuery),
 			chromedp.Sleep(100*time.Millisecond),
-			chromedp.KeyEvent("\u0008"), // 退格删掉
+			chromedp.KeyEvent("\u0008"),
 		)
 		cancelShake()
 
-		// ==================== 【针对右键线索的全新修复代码】 ====================
 		logger.Print("IG5", "模拟右键副作用：强行触发失焦与全局事件刷新")
 		blurCtx, cancelBlur := context.WithTimeout(ctx, 5*time.Second)
 
-		// 方案 A: 模拟人类点击发帖窗口的空白头部/背景，或者直接调用 el.blur()
-		// 我们通过 JS 强行让输入框失去焦点，并触发 change 事件，逼迫 React 收拢状态
 		blurJs := fmt.Sprintf(`(function(){
 			var el = document.querySelector(%q);
 			if(el) {
-				el.blur(); // 强行失焦，这会触发表单的 OnBlur 提交状态
-				
-				// 模拟派发一个受信任的 change 事件
+				el.blur();
 				var changeEvent = new Event('change', { bubbles: true });
 				el.dispatchEvent(changeEvent);
 			}
-			// 顺便让整个 body 重新计算布局，模拟右键带来的 Reflow
 			document.body.offsetHeight; 
 		})()`, sel)
 
 		_ = chromedp.Run(blurCtx,
 			chromedp.Evaluate(blurJs, nil),
-			// 方案 B: 物理点击一下页面的其他无关安全区域（例如发帖弹窗的标题栏，防止点错按钮）
-			// 请根据你页面实际情况，点一个空白的 div 标签，比如 `div[role="dialog"]` 的头部
 			chromedp.Click(`h1, div[role="presentation"]`, chromedp.ByQuery),
 		)
 		cancelBlur()
-		// =====================================================================
 
-		// 给外部指纹浏览器和 IG 前端 3 秒钟完成异步防抖更新状态
 		time.Sleep(3 * time.Second)
 
-		// 5. 最终验证检查
 		var currentText string
 		checkJs := fmt.Sprintf(`(function(){
 			var el = document.querySelector(%q);

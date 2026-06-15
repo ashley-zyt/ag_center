@@ -271,15 +271,21 @@ func clickPost(ctx context.Context, logger *logx.Logger) error {
 			)
 			cancelClick()
 
-			// 点击后检查是否出现 "Post now" 弹窗
+			// 给页面 1.5 秒缓冲时间，防止因网络或渲染延迟导致 handlePostNowModal 瞬间检测不到弹窗
+			time.Sleep(1500 * time.Millisecond)
+
+			// 点击主按钮后，检查是否出现 "Post now" 弹窗
 			if handlePostNowModal(ctx, logger) {
-				// 如果处理了弹窗，等待5秒后（已在handle内等待）继续循环，尝试再次点击主按钮
-				continue
+				// 💡 核心修改：如果处理并点击了 "Post now" 弹窗，说明已经最终发布，直接返回 nil 成功！
+				logger.Print("TT6", "通过 'Post now' 确认发布成功")
+				return nil
 			}
 
 			if err == nil {
 				return nil
 			}
+
+			// JS 兜底点击
 			var ok bool
 			js := `(function(sel){
 				var el = sel.startsWith("//") ? (document.evaluate(sel, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue) : document.querySelector(sel);
@@ -290,9 +296,13 @@ func clickPost(ctx context.Context, logger *logx.Logger) error {
 			eCtx, cancelEval := context.WithTimeout(ctx, 3*time.Second)
 			_ = chromedp.Run(eCtx, chromedp.Evaluate(js, &ok))
 			cancelEval()
+
 			if ok {
+				time.Sleep(1500 * time.Millisecond) // 同步等待延迟
 				if handlePostNowModal(ctx, logger) {
-					continue
+					// 💡 核心修改：兜底点击如果触发并处理了弹窗，同样直接返回成功
+					logger.Print("TT6", "通过 JS 兜底及 'Post now' 确认发布成功")
+					return nil
 				}
 				return nil
 			}

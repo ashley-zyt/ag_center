@@ -10,133 +10,182 @@ import (
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/platform/scraper"
 
-	"github.com/chromedp/cdproto/cdp"
-	"github.com/chromedp/cdproto/dom"
 	"github.com/chromedp/chromedp"
 )
 
-// FetchPosts scrapes the first page of posts from X / Twitter by navigating
-// to the profile page and extracting post metrics.
+// FetchPosts scrapes posts from X / Twitter using robust in-browser JS evaluation.
 func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchRequest) (scraper.FetchResult, error) {
-	logger.Print("TW_FETCH", "开始 X/Twitter 抓取流程: "+req.SourceURL)
+	logger.Print("TW_FETCH", "开始抓取 X 流程: "+req.SourceURL)
 
-	// 1. 打开首页链接
-	logger.Print("TW_FETCH", "正在打开 X 首页")
-	if err := chromedp.Run(ctx, chromedp.Navigate("https://x.com/home")); err != nil {
+	// 🌟 创建一个新的局部上下文，强行注入 WithErrorf 静音器
+	// 这会直接吞掉所有底层类似 "could not unmarshal event" 的非业务干扰错误
+	silentCtx, silentCancel := chromedp.NewContext(ctx,
+		chromedp.WithErrorf(func(string, ...interface{}) {}),
+	)
+	defer silentCancel()
+
+	// 1. 打开首页（使用 silentCtx）
+	if err := chromedp.Run(silentCtx, chromedp.Navigate("https://x.com/home")); err != nil {
 		return scraper.FetchResult{}, fmt.Errorf("navigate home failed: %w", err)
 	}
 
-	// 2. 等待个人主页链接并点击
+	// 2. 点击个人主页
 	profileBtnSel := `a[data-testid="AppTabBar_Profile_Link"]`
-	logger.Print("TW_FETCH", "等待个人主页按钮并点击")
-	if err := chromedp.Run(ctx,
+	if err := chromedp.Run(silentCtx,
 		chromedp.WaitVisible(profileBtnSel, chromedp.ByQuery),
 		chromedp.Click(profileBtnSel, chromedp.ByQuery),
 	); err != nil {
 		return scraper.FetchResult{}, fmt.Errorf("click profile link failed: %w", err)
 	}
 
-	// 确认跳转
-	var currentURL string
-	_ = chromedp.Run(ctx, chromedp.Location(&currentURL))
-	logger.Print("TW_FETCH", "当前页面 URL: "+currentURL)
-
-	// 3. 等待发文容器出现
+	// 3. 等待内容容器初始加载
 	cellSel := `div[data-testid="cellInnerDiv"]`
-	logger.Print("TW_FETCH", "等待发文内容加载 (最长等待 30s)")
-	if err := chromedp.Run(ctx, chromedp.WaitVisible(cellSel, chromedp.ByQuery)); err != nil {
-		return scraper.FetchResult{}, fmt.Errorf("wait for posts failed (possible account not logged in or profile page didn't load): %w", err)
+	if err := chromedp.Run(silentCtx, chromedp.WaitVisible(cellSel, chromedp.ByQuery)); err != nil {
+		return scraper.FetchResult{}, fmt.Errorf("wait for posts failed: %w", err)
+	}
+	time.Sleep(2 * time.Second)
+
+	// 4. 执行滚动采集
+	logger.Print("TW_FETCH", "正在执行动态滚动采集...")
+	runScrollScript := `
+	(() => {
+		window._xPostsData = [];
+		let postsMap = new Map();
+		let currentRound = 0;
+		let maxRounds = 3;
+
+		// 🌟 【新增验证第一步】：根据 DOM 结构，动态提取当前主页的正确 Handle (例如: @DanielaHig92951)
+		let targetHandle = "";
+		let pageUserContainer = document.querySelector('div[data-testid="UserName"]');
+		if (pageUserContainer) {
+			// 从包含 @ 字符的文本节点中精准匹配出用户的 Handle
+			let handleMatch = pageUserContainer.innerText.match(/@\w+/);
+			if (handleMatch) {
+				targetHandle = handleMatch[0].toLowerCase().trim();
+			}
+		}
+
+		// 兜底策略：如果 DOM 尚未完全加载，则从当前浏览器路径名中提取
+		if (!targetHandle) {
+			let pathParts = window.location.pathname.split('/');
+			if (pathParts[1]) {
+				targetHandle = "@" + pathParts[1].toLowerCase().trim();
+			}
+		}
+
+		console.log("【安全防污染验证】当前主页合法发文者 Handle 被锁定为: " + targetHandle);
+
+		function collectData() {
+			let cells = document.querySelectorAll('div[data-testid="cellInnerDiv"]');
+			cells.forEach(cell => {
+				let textNode = cell.querySelector('div[data-testid="tweetText"]');
+				let linkNode = cell.querySelector('div[data-testid="User-Name"] a[href*="/status/"]');
+				
+				if (textNode && linkNode) {
+					// 🌟 【新增验证第二步】：提取当前这条推文真实的发布者 Handle
+					let tweetUserContainer = cell.querySelector('div[data-testid="User-Name"]');
+					if (tweetUserContainer) {
+						let tweetUserText = tweetUserContainer.innerText;
+						let tweetHandleMatch = tweetUserText.match(/@\w+/);
+						
+						if (tweetHandleMatch) {
+							let currentTweetHandle = tweetHandleMatch[0].toLowerCase().trim();
+							
+							// 🌟 【新增验证第三步】：进行匹配，若不成功，则判定为嵌入的热点/广告，直接略过
+							if (targetHandle && currentTweetHandle !== targetHandle) {
+								// console.log("过滤掉非本主页发文: " + currentTweetHandle);
+								return; 
+							}
+						}
+					}
+
+					let link = linkNode.getAttribute('href');
+					if (!postsMap.has(link)) {
+						let timeNode = cell.querySelector('div[data-testid="User-Name"] time');
+						let replyNode = cell.querySelector('button[data-testid="reply"]');
+						let retweetNode = cell.querySelector('button[data-testid="retweet"]') || cell.querySelector('button[data-testid="unretweet"]');
+						let likeNode = cell.querySelector('button[data-testid="like"]') || cell.querySelector('button[data-testid="unlike"]');
+						let viewNode = cell.querySelector('a[href*="/analytics"]');
+
+						postsMap.set(link, {
+							title: textNode.innerText || "",
+							link: link,
+							publishTime: timeNode ? (timeNode.getAttribute('datetime') || "") : "",
+							comments: replyNode ? (replyNode.innerText || replyNode.getAttribute('aria-label') || "") : "",
+							shares: retweetNode ? (retweetNode.innerText || retweetNode.getAttribute('aria-label') || "") : "",
+							likes: likeNode ? (likeNode.innerText || likeNode.getAttribute('aria-label') || "") : "",
+							views: viewNode ? (viewNode.innerText || viewNode.getAttribute('aria-label') || "") : ""
+						});
+					}
+				}
+			});
+		}
+
+		let timer = setInterval(() => {
+			collectData();
+			currentRound++;
+			if (currentRound >= maxRounds) {
+				clearInterval(timer);
+				window._xPostsData = Array.from(postsMap.values());
+				window._xScrollDone = true;
+				return;
+			}
+			window.scrollBy(0, 1400);
+		}, 2000);
+	})()
+	`
+
+	if err := chromedp.Run(silentCtx, chromedp.Evaluate(runScrollScript, nil)); err != nil {
+		return scraper.FetchResult{}, fmt.Errorf("inject scroll script failed: %w", err)
 	}
 
-	// 预留一点渲染时间
-	time.Sleep(3 * time.Second)
-
-	// 使用原生 chromedp Actions 提取数据
-	logger.Print("TW_FETCH", "正在使用原生 chromedp 提取发文数据")
-
-	var cellNodes []*cdp.Node
-	if err := chromedp.Run(ctx, chromedp.Nodes(cellSel, &cellNodes, chromedp.ByQuery)); err != nil {
-		return scraper.FetchResult{}, fmt.Errorf("get cell nodes failed: %w", err)
+	// 5. 等待 JS 结束标记并取回数据
+	var isDone bool
+	for i := 0; i < 10; i++ {
+		_ = chromedp.Run(silentCtx, chromedp.Evaluate("window._xScrollDone || false", &isDone))
+		if isDone {
+			break
+		}
+		time.Sleep(1 * time.Second)
 	}
 
+	var jsResult []map[string]string
+	if err := chromedp.Run(silentCtx, chromedp.Evaluate("window._xPostsData || []", &jsResult)); err != nil {
+		return scraper.FetchResult{}, fmt.Errorf("retrieve standard json data failed: %w", err)
+	}
+
+	// 6. 数据序列化拼装并进行精准打印
 	var posts []scraper.Post
-	for i, node := range cellNodes {
-		// 打印每一条发文的 Dom 结构 (OuterHTML)
-		var outerHTML string
-		_ = chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-			var err error
-			outerHTML, err = dom.GetOuterHTML().WithNodeID(node.NodeID).Do(ctx)
-			return err
-		}))
-		logger.Print("TW_DOM", fmt.Sprintf("发文 [%d] DOM 结构: %s", i, outerHTML))
+	logger.Print("TW_FETCH", "开始解析并打印抓取到的发文明细:")
 
-		// 每个 cellInnerDiv 内部进行字段提取
-		var title, link, publishTime, likes, comments, shares, views string
-
-		// 提取标题 (tweetText)
-		_ = chromedp.Run(ctx, chromedp.Text(`div[data-testid="tweetText"]`, &title, chromedp.ByQuery, chromedp.FromNode(node)))
-		if title == "" {
-			continue // 排除非发文内容（如推荐、广告等）
+	for idx, raw := range jsResult {
+		// 补全完整 URL
+		fullLink := raw["link"]
+		if !strings.HasPrefix(fullLink, "http") {
+			fullLink = "https://x.com" + fullLink
 		}
 
-		// 提取链接和发布时间
-		_ = chromedp.Run(ctx, chromedp.AttributeValue(`div[data-testid="User-Name"] > a`, "href", &link, nil, chromedp.ByQuery, chromedp.FromNode(node)))
-		_ = chromedp.Run(ctx, chromedp.AttributeValue(`div[data-testid="User-Name"] > a > time`, "datetime", &publishTime, nil, chromedp.ByQuery, chromedp.FromNode(node)))
-
-		// 提取互动数据
-		// 注意：X 的数据可能在 span 文本里，也可能只在按钮的 aria-label 里
-		_ = chromedp.Run(ctx, chromedp.Text(`button[data-testid="reply"] span`, &comments, chromedp.ByQuery, chromedp.FromNode(node)))
-		if comments == "" {
-			_ = chromedp.Run(ctx, chromedp.AttributeValue(`button[data-testid="reply"]`, "aria-label", &comments, nil, chromedp.ByQuery, chromedp.FromNode(node)))
-		}
-
-		// 转发（处理已转发和未转发两种状态）
-		_ = chromedp.Run(ctx, chromedp.Text(`button[data-testid="unretweet"] span`, &shares, chromedp.ByQuery, chromedp.FromNode(node)))
-		if shares == "" {
-			_ = chromedp.Run(ctx, chromedp.Text(`button[data-testid="retweet"] span`, &shares, chromedp.ByQuery, chromedp.FromNode(node)))
-		}
-		if shares == "" {
-			_ = chromedp.Run(ctx, chromedp.AttributeValue(`button[data-testid="retweet"]`, "aria-label", &shares, nil, chromedp.ByQuery, chromedp.FromNode(node)))
-			if shares == "" {
-				_ = chromedp.Run(ctx, chromedp.AttributeValue(`button[data-testid="unretweet"]`, "aria-label", &shares, nil, chromedp.ByQuery, chromedp.FromNode(node)))
-			}
-		}
-
-		// 点赞
-		_ = chromedp.Run(ctx, chromedp.Text(`button[data-testid="unlike"] span`, &likes, chromedp.ByQuery, chromedp.FromNode(node)))
-		if likes == "" {
-			_ = chromedp.Run(ctx, chromedp.Text(`button[data-testid="like"] span`, &likes, chromedp.ByQuery, chromedp.FromNode(node)))
-		}
-		if likes == "" {
-			_ = chromedp.Run(ctx, chromedp.AttributeValue(`button[data-testid="like"]`, "aria-label", &likes, nil, chromedp.ByQuery, chromedp.FromNode(node)))
-			if likes == "" {
-				_ = chromedp.Run(ctx, chromedp.AttributeValue(`button[data-testid="unlike"]`, "aria-label", &likes, nil, chromedp.ByQuery, chromedp.FromNode(node)))
-			}
-		}
-
-		// 观看量
-		_ = chromedp.Run(ctx, chromedp.Text(`a[aria-label*="analytics"] span`, &views, chromedp.ByQuery, chromedp.FromNode(node)))
-		if views == "" {
-			_ = chromedp.Run(ctx, chromedp.AttributeValue(`a[aria-label*="analytics"]`, "aria-label", &views, nil, chromedp.ByQuery, chromedp.FromNode(node)))
-		}
-
-		if i == 0 {
-			logger.Print("TW_DEBUG", fmt.Sprintf("原生样本 - 标题: %s, 时间: %s, 评论: %s, 转发: %s, 点赞: %s, 观看: %s",
-				truncate(title, 20), publishTime, comments, shares, likes, views))
-		}
+		// 循环打印每一条推文的完整详细数据
+		logger.Print("TW_DATA", fmt.Sprintf(
+			"发文 [%d] -> 时间: %s | 链接: %s | 标题: %s",
+			idx+1,
+			raw["publishTime"],
+			fullLink,
+			truncate(raw["title"], 30), // 标题较长时截断 30 字符展示，防止日志刷屏
+		))
 
 		posts = append(posts, scraper.Post{
-			Title:       title,
-			Link:        link,
-			PublishTime: publishTime,
-			Likes:       parseTwitterMetric(likes),
-			Comments:    parseTwitterMetric(comments),
-			Shares:      parseTwitterMetric(shares),
-			Views:       parseTwitterMetric(views),
+			Title:       raw["title"],
+			Link:        fullLink,
+			PublishTime: raw["publishTime"],
+			Likes:       parseTwitterMetric(raw["likes"]),
+			Comments:    parseTwitterMetric(raw["comments"]),
+			Shares:      parseTwitterMetric(raw["shares"]),
+			Views:       parseTwitterMetric(raw["views"]),
 		})
 	}
 
-	logger.Print("TW_FETCH", fmt.Sprintf("成功抓取到 %d 条发文", len(posts)))
+	logger.Print("TW_FETCH", fmt.Sprintf("抓取流执行完毕。本次成功收录 %d 条有效发文", len(posts)))
 	return scraper.FetchResult{Posts: posts}, nil
 }
 
@@ -147,23 +196,19 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-// parseTwitterMetric converts strings like "1.2K", "3M", "1,234" to integers.
 func parseTwitterMetric(s string) int {
 	s = strings.TrimSpace(strings.ToLower(s))
-	if s == "" {
+	if s == "" || strings.HasPrefix(s, "0 ") {
 		return 0
 	}
-	// 移除逗号
 	s = strings.ReplaceAll(s, ",", "")
 
-	// 处理 aria-label 可能带入的非数字字符（保留数字、点和单位）
-	// 例如 "123 replies" -> "123"
 	var clean strings.Builder
 	for _, r := range s {
 		if (r >= '0' && r <= '9') || r == '.' || r == 'k' || r == 'm' || r == 'b' {
 			clean.WriteRune(r)
 		} else if clean.Len() > 0 {
-			break // 遇到空格或其他字符停止
+			break
 		}
 	}
 	s = clean.String()
