@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	chrome "minimax_pro/internal/clock"
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/platform/facebook"
 	"minimax_pro/internal/platform/instagram"
@@ -198,7 +199,6 @@ func updateAccountStatus(ctx context.Context, id int, statusDesp string) error {
 // the real backend contract will be provided later.
 type postsUpdatePayload struct {
 	AccountID   int            `json:"account_id"`
-	ProfileID   int            `json:"profile_id"`
 	ProfileName string         `json:"profile_name"`
 	Platform    string         `json:"platform"`
 	SourceURL   string         `json:"source_url"`
@@ -223,7 +223,6 @@ func resolvePostsUpdateURL(override string) string {
 func callPostsUpdateAPI(ctx context.Context, logger *logx.Logger, endpoint string, payload postsUpdatePayload) error {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
-		logger.Print("POSTS_UPD", fmt.Sprintf("未配置发文数据更新接口，跳过 account_id=%d platform=%s posts=%d", payload.AccountID, payload.Platform, len(payload.Posts)))
 		return nil
 	}
 	body, err := json.Marshal(payload)
@@ -241,11 +240,13 @@ func callPostsUpdateAPI(ctx context.Context, logger *logx.Logger, endpoint strin
 		return err
 	}
 	defer resp.Body.Close()
+
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("posts update http %d: %s", resp.StatusCode, safeSnippet(string(raw), 300))
+		return fmt.Errorf("http status %d: %s", resp.StatusCode, safeSnippet(string(raw), 300))
 	}
-	logger.Print("POSTS_UPD", fmt.Sprintf("已推送发文数据 account_id=%d platform=%s posts=%d resp=%s", payload.AccountID, payload.Platform, len(payload.Posts), safeSnippet(string(raw), 200)))
+
+	logger.Print("POSTS_UPD", fmt.Sprintf("已成功推送发文数据 (account_id=%d, platform=%s, posts=%d)", payload.AccountID, payload.Platform, len(payload.Posts)))
 	return nil
 }
 
@@ -414,11 +415,28 @@ func startProfileByName(ctx context.Context, logger *logx.Logger, profileName st
 
 	logger.Print("4", "启动profile")
 	startErr := client.StartProfileBestEffort(localCtx, profileID)
+
+	// 💡 新增：捕获锁被占用错误并尝试释放重试
+	if startErr != nil && strings.Contains(startErr.Error(), "Profile is locked") {
+		logger.Print("4", "检测到指纹浏览器已被占用 (Profile is locked)，尝试强制释放并重试...")
+
+		// 1. 调用停止接口尝试解锁
+		_ = client.StopProfileBestEffort(localCtx, profileID)
+
+		// 2. 必须等待几秒，给浏览器关闭进程和云端同步留出时间
+		time.Sleep(10 * time.Second)
+
+		// 3. 重新尝试启动
+		logger.Print("4", "正在重新尝试启动 profile...")
+		startErr = client.StartProfileBestEffort(localCtx, profileID)
+	}
+
 	if startErr == nil {
 		logger.Print("4", "启动请求成功")
 	} else {
+		// 如果重试后依然失败，返回明确的错误提示
 		if strings.Contains(startErr.Error(), "Profile is locked") {
-			return startByNameResult{}, fmt.Errorf("指纹浏览器已被占用 (Profile is locked)")
+			return startByNameResult{}, fmt.Errorf("指纹浏览器已被占用 (Profile is locked)，自动释放后重试依然失败")
 		}
 		logger.Print("4", "启动请求异常，尝试继续检测状态")
 	}
@@ -506,11 +524,13 @@ func fetchPostsByPlatform(ctx context.Context, logger *logx.Logger, platform str
 	case "twitter", "x":
 		return twitter.FetchPosts(ctx, logger, req)
 	case "youtube", "yt":
-		return youtube.FetchPosts(ctx, logger, req)
+		return youtube.FetchYoutubePosts(ctx, logger, req)
 	case "instagram", "ig":
-		return instagram.FetchPosts(ctx, logger, req)
+		return instagram.FetchInstagramPosts(ctx, logger, req)
 	case "tiktok", "tt":
-		return tiktok.FetchPosts(ctx, logger, req)
+		return tiktok.FetchTikTokPosts(ctx, logger, req)
+	case "facebook", "fb":
+		return facebook.FetchFacebookPosts(ctx, logger, req)
 	default:
 		return scraper.FetchResult{}, fmt.Errorf("scraper: unsupported platform %q", platform)
 	}
@@ -553,6 +573,19 @@ type FetchPostsResponse struct {
 	ErrorInfo string                    `json:"error_info,omitempty"`
 }
 
+// 🌟 1. 重新定义推送给 Rails 的单条数据 Payload，完美对齐 params 键名
+type RailsPostParam struct {
+	AccountID     int64  `json:"account_id"`
+	PostDate      string `json:"post_date"` // 对应 params[:post_date]
+	URL           string `json:"url"`       // 对应 params[:url]
+	Title         string `json:"title"`
+	LikesCount    int    `json:"likes_count"`
+	SharesCount   int    `json:"shares_count"`
+	CommentsCount int    `json:"comments_count"`
+	ViewsCount    int    `json:"views_count"`
+	DataUpdatedAt string `json:"data_updated_at"`
+}
+
 func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -561,24 +594,15 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 		}
 
 		var req FetchPostsRequest
-		raw, err := decodeJSONBody(r, &req, 2<<20)
+		_, err := decodeJSONBody(r, &req, 2<<20)
 		if err != nil {
 			logger.Print("E", "fetch_posts JSON解析失败: "+err.Error())
-			logger.Print("E", "Content-Type: "+r.Header.Get("Content-Type"))
-			if raw != "" {
-				logger.Print("E", "Body: "+safeSnippet(raw, 1200))
-			}
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
 			return
 		}
-		logger.Print("FP_REQ", "Body: "+safeSnippet(raw, 1500))
 
-		if req.ProfileName == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
-			return
-		}
-		if len(req.ActiveAccounts) == 0 {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "active_accounts is required"})
+		if req.ProfileName == "" || len(req.ActiveAccounts) == 0 {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name and active_accounts are required"})
 			return
 		}
 		if req.Host == "" {
@@ -591,37 +615,36 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			req.WaitSeconds = accountDefaultWaitS
 		}
 
-		// updateEndpoint := resolvePostsUpdateURL(req.UpdateAPIURL)
+		updateEndpoint := resolvePostsUpdateURL(req.UpdateAPIURL)
 
-		// 1. 打开浏览器（启动 Profile）
-		logger.Print("FP1", fmt.Sprintf("开始启动Profile profile_name=%s accounts=%d", req.ProfileName, len(req.ActiveAccounts)))
+		// 1. 启动指纹浏览器环境
+		logger.Print("FP1", fmt.Sprintf("启动Profile环境: %s (任务数: %d)", req.ProfileName, len(req.ActiveAccounts)))
 		startRes, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
 			logger.Print("E", "启动Profile失败: "+err.Error())
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
-		logger.Print("FP2", "Profile已启动 profile_id="+startRes.ProfileID)
 
-		// 建立与指纹浏览器的连接
+		// 建立 CDP 远程连接
 		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(r.Context(), startRes.Info.WebsocketLink, chromedp.NoModifyURL)
 		defer cancelAlloc()
 
-		// 创建浏览器实例 context，并挂载日志过滤器
+		// 🌟 双重静音保险：阻止 Chrome 底层未定义事件乱喷日志
 		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
-			chromedp.WithLogf((&cdpFilterLogger{logger: logger}).Printf),
-			chromedp.WithErrorf((&cdpFilterLogger{logger: logger}).Printf),
+			chromedp.WithLogf(func(string, ...interface{}) {}),
+			chromedp.WithErrorf(func(string, ...interface{}) {}),
 		)
 		defer cancelBrowser()
 
-		// 记录所有打开的标签页 context 和 cancel，以便最后统一关闭
 		type tabInfo struct {
 			ctx    context.Context
 			cancel context.CancelFunc
 		}
 		openedTabs := make([]tabInfo, 0, len(req.ActiveAccounts))
-
 		results := make([]FetchPostsAccountResult, 0, len(req.ActiveAccounts))
+
+		// 2. 串行遍历账号采集
 		for i, acc := range req.ActiveAccounts {
 			res := FetchPostsAccountResult{
 				AccountID: acc.ID,
@@ -632,15 +655,13 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			}
 
 			trimmedURL := strings.TrimSpace(acc.SourceURL)
-			if acc.ID == 0 || strings.TrimSpace(acc.Platform) == "" || trimmedURL == "" {
-				res.ErrorInfo = "账号字段不完整 (id/platform/source_url)"
+			if acc.ID == 0 || strings.TrimSpace(acc.Platform) == "" {
+				res.ErrorInfo = "账号参数不完整"
 				results = append(results, res)
 				continue
 			}
 
-			// 2. 循环accounts打开各自的发文页面
-			// 2.1 获取一个账号的发文之后，再去打开下一个标签页获取账号发文
-			logger.Print("FP3", fmt.Sprintf("[%d/%d] 正在为 %s 打开新标签页: %s", i+1, len(req.ActiveAccounts), acc.Platform, trimmedURL))
+			logger.Print("FP3", fmt.Sprintf("[%d/%d] 正在创建标签页任务 -> 平台: %s", i+1, len(req.ActiveAccounts), acc.Platform))
 
 			tabCtx, cancelTab := chromedp.NewContext(browserCtx)
 			openedTabs = append(openedTabs, tabInfo{ctx: tabCtx, cancel: cancelTab})
@@ -653,7 +674,6 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 
 			if fetchErr != nil {
 				res.ErrorInfo = fetchErr.Error()
-				logger.Print("FP3", fmt.Sprintf("抓取失败 account_id=%d platform=%s err=%s", acc.ID, acc.Platform, fetchErr.Error()))
 			} else {
 				res.Posts = fetchRes.Posts
 				if res.Posts == nil {
@@ -661,28 +681,50 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 				}
 				res.PostCount = len(res.Posts)
 				res.Status = "normal"
-				logger.Print("FP3", fmt.Sprintf("抓取成功 account_id=%d platform=%s posts=%d", acc.ID, acc.Platform, res.PostCount))
 			}
 
-			/* 暂时关闭更新接口调用
-			updateErr := callPostsUpdateAPI(r.Context(), logger, updateEndpoint, postsUpdatePayload{
-				AccountID:   acc.ID,
-				ProfileID:   req.ID,
-				ProfileName: req.ProfileName,
-				Platform:    acc.Platform,
-				SourceURL:   trimmedURL,
-				Posts:       res.Posts,
-			})
-			if updateErr != nil {
-				res.UpdateSent = false
-				res.UpdateError = updateErr.Error()
-				logger.Print("E", fmt.Sprintf("更新发文数据失败 account_id=%d err=%s", acc.ID, updateErr.Error()))
-			} else {
-				res.UpdateSent = true
+			// 🌟 2. 核心调整：如果配置了接口，将多条发文拆解为 Rails 期待的单条参数，循环推送
+			if res.Status == "normal" && len(res.Posts) > 0 {
+				if updateEndpoint == "" {
+					logger.Print("POSTS_UPD", fmt.Sprintf("未配置发文更新接口，跳过同步 (account_id=%d)", acc.ID))
+				} else {
+					successCount := 0
+					for _, post := range res.Posts {
+						// 将提取出来的空串/相对时间转换为 Rails 能够解析的标准字符串
+						postDate := post.PublishTime
+						if postDate == "" {
+							postDate = time.Now().Format(time.RFC3339) // 如果拿不到时间，提供当前时间降级
+						}
+
+						// 转换为 Rails 对应的单条结构
+						payload := RailsPostParam{
+							AccountID:     int64(acc.ID),
+							PostDate:      postDate,
+							URL:           post.Link,
+							Title:         post.Title,
+							LikesCount:    post.Likes,
+							SharesCount:   post.Shares,
+							CommentsCount: post.Comments,
+							ViewsCount:    post.Views,
+							DataUpdatedAt: time.Now().Format(time.RFC3339),
+						}
+
+						// 发起请求
+						updateErr := callSinglePostUpdateAPI(r.Context(), logger, updateEndpoint, payload)
+						if updateErr != nil {
+							logger.Print("E", fmt.Sprintf("同步单条推文失败 (URL: %s): %s", post.Link, updateErr.Error()))
+							res.UpdateError = updateErr.Error()
+						} else {
+							successCount++
+						}
+					}
+
+					if successCount == len(res.Posts) {
+						res.UpdateSent = true
+					}
+					logger.Print("POSTS_UPD", fmt.Sprintf("账号(account_id=%d) 数据推送完毕。成功: %d/%d", acc.ID, successCount, len(res.Posts)))
+				}
 			}
-			*/
-			logger.Print("FP3", fmt.Sprintf("已跳过发文数据更新接口调用 (根据要求暂时关闭)"))
-			res.UpdateSent = false // 标记为未发送以在响应中体现
 
 			results = append(results, res)
 
@@ -691,14 +733,12 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			}
 		}
 
-		// 3. 各个账号获取完成以后关闭所有打开的标签页
-		logger.Print("FP4", "关闭所有打开的标签页")
+		// 3. 收尾清理
+		logger.Print("FP4", "任务结束，正在释放标签页与关闭Profile进程...")
 		for _, tab := range openedTabs {
 			tab.cancel()
 		}
 
-		// 再关闭浏览器（停止 Profile）
-		logger.Print("FP4", "停止Profile进程")
 		stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
 		_ = undetectable.NewClient(startRes.Host, startRes.Port).StopProfileBestEffort(stopCtx, startRes.ProfileID)
 		cancelStop()
@@ -710,7 +750,33 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 		})
 	}
 }
+func callSinglePostUpdateAPI(ctx context.Context, logger *logx.Logger, endpoint string, payload RailsPostParam) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
 
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("User-Agent", accountCheckUA)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("Rails返回错误码 %d: %s", resp.StatusCode, string(raw))
+	}
+
+	return nil
+}
 func main() {
 	logger := logx.New(os.Stdout)
 
@@ -1304,7 +1370,7 @@ func main() {
 			UndetectablePort: res.Port,
 		})
 	})
-
+	mux.HandleFunc("/api/browser/locked", chrome.GetLockedProfilesHandler(logger, "127.0.0.1", 25325))
 	addr := ":8080"
 	logger.Print("BOOT", "listening on "+addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
