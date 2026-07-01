@@ -102,6 +102,50 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func downloadVideoFromOss(ctx context.Context, logger *logx.Logger, ossURL string) (string, error) {
+	logger.Print("DL", "开始下载视频: "+ossURL)
+	parsedURL, err := url.Parse(ossURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid oss_url: %w", err)
+	}
+
+	resp, err := http.Get(ossURL)
+	if err != nil {
+		return "", fmt.Errorf("download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
+	}
+
+	ext := filepath.Ext(parsedURL.Path)
+	if ext == "" {
+		ext = ".mp4"
+	}
+
+	videoDir := `C:\Users\Administrator\Desktop\videos\`
+	if err := os.MkdirAll(videoDir, os.ModePerm); err != nil {
+		return "", fmt.Errorf("create video directory failed: %w", err)
+	}
+	localPath := filepath.Join(videoDir, fmt.Sprintf("video_%d%s", time.Now().UnixNano(), ext))
+
+	out, err := os.Create(localPath)
+	if err != nil {
+		return "", fmt.Errorf("create temp file failed: %w", err)
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		_ = os.Remove(localPath)
+		return "", fmt.Errorf("save file failed: %w", err)
+	}
+
+	logger.Print("DL", "视频下载完成: "+localPath)
+	return localPath, nil
+}
+
 func decodeJSONBody(r *http.Request, dst any, maxBytes int64) (string, error) {
 	if r.Body == nil {
 		return "", errors.New("empty body")
@@ -890,7 +934,7 @@ func main() {
 	type FacebookPublishRequest struct {
 		ProfileName      string `json:"profile_name"`
 		Title            string `json:"title"`
-		VideoPath        string `json:"video_path"`
+		VideoOssURL      string `json:"video_oss_url"`
 		Host             string `json:"host"`
 		Port             int    `json:"port"`
 		WaitSeconds      int    `json:"wait_seconds"`
@@ -931,16 +975,13 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
 			return
 		}
-		if req.VideoPath == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path is required"})
+		if req.VideoOssURL == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url is required"})
 			return
 		}
-		absVideoPath, err := filepath.Abs(req.VideoPath)
+
+		absVideoPath, err := downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
-		if _, err := os.Stat(absVideoPath); err != nil {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
@@ -948,6 +989,7 @@ func main() {
 		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
 			logger.Print("E", err.Error())
+			_ = os.Remove(absVideoPath)
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
@@ -964,6 +1006,7 @@ func main() {
 			select {
 			case <-r.Context().Done():
 				stopProfile("request canceled")
+				_ = os.Remove(absVideoPath)
 			}
 		}()
 		logger.Print("FB", "开始Facebook发布流程")
@@ -977,12 +1020,14 @@ func main() {
 		}); err != nil {
 			logger.Print("E", err.Error())
 			stopProfile("publish error")
+			_ = os.Remove(absVideoPath)
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
 
 		// 成功后也关闭 Profile，释放浏览器
 		stopProfile("publish success")
+		_ = os.Remove(absVideoPath)
 
 		writeJSON(w, http.StatusOK, FacebookPublishResponse{
 			Type:             "success",
@@ -1004,7 +1049,7 @@ func main() {
 			ProfileName      string `json:"profile_name"`
 			Text             string `json:"text"`
 			Title            string `json:"title"`
-			VideoPath        string `json:"video_path"`
+			VideoOssURL      string `json:"video_oss_url"`
 			Host             string `json:"host"`
 			Port             int    `json:"port"`
 			WaitSeconds      int    `json:"wait_seconds"`
@@ -1037,22 +1082,21 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
 			return
 		}
-		if req.VideoPath == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path is required"})
+		if req.VideoOssURL == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url is required"})
 			return
 		}
-		absVideoPath, err := filepath.Abs(req.VideoPath)
+
+		absVideoPath, err := downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
-		if _, err := os.Stat(absVideoPath); err != nil {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
+
 		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
 			logger.Print("E", err.Error())
+			_ = os.Remove(absVideoPath)
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
@@ -1073,12 +1117,14 @@ func main() {
 			stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
 			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 			cancelStop()
+			_ = os.Remove(absVideoPath)
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
 		stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
 		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 		cancelStop()
+		_ = os.Remove(absVideoPath)
 		writeJSON(w, http.StatusOK, TwitterPublishResponse{
 			Type:             "success",
 			ProfileID:        res.ProfileID,
@@ -1099,7 +1145,7 @@ func main() {
 			Text             string `json:"text"`
 			Title            string `json:"title"`
 			Description      string `json:"description"`
-			VideoPath        string `json:"video_path"`
+			VideoOssURL      string `json:"video_oss_url"`
 			Host             string `json:"host"`
 			Port             int    `json:"port"`
 			WaitSeconds      int    `json:"wait_seconds"`
@@ -1132,22 +1178,21 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
 			return
 		}
-		if req.VideoPath == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path is required"})
+		if req.VideoOssURL == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url is required"})
 			return
 		}
-		absVideoPath, err := filepath.Abs(req.VideoPath)
+
+		absVideoPath, err := downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
-		if _, err := os.Stat(absVideoPath); err != nil {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
+
 		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
 			logger.Print("E", err.Error())
+			_ = os.Remove(absVideoPath)
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
@@ -1166,6 +1211,7 @@ func main() {
 			ProfileID:        res.ProfileID,
 		}); err != nil {
 			logger.Print("E", err.Error())
+			_ = os.Remove(absVideoPath)
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
@@ -1173,6 +1219,7 @@ func main() {
 		stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
 		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 		cancelStop()
+		_ = os.Remove(absVideoPath)
 		writeJSON(w, http.StatusOK, YouTubePublishResponse{
 			Type:             "success",
 			ProfileID:        res.ProfileID,
@@ -1192,7 +1239,7 @@ func main() {
 			ProfileName      string `json:"profile_name"`
 			Text             string `json:"text"`
 			Title            string `json:"title"`
-			VideoPath        string `json:"video_path"`
+			VideoOssURL      string `json:"video_oss_url"`
 			Host             string `json:"host"`
 			Port             int    `json:"port"`
 			WaitSeconds      int    `json:"wait_seconds"`
@@ -1225,22 +1272,21 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
 			return
 		}
-		if req.VideoPath == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path is required"})
+		if req.VideoOssURL == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url is required"})
 			return
 		}
-		absVideoPath, err := filepath.Abs(req.VideoPath)
+
+		absVideoPath, err := downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
-		if _, err := os.Stat(absVideoPath); err != nil {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
+
 		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
 			logger.Print("E", err.Error())
+			_ = os.Remove(absVideoPath)
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
@@ -1258,6 +1304,7 @@ func main() {
 			ProfileID:        res.ProfileID,
 		}); err != nil {
 			logger.Print("E", err.Error())
+			_ = os.Remove(absVideoPath)
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
@@ -1265,6 +1312,7 @@ func main() {
 		stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
 		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 		cancelStop()
+		_ = os.Remove(absVideoPath)
 		writeJSON(w, http.StatusOK, TikTokPublishResponse{
 			Type:             "success",
 			ProfileID:        res.ProfileID,
@@ -1285,7 +1333,7 @@ func main() {
 			ProfileName      string `json:"profile_name"`
 			Text             string `json:"text"`
 			Title            string `json:"title"`
-			VideoPath        string `json:"video_path"`
+			VideoOssURL      string `json:"video_oss_url"`
 			Host             string `json:"host"`
 			Port             int    `json:"port"`
 			WaitSeconds      int    `json:"wait_seconds"`
@@ -1318,22 +1366,21 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
 			return
 		}
-		if req.VideoPath == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path is required"})
+		if req.VideoOssURL == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url is required"})
 			return
 		}
-		absVideoPath, err := filepath.Abs(req.VideoPath)
+
+		absVideoPath, err := downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
-		if _, err := os.Stat(absVideoPath); err != nil {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
+
 		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
 			logger.Print("E", err.Error())
+			_ = os.Remove(absVideoPath)
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
@@ -1354,12 +1401,14 @@ func main() {
 			stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
 			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 			cancelStop()
+			_ = os.Remove(absVideoPath)
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
 		stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
 		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 		cancelStop()
+		_ = os.Remove(absVideoPath)
 		writeJSON(w, http.StatusOK, InstagramPublishResponse{
 			Type:             "success",
 			ProfileID:        res.ProfileID,
