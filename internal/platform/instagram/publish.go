@@ -224,7 +224,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 }
 
 func waitForHeading(ctx context.Context, logger *logx.Logger, text string) error {
-	deadline := time.Now().Add(180 * time.Second)
+	deadline := time.Now().Add(250 * time.Second)
 	for time.Now().Before(deadline) {
 		var found bool
 		js := fmt.Sprintf(`(function(){

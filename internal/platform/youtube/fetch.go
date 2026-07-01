@@ -13,9 +13,10 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-// FetchYoutubePosts scrapes Shorts post metrics directly from the current view by matching exact class elements.
+// FetchYoutubePosts scrapes Shorts post metrics directly from the current view and visits detail pages for likes.
 func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.FetchRequest) (scraper.FetchResult, error) {
-	logger.Print("YT_FETCH", "开始 YouTube Studio 正式版极速采集流程")
+	// [精炼] 合并初始化日志
+	logger.Print("YT_FETCH", "初始化采集: 导航至 Shorts 后台并准备注入脚本...")
 
 	// 1. 创建局部静音上下文
 	silentCtx, silentCancel := chromedp.NewContext(ctx,
@@ -25,7 +26,6 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 
 	// 2. 强行导航至后台主页
 	targetURL := "https://studio.youtube.com/"
-	logger.Print("YT_FETCH", "正在直达 YouTube Studio 后台: "+targetURL)
 	if err := chromedp.Run(silentCtx, chromedp.Navigate(targetURL)); err != nil {
 		return scraper.FetchResult{}, fmt.Errorf("navigate to studio failed: %w", err)
 	}
@@ -37,15 +37,12 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 	}
 
 	shortsURL := strings.TrimSuffix(currentURL, "/") + "/videos/short"
-	logger.Print("YT_FETCH", "重定向切换至 Shorts 后台目标页 -> "+shortsURL)
-
 	redirectJS := fmt.Sprintf(`window.location.href = "%s";`, shortsURL)
 	if err := chromedp.Run(silentCtx, chromedp.Evaluate(redirectJS, nil)); err != nil {
 		return scraper.FetchResult{}, fmt.Errorf("location redirect failed: %w", err)
 	}
 
 	// 4. 等待表格内容渲染
-	logger.Print("YT_FETCH", "等待数据表格完全渲染...")
 	waitListSel := `ytcp-video-section-content#video-list`
 	if err := chromedp.Run(silentCtx, chromedp.WaitVisible(waitListSel, chromedp.ByQuery)); err != nil {
 		return scraper.FetchResult{}, fmt.Errorf("wait for video list table failed: %w", err)
@@ -53,7 +50,6 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 	time.Sleep(3 * time.Second) // 预留稳定性数据行落字缓冲
 
 	// 5. 注入高精度 Class 定位采集脚本
-	logger.Print("YT_FETCH", "注入精准节点嗅探与去重脚本...")
 	runScript := `
     (() => {
         window._ytPostsData = [];
@@ -66,7 +62,6 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
             try {
                 let parsedTimestamp = Date.parse(cleanStr);
                 if (isNaN(parsedTimestamp)) {
-                    // 适配可能存在的中文排版格式
                     let match = cleanStr.match(/(\d{4})[-年](\d{1,2})[-月](\d{1,2})/);
                     if (match) {
                         let pad = (n) => n.length < 2 ? '0' + n : n;
@@ -126,12 +121,9 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
             if (titleNode) {
                 let editHref = titleNode.getAttribute('href') || ""; 
                 let titleText = titleNode.innerText || "";
-                
                 let videoId = editHref.replace("/video/", "").replace("/edit", "").trim();
                 
                 if (videoId && !postsMap.has(videoId)) {
-                    
-                    // 1. 🌟 核心修复：精准隔离文本节点，剔除下方的 status div 影响
                     let dateCell = queryInsideShadow(row, '.tablecell-date');
                     let rawDate = "";
                     if (dateCell) {
@@ -146,24 +138,17 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
                     }
                     let standardDate = formatYoutubeDate(rawDate);
 
-                    // 2. 抓取观看量
                     let viewsCell = queryInsideShadow(row, '.tablecell-views');
                     let viewsStr = viewsCell ? viewsCell.innerText.replace(/[\r\n]+/g, "").trim() : "0";
 
-                    // 3. 抓取评论数
                     let commentsCell = queryInsideShadow(row, '.tablecell-comments a');
                     let commentsStr = commentsCell ? commentsCell.innerText.trim() : "0";
-
-                    // 4. 抓取点赞数（后台结构中若未提供 likes 独立展示，默认同步为 0 或解析相关单元格）
-                    let likesCell = queryInsideShadow(row, '.tablecell-likes .likes-label') || queryInsideShadow(row, '[class*="likes"]');
-                    let likesStr = likesCell ? likesCell.innerText.trim() : "0";
 
                     postsMap.set(videoId, {
                         title: titleText,
                         video_id: videoId,
                         publishTime: standardDate,
                         views: viewsStr,
-                        likes: likesStr,
                         comments: commentsStr,
                         shares: "0"
                     });
@@ -172,9 +157,8 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
         });
 
         window._ytPostsData = Array.from(postsMap.values());
-        window._ytScrollDone = true;
     })()
-	`
+    `
 
 	if err := chromedp.Run(silentCtx, chromedp.Evaluate(runScript, nil)); err != nil {
 		return scraper.FetchResult{}, fmt.Errorf("inject scroll script failed: %w", err)
@@ -190,35 +174,68 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 		return scraper.FetchResult{}, fmt.Errorf("数据列解析完成，但未成功生成有效映射记录")
 	}
 
-	// 7. 格式化数据并逐条规范打印
+	// 7. 遍历数据：打开新标签页进入 Shorts 详情页单独抓取点赞量，随后关闭
 	var posts []scraper.Post
-	logger.Print("YT_FETCH", "开始解析并逐条打印 YouTube Shorts 发文明细:")
+
+	// [精炼] 提示解析出的数量
+	logger.Print("YT_FETCH", fmt.Sprintf("嗅探到 %d 条记录，开始追溯点赞明细...", len(jsResult)))
 
 	for idx, raw := range jsResult {
 		fullShortsURL := "https://www.youtube.com/shorts/" + raw["video_id"]
+		likesStr := "0"
 
+		// 创建新的空标签页/上下文隔离详情页请求
+		detailCtx, detailCancel := chromedp.NewContext(silentCtx)
+
+		likeSelector := `div.ytSpecButtonShapeWithLabelLabel span`
+		timeoutCtx, timeoutCancel := context.WithTimeout(detailCtx, 5*time.Second)
+
+		err := chromedp.Run(timeoutCtx,
+			chromedp.Navigate(fullShortsURL),
+			chromedp.WaitVisible(likeSelector, chromedp.ByQuery),
+			chromedp.Text(likeSelector, &likesStr, chromedp.ByQuery),
+		)
+
+		timeoutCancel()
+		detailCancel()
+
+		if err != nil {
+			// [精炼] 警告日志更简短
+			logger.Print("YT_WARN", fmt.Sprintf("视频 [%s] 点赞抓取失败(超时/受限)", raw["video_id"]))
+			likesStr = "0"
+		}
+
+		// 处理点赞数为 "like" 或空的情况
+		likesStr = strings.TrimSpace(likesStr)
+		if likesStr == "" || strings.EqualFold(likesStr, "like") {
+			likesStr = "0"
+		}
+
+		// [精炼] 截取日期的前半部分 (去除 00:00:00)
+		shortDate := raw["publishTime"]
+		if parts := strings.Split(shortDate, " "); len(parts) > 0 {
+			shortDate = parts[0]
+		}
+
+		// [精炼] 数据行排版紧凑对齐
 		logger.Print("YT_DATA", fmt.Sprintf(
-			"发文 [%d] -> 时间: %s | 观看: %s | 评论: %s | 点赞: %s | 链接: %s",
-			idx+1,
-			raw["publishTime"],
-			raw["views"],
-			raw["comments"],
-			raw["likes"],
-			fullShortsURL,
+			"#%02d | 日期: %s | 观看: %-3s | 评论: %-2s | 点赞: %-3s | %s",
+			idx+1, shortDate, raw["views"], raw["comments"], likesStr, fullShortsURL,
 		))
 
 		posts = append(posts, scraper.Post{
 			Title:       raw["title"],
 			Link:        fullShortsURL,
 			PublishTime: raw["publishTime"],
-			Likes:       parseYoutubeMetric(raw["likes"]),
+			Likes:       parseYoutubeMetric(likesStr),
 			Comments:    parseYoutubeMetric(raw["comments"]),
 			Shares:      0,
 			Views:       parseYoutubeMetric(raw["views"]),
 		})
 	}
 
-	logger.Print("YT_FETCH", fmt.Sprintf("YouTube 抓取执行完毕。本次成功收录 %d 条有效 Shorts 视频数据", len(posts)))
+	// [精炼] 结束语精简
+	logger.Print("YT_FETCH", fmt.Sprintf("采集完成: 共收录 %d 条有效数据", len(posts)))
 	return scraper.FetchResult{Posts: posts}, nil
 }
 

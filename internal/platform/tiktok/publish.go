@@ -110,6 +110,15 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		return errors.New("TT2 tiktok not logged in in this profile")
 	}
 
+	// 💡 修改点1：前置检查页面刚打开时是否直接弹出了账号异常/功能不可用提示
+	anomalyCheckCtx, cancelAnomalyCheck := context.WithTimeout(tabCtx, 4*time.Second)
+	var anomalyNodes []*cdp.Node
+	_ = chromedp.Run(anomalyCheckCtx, chromedp.Nodes(`//*[contains(text(), 'Feature unavailable') or contains(text(), 'Feature restricted') or contains(text(), '功能不可用') or contains(text(), 'Action Blocked')]`, &anomalyNodes, chromedp.BySearch))
+	cancelAnomalyCheck()
+	if len(anomalyNodes) > 0 {
+		return errors.New("TT2 tiktok account anomaly pre-check: Feature unavailable")
+	}
+
 	if err := waitAndUploadFile(tabCtx, logger, absVideoPath); err != nil {
 		return fmt.Errorf("TT3 %v", err)
 	}
@@ -324,8 +333,17 @@ func waitAndUploadFile(ctx context.Context, logger *logx.Logger, absVideoPath st
 	var found string
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
+		// 💡 修改点2：在查找控件循环中，同步动态监测页面是否突发 Feature unavailable 阻断
+		anomalyCtx, cancelAnomaly := context.WithTimeout(ctx, 2*time.Second)
+		var anomalyNodes []*cdp.Node
+		_ = chromedp.Run(anomalyCtx, chromedp.Nodes(`//*[contains(text(), 'Feature unavailable') or contains(text(), 'Feature restricted') or contains(text(), '功能不可用') or contains(text(), 'Action Blocked')]`, &anomalyNodes, chromedp.BySearch))
+		cancelAnomaly()
+		if len(anomalyNodes) > 0 {
+			return errors.New("TT3 tiktok account anomaly: Feature unavailable")
+		}
+
 		for _, sel := range uploadSelectors {
-			checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			checkCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 			var nodes []*cdp.Node
 			_ = chromedp.Run(checkCtx, chromedp.Nodes(sel, &nodes, chromedp.BySearch))
 			cancel()
@@ -342,12 +360,23 @@ func waitAndUploadFile(ctx context.Context, logger *logx.Logger, absVideoPath st
 	if found == "" {
 		return errors.New("TT3 video upload control not found within 60 seconds")
 	}
+
 	logger.Print("TT3", "使用选择器: "+found)
-	if err := chromedp.Run(ctx, chromedp.WaitReady(found, chromedp.BySearch)); err != nil {
-		return err
+
+	// 💡 修改点3：绝不在父级 5 分钟 Context 上无限死等，将后续交互包裹在独立的 20 秒短超时内
+	uploadCtx, cancelUpload := context.WithTimeout(ctx, 20*time.Second)
+	defer cancelUpload()
+
+	if err := chromedp.Run(uploadCtx, chromedp.WaitReady(found, chromedp.BySearch)); err != nil {
+		// 如果 Ready 超时或失败，判定是否是由风控弹窗拦截导致
+		return checkAnomalyContext(ctx, fmt.Errorf("TT3 wait upload input ready failed: %v", err))
 	}
+
 	logger.Print("TT4", "开始选择视频文件: "+absVideoPath)
-	return chromedp.Run(ctx, chromedp.SetUploadFiles(found, []string{absVideoPath}, chromedp.BySearch))
+	if err := chromedp.Run(uploadCtx, chromedp.SetUploadFiles(found, []string{absVideoPath}, chromedp.BySearch)); err != nil {
+		return checkAnomalyContext(ctx, fmt.Errorf("TT4 set upload files failed: %v", err))
+	}
+	return nil
 }
 
 // dismissPopups 关闭上传过程中的提示弹窗
@@ -635,4 +664,14 @@ func waitPublishEffect(ctx context.Context, logger *logx.Logger) error {
 		time.Sleep(600 * time.Millisecond)
 	}
 	return errors.New("TT6 publish effect not observed")
+}
+func checkAnomalyContext(ctx context.Context, originalErr error) error {
+	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	var nodes []*cdp.Node
+	_ = chromedp.Run(checkCtx, chromedp.Nodes(`//*[contains(text(), 'Feature unavailable') or contains(text(), 'Feature restricted') or contains(text(), '功能不可用') or contains(text(), 'Action Blocked')]`, &nodes, chromedp.BySearch))
+	if len(nodes) > 0 {
+		return errors.New("TT3 tiktok account anomaly: Feature unavailable interrupted the upload process")
+	}
+	return originalErr
 }
