@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
+	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/undetectable"
 
-	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
 )
@@ -31,12 +31,13 @@ type SendMessageRequest struct {
 
 // SendMessage 向指定用户发送私信
 // 参数说明:
-//   SessionID: 会话ID
-//   TargetPlatform: 目标平台
-//   TargetProfileURL: 目标用户主页链接
-//   AccountID: 使用的账号ID
-//   BrowserName: 使用的指纹浏览器名称
-//   MessageContent: 消息内容
+//
+//	SessionID: 会话ID
+//	TargetPlatform: 目标平台
+//	TargetProfileURL: 目标用户主页链接
+//	AccountID: 使用的账号ID
+//	BrowserName: 使用的指纹浏览器名称
+//	MessageContent: 消息内容
 func SendMessage(ctx context.Context, logger *logx.Logger, req SendMessageRequest) error {
 	if req.WebsocketURL == "" {
 		return errors.New("TT_MSG0 websocket_url is required")
@@ -68,10 +69,14 @@ func SendMessage(ctx context.Context, logger *logx.Logger, req SendMessageReques
 			return chromedp.Run(closeTabCtx, chromedp.Evaluate(`window.close()`, &result))
 		}))
 
-		logger.Print("TT_MSG7", "关闭浏览器窗口")
-		closeCtx, cancelClose := context.WithTimeout(context.Background(), 6*time.Second)
-		defer cancelClose()
-		_ = chromedp.Run(closeCtx, browser.Close())
+		logger.Print("TT_MSG7", "关闭所有标签页")
+		closeCtx, cancelClose := context.WithTimeout(allocCtx, 10*time.Second)
+		if err := chromedputil.CloseAllTabsThenBrowser(closeCtx); err != nil {
+			logger.Print("TT_MSG7", "关闭标签页失败: "+err.Error())
+		} else {
+			logger.Print("TT_MSG7", "已关闭所有标签页")
+		}
+		cancelClose()
 
 		if req.ProfileID != "" && req.UndetectableHost != "" && req.UndetectablePort != 0 {
 			stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)

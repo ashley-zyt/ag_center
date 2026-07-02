@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"minimax_pro/internal/chromedputil"
 	chrome "minimax_pro/internal/clock"
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/platform/facebook"
@@ -26,7 +27,6 @@ import (
 	"minimax_pro/internal/platform/youtube"
 	"minimax_pro/internal/undetectable"
 
-	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/chromedp"
 )
 
@@ -365,8 +365,8 @@ func checkAccountLogin(ctx context.Context, logger *logx.Logger, item AccountChe
 	defer cancelTab()
 
 	defer func() {
-		closeCtx, cancelClose := context.WithTimeout(context.Background(), 6*time.Second)
-		_ = chromedp.Run(closeCtx, browser.Close())
+		closeCtx, cancelClose := context.WithTimeout(allocCtx, 10*time.Second)
+		_ = chromedputil.CloseAllTabsThenBrowser(closeCtx)
 		cancelClose()
 
 		stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)

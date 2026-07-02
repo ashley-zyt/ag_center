@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/undetectable"
 
-	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
@@ -71,10 +71,14 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	)
 	defer cancelTab()
 	defer func() {
-		closeCtx, cancelClose := context.WithTimeout(allocCtx, 6*time.Second)
-		_ = chromedp.Run(closeCtx, browser.Close())
+		logger.Print("YTB12", "关闭所有标签页")
+		closeCtx, cancelClose := context.WithTimeout(allocCtx, 10*time.Second)
+		if err := chromedputil.CloseAllTabsThenBrowser(closeCtx); err != nil {
+			logger.Print("YTB12", "关闭标签页失败: "+err.Error())
+		} else {
+			logger.Print("YTB12", "已关闭所有标签页")
+		}
 		cancelClose()
-		logger.Print("YTB12", "关闭浏览器窗口完成")
 		if req.ProfileID != "" && req.UndetectableHost != "" && req.UndetectablePort != 0 {
 			stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
 			_ = undetectable.NewClient(req.UndetectableHost, req.UndetectablePort).StopProfileBestEffort(stopCtx, req.ProfileID)

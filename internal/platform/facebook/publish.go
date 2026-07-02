@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/undetectable"
 	"os"
 	"path/filepath"
@@ -13,7 +14,6 @@ import (
 
 	"minimax_pro/internal/logx"
 
-	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
 )
@@ -84,14 +84,14 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	)
 	defer cancelTab()
 	defer func() {
-		logger.Print("FB7", "关闭浏览器窗口")
-		closeCtx, cancelClose := context.WithTimeout(allocCtx, 5*time.Second)
-		defer cancelClose()
-		if err := chromedp.Run(closeCtx, browser.Close()); err != nil {
-			logger.Print("FB7", "关闭浏览器失败: "+err.Error())
+		logger.Print("FB7", "关闭所有标签页")
+		closeCtx, cancelClose := context.WithTimeout(allocCtx, 10*time.Second)
+		if err := chromedputil.CloseAllTabsThenBrowser(closeCtx); err != nil {
+			logger.Print("FB7", "关闭标签页失败: "+err.Error())
 		} else {
-			logger.Print("FB7", "已关闭浏览器窗口")
+			logger.Print("FB7", "已关闭所有标签页")
 		}
+		cancelClose()
 		if req.ProfileID != "" && req.UndetectableHost != "" && req.UndetectablePort != 0 {
 			stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
 			_ = undetectable.NewClient(req.UndetectableHost, req.UndetectablePort).StopProfileBestEffort(stopCtx, req.ProfileID)

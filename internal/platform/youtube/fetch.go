@@ -184,23 +184,64 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 		fullShortsURL := "https://www.youtube.com/shorts/" + raw["video_id"]
 		likesStr := "0"
 
-		// 创建新的空标签页/上下文隔离详情页请求
 		detailCtx, detailCancel := chromedp.NewContext(silentCtx)
 
-		likeSelector := `div.ytSpecButtonShapeWithLabelLabel span`
-		timeoutCtx, timeoutCancel := context.WithTimeout(detailCtx, 5*time.Second)
+		likeSelectors := []string{
+			`div.ytSpecButtonShapeWithLabelLabel span`,
+			`yt-spec-button-shape-next span.yt-spec-button-shape-next__text`,
+			`button[aria-label*="like"] span`,
+			`.like-button-view-model span`,
+		}
+
+		timeoutCtx, timeoutCancel := context.WithTimeout(detailCtx, 15*time.Second)
 
 		err := chromedp.Run(timeoutCtx,
 			chromedp.Navigate(fullShortsURL),
-			chromedp.WaitVisible(likeSelector, chromedp.ByQuery),
-			chromedp.Text(likeSelector, &likesStr, chromedp.ByQuery),
+			chromedp.Sleep(2*time.Second),
+			chromedp.WaitVisible(`ytd-shorts-video-renderer`, chromedp.ByQuery),
 		)
+
+		if err == nil {
+			for _, selector := range likeSelectors {
+				err = chromedp.Run(timeoutCtx, chromedp.WaitVisible(selector, chromedp.ByQuery))
+				if err == nil {
+					err = chromedp.Run(timeoutCtx, chromedp.Text(selector, &likesStr, chromedp.ByQuery))
+					if err == nil {
+						break
+					}
+				}
+			}
+		}
+
+		if err != nil {
+			timeoutCancel()
+			retryCtx, retryCancel := context.WithTimeout(detailCtx, 10*time.Second)
+			time.Sleep(3 * time.Second)
+
+			retryErr := chromedp.Run(retryCtx,
+				chromedp.WaitVisible(`ytd-shorts-video-renderer`, chromedp.ByQuery),
+			)
+
+			if retryErr == nil {
+				for _, selector := range likeSelectors {
+					retryErr = chromedp.Run(retryCtx, chromedp.WaitVisible(selector, chromedp.ByQuery))
+					if retryErr == nil {
+						retryErr = chromedp.Run(retryCtx, chromedp.Text(selector, &likesStr, chromedp.ByQuery))
+						if retryErr == nil {
+							err = nil
+							break
+						}
+					}
+				}
+			}
+
+			retryCancel()
+		}
 
 		timeoutCancel()
 		detailCancel()
 
 		if err != nil {
-			// [精炼] 警告日志更简短
 			logger.Print("YT_WARN", fmt.Sprintf("视频 [%s] 点赞抓取失败(超时/受限)", raw["video_id"]))
 			likesStr = "0"
 		}
