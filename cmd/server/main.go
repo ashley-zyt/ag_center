@@ -935,6 +935,7 @@ func main() {
 		ProfileName      string `json:"profile_name"`
 		Title            string `json:"title"`
 		VideoOssURL      string `json:"video_oss_url"`
+		VideoPath        string `json:"video_path"`
 		Host             string `json:"host"`
 		Port             int    `json:"port"`
 		WaitSeconds      int    `json:"wait_seconds"`
@@ -975,15 +976,30 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
 			return
 		}
-		if req.VideoOssURL == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url is required"})
+		if req.VideoOssURL == "" && req.VideoPath == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url or video_path is required"})
 			return
 		}
 
-		absVideoPath, err := downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
+		var absVideoPath string
+		if req.VideoOssURL != "" {
+			var err error
+			absVideoPath, err = downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+				return
+			}
+		} else {
+			var err error
+			absVideoPath, err = filepath.Abs(req.VideoPath)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid video_path: " + err.Error()})
+				return
+			}
+			if _, err := os.Stat(absVideoPath); err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path file not found"})
+				return
+			}
 		}
 
 		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
@@ -1050,6 +1066,7 @@ func main() {
 			Text             string `json:"text"`
 			Title            string `json:"title"`
 			VideoOssURL      string `json:"video_oss_url"`
+			VideoPath        string `json:"video_path"`
 			Host             string `json:"host"`
 			Port             int    `json:"port"`
 			WaitSeconds      int    `json:"wait_seconds"`
@@ -1082,15 +1099,30 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
 			return
 		}
-		if req.VideoOssURL == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url is required"})
+		if req.VideoOssURL == "" && req.VideoPath == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url or video_path is required"})
 			return
 		}
 
-		absVideoPath, err := downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
+		var absVideoPath string
+		if req.VideoOssURL != "" {
+			var err error
+			absVideoPath, err = downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+				return
+			}
+		} else {
+			var err error
+			absVideoPath, err = filepath.Abs(req.VideoPath)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid video_path: " + err.Error()})
+				return
+			}
+			if _, err := os.Stat(absVideoPath); err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path file not found"})
+				return
+			}
 		}
 
 		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
@@ -1146,6 +1178,7 @@ func main() {
 			Title            string `json:"title"`
 			Description      string `json:"description"`
 			VideoOssURL      string `json:"video_oss_url"`
+			VideoPath        string `json:"video_path"`
 			Host             string `json:"host"`
 			Port             int    `json:"port"`
 			WaitSeconds      int    `json:"wait_seconds"`
@@ -1178,15 +1211,30 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
 			return
 		}
-		if req.VideoOssURL == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url is required"})
+		if req.VideoOssURL == "" && req.VideoPath == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url or video_path is required"})
 			return
 		}
 
-		absVideoPath, err := downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
+		var absVideoPath string
+		if req.VideoOssURL != "" {
+			var err error
+			absVideoPath, err = downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+				return
+			}
+		} else {
+			var err error
+			absVideoPath, err = filepath.Abs(req.VideoPath)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid video_path: " + err.Error()})
+				return
+			}
+			if _, err := os.Stat(absVideoPath); err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path file not found"})
+				return
+			}
 		}
 
 		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
@@ -1240,6 +1288,7 @@ func main() {
 			Text             string `json:"text"`
 			Title            string `json:"title"`
 			VideoOssURL      string `json:"video_oss_url"`
+			VideoPath        string `json:"video_path"`
 			Host             string `json:"host"`
 			Port             int    `json:"port"`
 			WaitSeconds      int    `json:"wait_seconds"`
@@ -1272,15 +1321,30 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
 			return
 		}
-		if req.VideoOssURL == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url is required"})
+		if req.VideoOssURL == "" && req.VideoPath == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url or video_path is required"})
 			return
 		}
 
-		absVideoPath, err := downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
+		var absVideoPath string
+		if req.VideoOssURL != "" {
+			var err error
+			absVideoPath, err = downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+				return
+			}
+		} else {
+			var err error
+			absVideoPath, err = filepath.Abs(req.VideoPath)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid video_path: " + err.Error()})
+				return
+			}
+			if _, err := os.Stat(absVideoPath); err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path file not found"})
+				return
+			}
 		}
 
 		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
@@ -1334,6 +1398,7 @@ func main() {
 			Text             string `json:"text"`
 			Title            string `json:"title"`
 			VideoOssURL      string `json:"video_oss_url"`
+			VideoPath        string `json:"video_path"`
 			Host             string `json:"host"`
 			Port             int    `json:"port"`
 			WaitSeconds      int    `json:"wait_seconds"`
@@ -1366,15 +1431,30 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
 			return
 		}
-		if req.VideoOssURL == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url is required"})
+		if req.VideoOssURL == "" && req.VideoPath == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url or video_path is required"})
 			return
 		}
 
-		absVideoPath, err := downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
+		var absVideoPath string
+		if req.VideoOssURL != "" {
+			var err error
+			absVideoPath, err = downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+				return
+			}
+		} else {
+			var err error
+			absVideoPath, err = filepath.Abs(req.VideoPath)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid video_path: " + err.Error()})
+				return
+			}
+			if _, err := os.Stat(absVideoPath); err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path file not found"})
+				return
+			}
 		}
 
 		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
