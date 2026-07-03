@@ -11,7 +11,6 @@ import (
 
 	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/logx"
-	"minimax_pro/internal/undetectable"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
@@ -78,22 +77,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 			var result interface{}
 			return chromedp.Run(closeTabCtx, chromedp.Evaluate(`window.close()`, &result))
 		}))
-
-		logger.Print("TT7", "关闭所有标签页")
-		closeCtx, cancelClose := context.WithTimeout(allocCtx, 10*time.Second)
-		if err := chromedputil.CloseAllTabsThenBrowser(closeCtx); err != nil {
-			logger.Print("TT7", "关闭标签页失败: "+err.Error())
-		} else {
-			logger.Print("TT7", "已关闭所有标签页")
-		}
-		cancelClose()
-
-		if req.ProfileID != "" && req.UndetectableHost != "" && req.UndetectablePort != 0 {
-			stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
-			defer cancelStop()
-			_ = undetectable.NewClient(req.UndetectableHost, req.UndetectablePort).StopProfileBestEffort(stopCtx, req.ProfileID)
-			logger.Print("TT7", "已请求停止Undetectable Profile")
-		}
+		chromedputil.CloseTabsAndStopProfile(ctx, allocCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "TT7")
 		logger.Print("TT7", "资源清理完成")
 	}()
 

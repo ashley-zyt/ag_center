@@ -364,15 +364,7 @@ func checkAccountLogin(ctx context.Context, logger *logx.Logger, item AccountChe
 	tabCtx, cancelTab := chromedp.NewContext(allocCtx)
 	defer cancelTab()
 
-	defer func() {
-		closeCtx, cancelClose := context.WithTimeout(allocCtx, 10*time.Second)
-		_ = chromedputil.CloseAllTabsThenBrowser(closeCtx)
-		cancelClose()
-
-		stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
-		_ = undetectable.NewClient(startRes.Host, startRes.Port).StopProfileBestEffort(stopCtx, startRes.ProfileID)
-		cancelStop()
-	}()
+	defer stopProfileWithCleanup(context.Background(), logger, allocCtx, startRes.Host, startRes.Port, startRes.ProfileID)
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 30*time.Second)
 	defer cancelTimeout()
@@ -496,6 +488,17 @@ func startProfileByName(ctx context.Context, logger *logx.Logger, profileName st
 	logger.Print("5", "已启动")
 
 	return startByNameResult{ProfileID: profileID, Info: info, Host: host, Port: port, Path: path}, nil
+}
+
+func stopProfileWithCleanup(ctx context.Context, logger *logx.Logger, allocCtx context.Context, host string, port int, profileID string) {
+	if allocCtx != nil {
+		closeCtx, cancelClose := context.WithTimeout(allocCtx, 10*time.Second)
+		_ = chromedputil.CloseAllTabsThenBrowser(closeCtx)
+		cancelClose()
+	}
+	stopCtx, cancelStop := context.WithTimeout(ctx, 6*time.Second)
+	_ = undetectable.NewClient(host, port).StopProfileBestEffort(stopCtx, profileID)
+	cancelStop()
 }
 
 func resolveUndetectablePath(explicit string) string {
@@ -783,9 +786,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			tab.cancel()
 		}
 
-		stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
-		_ = undetectable.NewClient(startRes.Host, startRes.Port).StopProfileBestEffort(stopCtx, startRes.ProfileID)
-		cancelStop()
+		stopProfileWithCleanup(context.Background(), logger, allocCtx, startRes.Host, startRes.Port, startRes.ProfileID)
 
 		writeJSON(w, http.StatusOK, FetchPostsResponse{
 			Type:      "success",

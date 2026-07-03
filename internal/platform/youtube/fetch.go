@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/platform/scraper"
 
@@ -239,6 +240,11 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 		}
 
 		timeoutCancel()
+
+		closeTabCtx, cancelCloseTab := context.WithTimeout(detailCtx, 3*time.Second)
+		_ = chromedputil.CloseAllTabsThenBrowser(closeTabCtx)
+		cancelCloseTab()
+
 		detailCancel()
 
 		if err != nil {

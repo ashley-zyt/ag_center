@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"minimax_pro/internal/chromedputil"
-	"minimax_pro/internal/undetectable"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,22 +71,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 			(&filterLogger{logger: logger}).Printf(format, v...)
 		}),
 	)
-	defer func() {
-		logger.Print("TW7", "关闭所有标签页")
-		closeCtx, cancelClose := context.WithTimeout(allocCtx, 10*time.Second)
-		if err := chromedputil.CloseAllTabsThenBrowser(closeCtx); err != nil {
-			logger.Print("TW7", "关闭标签页失败: "+err.Error())
-		} else {
-			logger.Print("TW7", "已关闭所有标签页")
-		}
-		cancelClose()
-		if req.ProfileID != "" && req.UndetectableHost != "" && req.UndetectablePort != 0 {
-			stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
-			_ = undetectable.NewClient(req.UndetectableHost, req.UndetectablePort).StopProfileBestEffort(stopCtx, req.ProfileID)
-			cancelStop()
-			logger.Print("TW7", "已请求停止Undetectable Profile")
-		}
-	}()
+	defer chromedputil.CloseTabsAndStopProfile(ctx, allocCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "TW7")
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 4*time.Minute)
 	defer cancelTimeout()
