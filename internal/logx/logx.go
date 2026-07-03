@@ -1,7 +1,6 @@
 package logx
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -10,15 +9,15 @@ import (
 )
 
 type Logger struct {
-	mu     sync.Mutex
-	bufOut *bufio.Writer
+	mu  sync.Mutex
+	out io.Writer
 }
 
 func New(out io.Writer) *Logger {
 	if out == nil {
 		out = os.Stdout
 	}
-	return &Logger{bufOut: bufio.NewWriterSize(out, 1)}
+	return &Logger{out: out}
 }
 
 func (l *Logger) Print(step string, msg string) {
@@ -27,6 +26,17 @@ func (l *Logger) Print(step string, msg string) {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_, _ = l.bufOut.WriteString(line)
-	_ = l.bufOut.Flush()
+	_, _ = l.out.Write([]byte(line))
+
+	if f, ok := l.out.(*os.File); ok {
+		_ = f.Sync()
+	}
+}
+
+func ForceFlushStdout() {
+	_ = os.Stdout.Sync()
+}
+
+func ForceFlushStderr() {
+	_ = os.Stderr.Sync()
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"minimax_pro/internal/chromedputil"
 	"os"
 	"path/filepath"
@@ -30,15 +29,12 @@ func (l *filterLogger) Printf(format string, v ...interface{}) {
 		msg = format
 	}
 
-	// 过滤已知且无害的 unmarshal 错误
 	if strings.Contains(msg, "could not unmarshal event: unknown PrivateNetworkRequestPolicy value") ||
 		strings.Contains(msg, "could not unmarshal event: unknown ClientNavigationReason value") {
 		return
 	}
 
-	// 其他日志正常输出，但在前面加上 [CDP] 标识以便区分
-	// 注意：chromedp 的日志通常比较底层，如果不是为了调试，也可以选择完全屏蔽
-	log.Printf("[CDP] %s", msg)
+	l.logger.Print("CDP", msg)
 }
 
 type PublishRequest struct {

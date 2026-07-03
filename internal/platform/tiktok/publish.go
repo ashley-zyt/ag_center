@@ -111,6 +111,11 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		return fmt.Errorf("TT3 %v", err)
 	}
 
+	logger.Print("TT4", "检查页面是否出现错误提示")
+	if checkSomethingWentWrong(tabCtx) {
+		return errors.New("TT4 Something went wrong")
+	}
+
 	_ = dismissPopups(tabCtx, logger)
 
 	if req.Text != "" {
@@ -118,8 +123,15 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 			return fmt.Errorf("TT5 %v", err)
 		}
 	}
+
+	logger.Print("TT6", "发布前检查页面是否出现错误提示")
+	if checkSomethingWentWrong(tabCtx) {
+		return errors.New("TT6 Something went wrong")
+	}
+
 	logger.Print("TT6", "已填写标题，等待点击发布")
 	time.Sleep(120 * time.Second)
+
 	if err := clickPost(tabCtx, logger); err != nil {
 		return fmt.Errorf("TT6 %v", err)
 	}
@@ -662,4 +674,28 @@ func checkAnomalyContext(ctx context.Context, originalErr error) error {
 		return errors.New("TT3 tiktok account anomaly: Feature unavailable interrupted the upload process")
 	}
 	return originalErr
+}
+
+func checkSomethingWentWrong(ctx context.Context) bool {
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	var hasError bool
+	checkJs := `(function(){
+		var bodyText = document.body.textContent || "";
+		if (bodyText.includes("Something went wrong")) {
+			return true;
+		}
+		var dialogs = document.querySelectorAll('div[role="dialog"], div[class*="modal"], div[class*="error"], div[class*="alert"]');
+		for(var i=0;i<dialogs.length;i++){
+			var txt = dialogs[i].textContent || "";
+			if(txt.includes("Something went wrong")){
+				return true;
+			}
+		}
+		return false;
+	})()`
+
+	_ = chromedp.Run(checkCtx, chromedp.Evaluate(checkJs, &hasError))
+	return hasError
 }

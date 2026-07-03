@@ -83,7 +83,7 @@ func FetchFacebookPosts(ctx context.Context, logger *logx.Logger, req scraper.Fe
 	// 组装结果
 	var posts []scraper.Post
 	for _, item := range results {
-		fmt.Printf("[序列: %s] [时间: %s] [链接: %s] 标题: %s\n", item["index"], item["time"], item["link"], item["title"])
+		logger.Print("FB_DATA", fmt.Sprintf("[序列: %s] [时间: %s] [链接: %s] 标题: %s", item["index"], item["time"], item["link"], item["title"]))
 
 		posts = append(posts, scraper.Post{
 			Title:       item["title"],
