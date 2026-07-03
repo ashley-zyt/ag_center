@@ -166,6 +166,11 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		return fmt.Errorf("IG4 %v", err)
 	}
 
+	logger.Print("IG4", "检查视频格式是否被浏览器识别")
+	if err := checkVideoFileError(tabCtx, logger); err != nil {
+		return fmt.Errorf("IG4 %v", err)
+	}
+
 	logger.Print("IG4", "等待Next按钮出现（素材已选择）")
 	if err := waitAndClick(tabCtx, logger, `div[role="dialog"]>div[role="button"]`, "Next"); err != nil {
 		return fmt.Errorf("IG4 %v", err)
@@ -542,6 +547,37 @@ func fillCaption(ctx context.Context, logger *logx.Logger, text string) error {
 		}
 	}
 	return errors.New("IG5 cannot find caption input on instagram")
+}
+
+func checkVideoFileError(ctx context.Context, logger *logx.Logger) error {
+	checkCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	var hasError bool
+	checkJs := `(function(){
+		var bodyText = document.body.textContent || "";
+		if (bodyText.includes("This video file could not be read by your browser")) {
+			return true;
+		}
+		var errorEls = document.querySelectorAll('div[role="dialog"] div, div[role="dialog"] span');
+		for(var i=0;i<errorEls.length;i++){
+			var txt = errorEls[i].textContent || "";
+			if(txt.includes("This video file could not be read by your browser")){
+				return true;
+			}
+		}
+		return false;
+	})()`
+
+	_ = chromedp.Run(checkCtx, chromedp.Evaluate(checkJs, &hasError))
+
+	if hasError {
+		logger.Print("IG4", "检测到视频格式错误提示：This video file could not be read by your browser")
+		return errors.New("视频格式有误，浏览器无法读取该视频文件")
+	}
+
+	logger.Print("IG4", "视频文件检查通过，未发现格式错误")
+	return nil
 }
 
 func clickShare(ctx context.Context, logger *logx.Logger) error {
