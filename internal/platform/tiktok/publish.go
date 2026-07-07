@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/logx"
+	"minimax_pro/internal/undetectable"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
@@ -77,7 +79,22 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 			var result interface{}
 			return chromedp.Run(closeTabCtx, chromedp.Evaluate(`window.close()`, &result))
 		}))
-		chromedputil.CloseTabsAndStopProfile(ctx, allocCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "TT7")
+
+		logger.Print("TT7", "关闭所有标签页")
+		closeCtx, cancelClose := context.WithTimeout(allocCtx, 10*time.Second)
+		if err := chromedputil.CloseAllTabsThenBrowser(closeCtx); err != nil {
+			logger.Print("TT7", "关闭标签页失败: "+err.Error())
+		} else {
+			logger.Print("TT7", "已关闭所有标签页")
+		}
+		cancelClose()
+
+		if req.ProfileID != "" && req.UndetectableHost != "" && req.UndetectablePort != 0 {
+			stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
+			defer cancelStop()
+			_ = undetectable.NewClient(req.UndetectableHost, req.UndetectablePort).StopProfileBestEffort(stopCtx, req.ProfileID)
+			logger.Print("TT7", "已请求停止Undetectable Profile")
+		}
 		logger.Print("TT7", "资源清理完成")
 	}()
 
@@ -111,11 +128,6 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		return fmt.Errorf("TT3 %v", err)
 	}
 
-	logger.Print("TT4", "检查页面是否出现错误提示")
-	if checkSomethingWentWrong(tabCtx) {
-		return errors.New("TT4 Something went wrong")
-	}
-
 	_ = dismissPopups(tabCtx, logger)
 
 	if req.Text != "" {
@@ -123,15 +135,14 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 			return fmt.Errorf("TT5 %v", err)
 		}
 	}
-
-	logger.Print("TT6", "发布前检查页面是否出现错误提示")
-	if checkSomethingWentWrong(tabCtx) {
-		return errors.New("TT6 Something went wrong")
-	}
-
 	logger.Print("TT6", "已填写标题，等待点击发布")
-	time.Sleep(120 * time.Second)
 
+	// logger.Print("TT6", "发布前检查页面是否出现错误提示")
+	// if checkSomethingWentWrong(tabCtx) {
+	// 	return errors.New("TT6 Something went wrong")
+	// }
+
+	time.Sleep(120 * time.Second)
 	if err := clickPost(tabCtx, logger); err != nil {
 		return fmt.Errorf("TT6 %v", err)
 	}
@@ -420,11 +431,27 @@ func dismissPopups(ctx context.Context, logger *logx.Logger) error {
 
 // fillText 填写标题：对 Draft.js 容器执行全选删除和粘贴，失败则键盘输入兜底
 func fillText(ctx context.Context, logger *logx.Logger, text string) error {
-	logger.Print("TT5", "填写视频文案")
-	// 精确定位到 DraftEditor-editorContainer > public-DraftEditor-content > div[data-contents='true']
+	logger.Print("TT5", "========== 开始填写视频文案 ==========")
+	logger.Print("TT5", "待填写文本长度: "+strconv.Itoa(len(text))+" 字符")
+	logger.Print("TT5", "文本预览(前100字符): "+text[:min(len(text), 100)])
+
+	time.Sleep(6 * time.Second)
+	if checkSomethingWentWrong(ctx) {
+		logger.Print("TT5", "【错误】在等待6秒后检测到 Something went wrong")
+		return errors.New("TT5 Something went wrong detected after initial sleep")
+	}
+
 	childSel := `div.DraftEditor-editorContainer > div.public-DraftEditor-content > div[data-contents="true"]`
 	contentSel := `div.DraftEditor-editorContainer > div.public-DraftEditor-content`
 	logger.Print("TT5", "定位标题容器: "+childSel)
+
+	time.Sleep(6 * time.Second)
+	if checkSomethingWentWrong(ctx) {
+		logger.Print("TT5", "【错误】在定位标题容器后检测到 Something went wrong")
+		return errors.New("TT5 Something went wrong detected after locating caption container")
+	}
+
+	logger.Print("TT5", "Step1: 等待元素可见并点击")
 	stepCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	err := chromedp.Run(stepCtx,
 		chromedp.WaitVisible(childSel, chromedp.ByQuery),
@@ -434,55 +461,116 @@ func fillText(ctx context.Context, logger *logx.Logger, text string) error {
 	)
 	cancel()
 	if err != nil {
-		logger.Print("TT5", "未找到标题元素: "+err.Error())
+		logger.Print("TT5", "Step1 失败: 未找到标题元素 - "+err.Error())
 		return errors.New("TT5 cannot find tiktok caption input")
 	}
-	logger.Print("TT5", "已点击并获取焦点")
-	// 选择全部并删除
-	selectCtx, cancelSel := context.WithTimeout(ctx, 4*time.Second)
-	err = chromedp.Run(selectCtx,
-		chromedp.SendKeys(contentSel, kb.Control+"a", chromedp.ByQuery),
-		chromedp.SendKeys(contentSel, kb.Delete, chromedp.ByQuery),
-	)
-	cancelSel()
-	if err != nil {
-		logger.Print("TT5", "全选删除失败: "+err.Error())
-	} else {
-		logger.Print("TT5", "已全选并清空")
+	logger.Print("TT5", "Step1 完成: 已点击并获取焦点")
+
+	if checkSomethingWentWrong(ctx) {
+		logger.Print("TT5", "【错误】在 Step1 点击后检测到 Something went wrong")
+		return errors.New("TT5 Something went wrong detected after click and focus")
 	}
-	// 粘贴标题（优先使用 insertText，失败则回退为直接文本输入）
-	var ok bool
-	js := fmt.Sprintf(`(function(T){
-		var el=document.querySelector(%q);
+
+	time.Sleep(6 * time.Second)
+	if checkSomethingWentWrong(ctx) {
+		logger.Print("TT5", "【错误】在 Step1 后等待6秒检测到 Something went wrong")
+		return errors.New("TT5 Something went wrong detected after step1 sleep")
+	}
+
+	logger.Print("TT5", "Step2: 使用 JavaScript 清空原有内容")
+	var clearOk bool
+	clearJs := fmt.Sprintf(`(function(sel){
+		var el=document.querySelector(sel);
 		if(!el){return false;}
 		el.focus();
 		try{
-			var sel=window.getSelection(); if(sel){sel.removeAllRanges(); var r=document.createRange(); r.selectNodeContents(el); sel.addRange(r);}
+			var sel=window.getSelection();
+			if(sel){
+				sel.removeAllRanges();
+				var r=document.createRange();
+				r.selectNodeContents(el);
+				sel.addRange(r);
+			}
 		}catch(e){}
-		try{if(document.execCommand('insertText', false, T)) return true;}catch(e){}
-		el.textContent=T;
+		try{document.execCommand('delete', false, null);}catch(e){}
+		el.textContent='';
 		try{el.dispatchEvent(new InputEvent('input',{bubbles:true}));}catch(e){el.dispatchEvent(new Event('input',{bubbles:true}));}
 		return true;
-	})(%q)`, contentSel, text)
-	typeCtx, cancelType := context.WithTimeout(ctx, 5*time.Second)
-	if err := chromedp.Run(typeCtx, chromedp.Evaluate(js, &ok)); err != nil {
-		logger.Print("TT5", "插入文本执行异常: "+err.Error())
-	}
-	cancelType()
-	if !ok {
-		// 兜底使用键盘输入
-		type2Ctx, cancelType2 := context.WithTimeout(ctx, 5*time.Second)
-		if err := chromedp.Run(type2Ctx, chromedp.SendKeys(contentSel, text, chromedp.ByQuery)); err != nil {
-			cancelType2()
-			logger.Print("TT5", "键盘兜底输入失败: "+err.Error())
-			return err
+	})(%q)`, contentSel)
+	selectCtx, cancelSel := context.WithTimeout(ctx, 4*time.Second)
+	err = chromedp.Run(selectCtx, chromedp.Evaluate(clearJs, &clearOk))
+	cancelSel()
+	if err != nil || !clearOk {
+		logger.Print("TT5", "Step2 警告: JavaScript 清空失败 - "+err.Error())
+		logger.Print("TT5", "Step2: 回退使用键盘全选删除")
+		keyCtx, cancelKey := context.WithTimeout(ctx, 4*time.Second)
+		err = chromedp.Run(keyCtx,
+			chromedp.SendKeys(contentSel, kb.Control+"a", chromedp.ByQuery),
+			chromedp.SendKeys(contentSel, kb.Backspace, chromedp.ByQuery),
+		)
+		cancelKey()
+		if err != nil {
+			logger.Print("TT5", "Step2 警告: 键盘全选删除也失败 - "+err.Error())
+		} else {
+			logger.Print("TT5", "Step2 完成: 使用键盘全选删除")
 		}
-		cancelType2()
-		logger.Print("TT5", "插入文本失败，已使用键盘兜底")
 	} else {
-		logger.Print("TT5", "使用insertText粘贴成功")
+		logger.Print("TT5", "Step2 完成: 使用 JavaScript 清空成功")
 	}
-	logger.Print("TT5", "文本已填写")
+
+	time.Sleep(6 * time.Second)
+	if checkSomethingWentWrong(ctx) {
+		logger.Print("TT5", "【错误】在 Step2 后等待6秒检测到 Something went wrong")
+		return errors.New("TT5 Something went wrong detected after step2 sleep")
+	}
+
+	logger.Print("TT5", "Step3: 使用 chromedp.SendKeys 输入文本")
+	typeCtx, cancelType := context.WithTimeout(ctx, 10*time.Second)
+	if err := chromedp.Run(typeCtx, chromedp.SendKeys(contentSel, text, chromedp.ByQuery)); err != nil {
+		cancelType()
+		logger.Print("TT5", "Step3 警告: SendKeys 执行异常 - "+err.Error())
+		logger.Print("TT5", "Step3: SendKeys 失败，尝试使用 JavaScript 插入文本")
+		var inputOk bool
+		inputJs := fmt.Sprintf(`(function(T){
+			var el=document.querySelector(%q);
+			if(!el){return false;}
+			el.focus();
+			el.textContent=T;
+			try{el.dispatchEvent(new InputEvent('input',{bubbles:true}));}catch(e){}
+			return true;
+		})(%q)`, contentSel, text)
+		jsCtx, cancelJs := context.WithTimeout(ctx, 5*time.Second)
+		if err := chromedp.Run(jsCtx, chromedp.Evaluate(inputJs, &inputOk)); err != nil {
+			cancelJs()
+			logger.Print("TT5", "Step3 失败: JavaScript 插入也失败 - "+err.Error())
+			return errors.New("TT5 cannot input text via SendKeys or JavaScript")
+		}
+		cancelJs()
+		if !inputOk {
+			logger.Print("TT5", "Step3 失败: JavaScript 插入返回 false")
+			return errors.New("TT5 JavaScript input returned false")
+		}
+		logger.Print("TT5", "Step3 完成: 使用 JavaScript 插入文本成功")
+	} else {
+		cancelType()
+		logger.Print("TT5", "Step3 完成: 使用 SendKeys 输入成功")
+	}
+
+	logger.Print("TT5", "Step3: 输入完成，等待3秒后检测页面状态")
+	time.Sleep(3 * time.Second)
+
+	if checkSomethingWentWrong(ctx) {
+		logger.Print("TT5", "【错误】在 Step3 输入后检测到 Something went wrong")
+		return errors.New("TT5 Something went wrong detected after input")
+	}
+
+	time.Sleep(6 * time.Second)
+	if checkSomethingWentWrong(ctx) {
+		logger.Print("TT5", "【错误】在 Step3 后等待6秒检测到 Something went wrong")
+		return errors.New("TT5 Something went wrong detected after step3 sleep")
+	}
+
+	logger.Print("TT5", "========== 填写视频文案完成 ==========")
 	return nil
 }
 
@@ -682,15 +770,41 @@ func checkSomethingWentWrong(ctx context.Context) bool {
 
 	var hasError bool
 	checkJs := `(function(){
-		var bodyText = document.body.textContent || "";
-		if (bodyText.includes("Something went wrong")) {
-			return true;
+		function isVisible(el){
+			if(!el) return false;
+			var style = window.getComputedStyle(el);
+			return style && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
 		}
-		var dialogs = document.querySelectorAll('div[role="dialog"], div[class*="modal"], div[class*="error"], div[class*="alert"]');
-		for(var i=0;i<dialogs.length;i++){
-			var txt = dialogs[i].textContent || "";
-			if(txt.includes("Something went wrong")){
-				return true;
+		var spans = document.querySelectorAll('span.TUXText--weight-bold');
+		for(var i=0;i<spans.length;i++){
+			var span = spans[i];
+			if(span.textContent && span.textContent.trim() === 'Something went wrong'){
+				if(isVisible(span)){
+					var parent = span.parentElement;
+					while(parent){
+						var parentText = parent.textContent || '';
+						if(parentText.includes('Please try again') || parentText.includes('Retry')){
+							return true;
+						}
+						parent = parent.parentElement;
+					}
+				}
+			}
+		}
+		var allSpans = document.querySelectorAll('span');
+		for(var i=0;i<allSpans.length;i++){
+			var span = allSpans[i];
+			if(span.textContent && span.textContent.trim() === 'Something went wrong'){
+				if(isVisible(span)){
+					var parent = span.parentElement;
+					while(parent){
+						var parentText = parent.textContent || '';
+						if(parentText.includes('Please try again') || parentText.includes('Retry')){
+							return true;
+						}
+						parent = parent.parentElement;
+					}
+				}
 			}
 		}
 		return false;

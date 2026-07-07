@@ -60,7 +60,6 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	logger.Print("IG1", "连接浏览器WebSocket")
 
 	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(ctx, req.WebsocketURL, chromedp.NoModifyURL)
-	defer cancelAlloc()
 
 	tabCtx, cancelTab := chromedp.NewContext(allocCtx,
 		chromedp.WithLogf(func(format string, v ...interface{}) {
@@ -82,6 +81,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		}))
 		chromedputil.CloseTabsAndStopProfile(ctx, allocCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "IG7")
 	}()
+	defer cancelAlloc()
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 5*time.Minute)
 	defer cancelTimeout()
@@ -166,13 +166,13 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		return fmt.Errorf("IG4 %v", err)
 	}
 
-	logger.Print("IG4", "检查视频格式是否被浏览器识别")
-	if err := checkVideoFileError(tabCtx, logger); err != nil {
+	logger.Print("IG4", "等待Next按钮出现（素材已选择）")
+	if err := waitAndClick(tabCtx, logger, `div[role="dialog"]>div[role="button"]`, "Next"); err != nil {
 		return fmt.Errorf("IG4 %v", err)
 	}
 
-	logger.Print("IG4", "等待Next按钮出现（素材已选择）")
-	if err := waitAndClick(tabCtx, logger, `div[role="dialog"]>div[role="button"]`, "Next"); err != nil {
+	logger.Print("IG4", "检查视频格式是否被浏览器识别")
+	if err := checkVideoFileError(tabCtx, logger); err != nil {
 		return fmt.Errorf("IG4 %v", err)
 	}
 
@@ -237,13 +237,86 @@ func waitForHeading(ctx context.Context, logger *logx.Logger, text string) error
 	}
 	var dialogHTML string
 	_ = chromedp.Run(ctx, chromedp.Evaluate(`(function(){var d=document.querySelector('div[role="dialog"]');return d?d.outerHTML:'NO_DIALOG';})()`, &dialogHTML))
-	logger.Print("IG", "弹窗内容: "+dialogHTML)
 	return fmt.Errorf("IG5 heading not found: %s", text)
 }
 
 func waitAndClick(ctx context.Context, logger *logx.Logger, parentSel string, buttonText string) error {
 	deadline := time.Now().Add(60 * time.Second)
+	startedAt := time.Now()
 	for time.Now().Before(deadline) {
+		var debugInfo interface{}
+		errorCtx, cancelError := context.WithTimeout(ctx, 3*time.Second)
+		err := chromedp.Run(errorCtx, chromedp.Evaluate(`(function(){
+			var result = {hasError: false, hasNext: false, isLoading: false, debug: ''};
+			var dialog = document.querySelector("div[aria-label=\"Video couldn't be uploaded\"]");
+			if(dialog){
+				var style = window.getComputedStyle(dialog);
+				result.debug += 'dialog_found:' + (style.display !== 'none' && style.visibility !== 'hidden') + ';';
+				if(style && style.display !== 'none' && style.visibility !== 'hidden'){
+					result.hasError = true;
+					return result;
+				}
+			}else{
+				result.debug += 'dialog_not_found;';
+			}
+			var h3s = document.querySelectorAll('h3');
+			result.debug += 'h3_count:' + h3s.length + ';';
+			for(var i=0;i<h3s.length;i++){
+				if(h3s[i].textContent && h3s[i].textContent.trim() === 'This video file could not be read by your browser'){
+					var style = window.getComputedStyle(h3s[i]);
+					result.debug += 'h3_matched_visible:' + (style.display !== 'none' && style.visibility !== 'hidden') + ';';
+					if(style && style.display !== 'none' && style.visibility !== 'hidden'){
+						result.hasError = true;
+						return result;
+					}
+				}
+			}
+			var mainDialog = document.querySelector('div[role="dialog"]');
+			if(mainDialog){
+				var nextBtn = null;
+				var btns = mainDialog.querySelectorAll('[role="button"]');
+				for(var i=0;i<btns.length;i++){
+					var t = (btns[i].textContent||"").trim();
+					if(t.includes('Next')){
+						nextBtn = btns[i];
+						break;
+					}
+				}
+				if(nextBtn){
+					var nextStyle = window.getComputedStyle(nextBtn);
+					if(nextStyle.display !== 'none' && nextStyle.visibility !== 'hidden'){
+						result.hasNext = true;
+					}
+				}
+				result.debug += 'has_next:' + result.hasNext + ';';
+			}
+			var loadingSpinners = document.querySelectorAll('svg[role="progressbar"], .x1fgarty, .x1sphbuq');
+			result.isLoading = loadingSpinners.length > 0;
+			result.debug += 'loading_count:' + loadingSpinners.length + ';';
+			return result;
+		})()`, &debugInfo))
+		cancelError()
+		if err != nil {
+			logger.Print("IG", "视频状态检测执行失败: "+err.Error())
+		} else {
+			logger.Print("IG", "视频状态检测结果: "+fmt.Sprintf("%v", debugInfo))
+			if debugMap, ok := debugInfo.(map[string]interface{}); ok {
+				if hasError, ok := debugMap["hasError"].(bool); ok && hasError {
+					logger.Print("IG", "检测到视频上传错误弹窗")
+					return errors.New("视频格式有误")
+				}
+				if hasNext, ok := debugMap["hasNext"].(bool); ok && hasNext {
+					logger.Print("IG", "检测到 Next 按钮已出现，准备点击")
+				}
+				isLoading, _ := debugMap["isLoading"].(bool)
+				elapsed := time.Since(startedAt).Seconds()
+				if elapsed > 15 && !isLoading {
+					logger.Print("IG", "视频上传超时: 15秒后仍未出现 Next 按钮且不在加载状态")
+					return errors.New("视频上传超时，无法加载视频内容")
+				}
+			}
+		}
+
 		var clicked bool
 		js := fmt.Sprintf(`(function(){
 			var dialog = document.querySelector('div[role="dialog"]');
@@ -269,7 +342,7 @@ func waitAndClick(ctx context.Context, logger *logx.Logger, parentSel string, bu
 	}
 	var dialogHTML string
 	_ = chromedp.Run(ctx, chromedp.Evaluate(`(function(){var d=document.querySelector('div[role="dialog"]');return d?d.outerHTML:'NO_DIALOG';})()`, &dialogHTML))
-	logger.Print("IG", "弹窗内容: "+dialogHTML)
+
 	return fmt.Errorf("IG5 cannot find or click button: %s", buttonText)
 }
 
@@ -555,15 +628,22 @@ func checkVideoFileError(ctx context.Context, logger *logx.Logger) error {
 
 	var hasError bool
 	checkJs := `(function(){
-		var bodyText = document.body.textContent || "";
-		if (bodyText.includes("This video file could not be read by your browser")) {
+		function isVisible(el){
+			if(!el) return false;
+			var style = window.getComputedStyle(el);
+			return style && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+		}
+		var errorDialog = document.querySelector("div[aria-label=\"Video couldn't be uploaded\"]");
+		if(errorDialog && isVisible(errorDialog)){
 			return true;
 		}
-		var errorEls = document.querySelectorAll('div[role="dialog"] div, div[role="dialog"] span');
-		for(var i=0;i<errorEls.length;i++){
-			var txt = errorEls[i].textContent || "";
-			if(txt.includes("This video file could not be read by your browser")){
-				return true;
+		var h3s = document.querySelectorAll('h3');
+		for(var i=0;i<h3s.length;i++){
+			var h3 = h3s[i];
+			if(h3.textContent && h3.textContent.trim() === 'This video file could not be read by your browser'){
+				if(isVisible(h3)){
+					return true;
+				}
 			}
 		}
 		return false;

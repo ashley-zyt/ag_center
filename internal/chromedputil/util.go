@@ -12,6 +12,10 @@ import (
 )
 
 func CloseAllTabsThenBrowser(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	targets, err := target.GetTargets().Do(ctx)
 	if err != nil {
 		return err
@@ -39,6 +43,9 @@ func CloseAllTabsThenBrowser(ctx context.Context) error {
 		wg.Add(1)
 		go func(targetID target.ID) {
 			defer wg.Done()
+			if ctx.Err() != nil {
+				return
+			}
 			closeCtx, cancelClose := context.WithTimeout(ctx, 3*time.Second)
 			defer cancelClose()
 			_ = target.CloseTarget(targetID).Do(closeCtx)
@@ -53,7 +60,7 @@ func CloseTabsAndStopProfile(ctx context.Context, allocCtx context.Context, logg
 	profileID, undetectableHost string, undetectablePort int, platformTag string) {
 
 	if allocCtx != nil {
-		closeCtx, cancelClose := context.WithTimeout(allocCtx, 5*time.Second)
+		closeCtx, cancelClose := context.WithTimeout(allocCtx, 15*time.Second)
 		if err := CloseAllTabsThenBrowser(closeCtx); err != nil {
 			logger.Print(platformTag, "清理标签页遇到异常 (Best Effort): "+err.Error())
 		} else {

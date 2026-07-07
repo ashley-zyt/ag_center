@@ -61,7 +61,6 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	logger.Print("TW1", "连接浏览器WebSocket")
 
 	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(ctx, req.WebsocketURL, chromedp.NoModifyURL)
-	defer cancelAlloc()
 
 	tabCtx, _ := chromedp.NewContext(allocCtx,
 		chromedp.WithLogf(func(format string, v ...interface{}) {
@@ -71,7 +70,9 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 			(&filterLogger{logger: logger}).Printf(format, v...)
 		}),
 	)
+
 	defer chromedputil.CloseTabsAndStopProfile(ctx, allocCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "TW7")
+	defer cancelAlloc()
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 4*time.Minute)
 	defer cancelTimeout()

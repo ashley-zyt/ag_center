@@ -53,7 +53,6 @@ func SendMessage(ctx context.Context, logger *logx.Logger, req SendMessageReques
 
 	logger.Print("TT_MSG1", "连接浏览器WebSocket")
 	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(ctx, req.WebsocketURL, chromedp.NoModifyURL)
-	defer cancelAlloc()
 
 	tabCtx, _ := chromedp.NewContext(allocCtx,
 		chromedp.WithLogf(func(format string, v ...interface{}) { (&filterLogger{logger: logger}).Printf(format, v...) }),
@@ -70,6 +69,7 @@ func SendMessage(ctx context.Context, logger *logx.Logger, req SendMessageReques
 		chromedputil.CloseTabsAndStopProfile(ctx, allocCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "TT_MSG7")
 		logger.Print("TT_MSG7", "资源清理完成")
 	}()
+	defer cancelAlloc()
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 5*time.Minute)
 	defer cancelTimeout()
