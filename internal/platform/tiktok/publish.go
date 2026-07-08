@@ -16,7 +16,6 @@ import (
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
-	"github.com/chromedp/chromedp/kb"
 )
 
 type filterLogger struct {
@@ -477,97 +476,85 @@ func fillText(ctx context.Context, logger *logx.Logger, text string) error {
 		return errors.New("TT5 Something went wrong detected after step1 sleep")
 	}
 
-	logger.Print("TT5", "Step2: 使用 JavaScript 清空原有内容")
-	var clearOk bool
-	clearJs := fmt.Sprintf(`(function(sel){
+	logger.Print("TT5", "Step2: 使用 JavaScript 全选，然后输入新文本（直接替换原有内容）")
+	var selectOk bool
+	selectJs := fmt.Sprintf(`(function(sel){
 		var el=document.querySelector(sel);
 		if(!el){return false;}
 		el.focus();
 		try{
-			var sel=window.getSelection();
-			if(sel){
-				sel.removeAllRanges();
-				var r=document.createRange();
-				r.selectNodeContents(el);
-				sel.addRange(r);
+			var selection=window.getSelection();
+			if(selection){
+				selection.removeAllRanges();
+				var range=document.createRange();
+				range.selectNodeContents(el);
+				selection.addRange(range);
 			}
 		}catch(e){}
-		try{document.execCommand('delete', false, null);}catch(e){}
-		el.textContent='';
-		try{el.dispatchEvent(new InputEvent('input',{bubbles:true}));}catch(e){el.dispatchEvent(new Event('input',{bubbles:true}));}
 		return true;
 	})(%q)`, contentSel)
-	selectCtx, cancelSel := context.WithTimeout(ctx, 4*time.Second)
-	err = chromedp.Run(selectCtx, chromedp.Evaluate(clearJs, &clearOk))
-	cancelSel()
-	if err != nil || !clearOk {
-		logger.Print("TT5", "Step2 警告: JavaScript 清空失败 - "+err.Error())
-		logger.Print("TT5", "Step2: 回退使用键盘全选删除")
-		keyCtx, cancelKey := context.WithTimeout(ctx, 4*time.Second)
-		err = chromedp.Run(keyCtx,
-			chromedp.SendKeys(contentSel, kb.Control+"a", chromedp.ByQuery),
-			chromedp.SendKeys(contentSel, kb.Backspace, chromedp.ByQuery),
-		)
-		cancelKey()
+
+	typeCtx, cancelType := context.WithTimeout(ctx, 10*time.Second)
+	err = chromedp.Run(typeCtx,
+		chromedp.Click(contentSel, chromedp.ByQuery),
+		chromedp.Focus(contentSel, chromedp.ByQuery),
+		chromedp.Evaluate(selectJs, &selectOk),
+		chromedp.SendKeys(contentSel, text, chromedp.ByQuery),
+	)
+	cancelType()
+	if err != nil || !selectOk {
 		if err != nil {
-			logger.Print("TT5", "Step2 警告: 键盘全选删除也失败 - "+err.Error())
+			logger.Print("TT5", "Step2 警告: SendKeys 执行异常 - "+err.Error())
 		} else {
-			logger.Print("TT5", "Step2 完成: 使用键盘全选删除")
+			logger.Print("TT5", "Step2 警告: JavaScript 全选失败")
 		}
+		logger.Print("TT5", "Step2: 尝试使用 JavaScript 插入文本")
+		var inputOk bool
+		inputJs := fmt.Sprintf(`(function(T){
+			var el=document.querySelector(%q);
+			if(!el){return false;}
+			el.focus();
+			try{document.execCommand('selectAll', false, null);}catch(e){}
+			try{document.execCommand('insertText', false, T);}catch(e){}
+			return true;
+		})(%q)`, contentSel, text)
+		jsCtx, cancelJs := context.WithTimeout(ctx, 5*time.Second)
+		if err := chromedp.Run(jsCtx, chromedp.Evaluate(inputJs, &inputOk)); err != nil {
+			cancelJs()
+			logger.Print("TT5", "Step2 失败: JavaScript 插入也失败 - "+err.Error())
+			return errors.New("TT5 cannot input text via SendKeys or JavaScript")
+		}
+		cancelJs()
+		if !inputOk {
+			logger.Print("TT5", "Step2 失败: JavaScript 插入返回 false")
+			return errors.New("TT5 JavaScript input returned false")
+		}
+		logger.Print("TT5", "Step2 完成: 使用 JavaScript 插入文本成功")
 	} else {
-		logger.Print("TT5", "Step2 完成: 使用 JavaScript 清空成功")
+		logger.Print("TT5", "Step2 完成: 使用 JavaScript 全选 + SendKeys 输入成功")
+	}
+
+	var finalText string
+	checkCtx, cancelCheck := context.WithTimeout(ctx, 3*time.Second)
+	chromedp.Run(checkCtx, chromedp.Evaluate(fmt.Sprintf(`(function(sel){
+		var el=document.querySelector(sel);
+		return el ? el.textContent : '';
+	})(%q)`, contentSel), &finalText))
+	cancelCheck()
+	logger.Print("TT5", "Step2: 最终文本内容(前100字符): "+finalText[:min(len(finalText), 100)])
+
+	logger.Print("TT5", "Step2: 输入完成，等待3秒后检测页面状态")
+	time.Sleep(3 * time.Second)
+
+	if checkSomethingWentWrong(ctx) {
+		logger.Print("TT5", "【错误】在 Step2 输入后检测到 Something went wrong")
+		return errors.New("TT5 Something went wrong detected after input")
 	}
 
 	time.Sleep(6 * time.Second)
 	if checkSomethingWentWrong(ctx) {
 		logger.Print("TT5", "【错误】在 Step2 后等待6秒检测到 Something went wrong")
 		return errors.New("TT5 Something went wrong detected after step2 sleep")
-	}
-
-	logger.Print("TT5", "Step3: 使用 chromedp.SendKeys 输入文本")
-	typeCtx, cancelType := context.WithTimeout(ctx, 10*time.Second)
-	if err := chromedp.Run(typeCtx, chromedp.SendKeys(contentSel, text, chromedp.ByQuery)); err != nil {
-		cancelType()
-		logger.Print("TT5", "Step3 警告: SendKeys 执行异常 - "+err.Error())
-		logger.Print("TT5", "Step3: SendKeys 失败，尝试使用 JavaScript 插入文本")
-		var inputOk bool
-		inputJs := fmt.Sprintf(`(function(T){
-			var el=document.querySelector(%q);
-			if(!el){return false;}
-			el.focus();
-			el.textContent=T;
-			try{el.dispatchEvent(new InputEvent('input',{bubbles:true}));}catch(e){}
-			return true;
-		})(%q)`, contentSel, text)
-		jsCtx, cancelJs := context.WithTimeout(ctx, 5*time.Second)
-		if err := chromedp.Run(jsCtx, chromedp.Evaluate(inputJs, &inputOk)); err != nil {
-			cancelJs()
-			logger.Print("TT5", "Step3 失败: JavaScript 插入也失败 - "+err.Error())
-			return errors.New("TT5 cannot input text via SendKeys or JavaScript")
-		}
-		cancelJs()
-		if !inputOk {
-			logger.Print("TT5", "Step3 失败: JavaScript 插入返回 false")
-			return errors.New("TT5 JavaScript input returned false")
-		}
-		logger.Print("TT5", "Step3 完成: 使用 JavaScript 插入文本成功")
-	} else {
-		cancelType()
-		logger.Print("TT5", "Step3 完成: 使用 SendKeys 输入成功")
-	}
-
-	logger.Print("TT5", "Step3: 输入完成，等待3秒后检测页面状态")
-	time.Sleep(3 * time.Second)
-
-	if checkSomethingWentWrong(ctx) {
-		logger.Print("TT5", "【错误】在 Step3 输入后检测到 Something went wrong")
-		return errors.New("TT5 Something went wrong detected after input")
-	}
-
-	time.Sleep(6 * time.Second)
-	if checkSomethingWentWrong(ctx) {
-		logger.Print("TT5", "【错误】在 Step3 后等待6秒检测到 Something went wrong")
-		return errors.New("TT5 Something went wrong detected after step3 sleep")
 	}
 
 	logger.Print("TT5", "========== 填写视频文案完成 ==========")
