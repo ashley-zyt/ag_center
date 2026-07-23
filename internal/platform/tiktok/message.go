@@ -54,6 +54,9 @@ func SendMessage(ctx context.Context, logger *logx.Logger, req SendMessageReques
 	logger.Print("TT_MSG1", "连接浏览器WebSocket")
 	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(ctx, req.WebsocketURL, chromedp.NoModifyURL)
 
+	// 清理多余标签页
+	chromedputil.CleanExtraTabs(allocCtx, logger, "TT_MSG1")
+
 	tabCtx, _ := chromedp.NewContext(allocCtx,
 		chromedp.WithLogf(func(format string, v ...interface{}) { (&filterLogger{logger: logger}).Printf(format, v...) }),
 		chromedp.WithErrorf(func(format string, v ...interface{}) { (&filterLogger{logger: logger}).Printf(format, v...) }),

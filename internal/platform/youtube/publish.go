@@ -69,6 +69,10 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		chromedp.WithErrorf(func(format string, v ...interface{}) { (&filterLogger{logger: logger}).Printf(format, v...) }),
 	)
 	defer cancelTab()
+
+	// 清理多余标签页
+	chromedputil.CleanExtraTabs(tabCtx, logger, "YTB1")
+
 	defer chromedputil.CloseTabsAndStopProfile(ctx, allocCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "YTB12")
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 6*time.Minute)

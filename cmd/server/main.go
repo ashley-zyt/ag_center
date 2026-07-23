@@ -21,6 +21,7 @@ import (
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/platform/facebook"
 	"minimax_pro/internal/platform/instagram"
+	"minimax_pro/internal/platform/nurture"
 	"minimax_pro/internal/platform/scraper"
 	"minimax_pro/internal/platform/tiktok"
 	"minimax_pro/internal/platform/twitter"
@@ -364,6 +365,9 @@ func checkAccountLogin(ctx context.Context, logger *logx.Logger, item AccountChe
 	tabCtx, cancelTab := chromedp.NewContext(allocCtx)
 	defer cancelTab()
 
+	// 清理多余标签页
+	chromedputil.CleanExtraTabs(tabCtx, logger, "CHECK")
+
 	defer stopProfileWithCleanup(context.Background(), logger, allocCtx, startRes.Host, startRes.Port, startRes.ProfileID)
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 30*time.Second)
@@ -583,6 +587,23 @@ func fetchPostsByPlatform(ctx context.Context, logger *logx.Logger, platform str
 	}
 }
 
+func nurtureByPlatform(ctx context.Context, logger *logx.Logger, platform string, req nurture.NurtureRequest) (nurture.NurtureResult, error) {
+	switch strings.ToLower(strings.TrimSpace(platform)) {
+	case "twitter", "x":
+		return twitter.NurtureAccount(ctx, logger, req)
+	case "youtube", "yt":
+		return youtube.NurtureAccount(ctx, logger, req)
+	case "instagram", "ig":
+		return instagram.NurtureAccount(ctx, logger, req)
+	case "tiktok", "tt":
+		return tiktok.NurtureAccount(ctx, logger, req)
+	case "facebook", "fb":
+		return facebook.NurtureAccount(ctx, logger, req)
+	default:
+		return nurture.NurtureResult{Status: "failed", ErrorInfo: "unsupported platform: " + platform}, fmt.Errorf("nurture: unsupported platform %q", platform)
+	}
+}
+
 type FetchPostsAccount struct {
 	ID        int    `json:"id"`
 	Platform  string `json:"platform"`
@@ -683,6 +704,9 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			chromedp.WithErrorf(func(string, ...interface{}) {}),
 		)
 		defer cancelBrowser()
+
+		// 清理多余标签页
+		chromedputil.CleanExtraTabs(browserCtx, logger, "FETCH")
 
 		type tabInfo struct {
 			ctx    context.Context
@@ -890,6 +914,114 @@ func main() {
 	})
 
 	mux.HandleFunc("/accounts/fetch_posts", handleFetchPosts(logger))
+
+	type NurtureRequest struct {
+		ProfileName      string `json:"profile_name"`
+		Platform         string `json:"platform"`
+		Host             string `json:"host"`
+		Port             int    `json:"port"`
+		WaitSeconds      int    `json:"wait_seconds"`
+		UndetectablePath string `json:"undetectable_path"`
+	}
+
+	type NurtureResponse struct {
+		Status string `json:"status"`
+		Info   string `json:"info"`
+	}
+
+	mux.HandleFunc("/accounts/nurture", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
+			return
+		}
+
+		var req NurtureRequest
+		_, err := decodeJSONBody(r, &req, 1<<20)
+		if err != nil {
+			logger.Print("E", "nurture JSON解析失败: "+err.Error())
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
+			return
+		}
+
+		if req.ProfileName == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
+			return
+		}
+		if req.Platform == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "platform is required"})
+			return
+		}
+		if req.Host == "" {
+			req.Host = accountDefaultHost
+		}
+		if req.Port == 0 {
+			req.Port = accountDefaultPort
+		}
+		if req.WaitSeconds <= 0 {
+			req.WaitSeconds = accountDefaultWaitS
+		}
+
+		logger.Print("NURTURE", fmt.Sprintf("收到养号请求: profile=%s, platform=%s", req.ProfileName, req.Platform))
+
+		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		if err != nil {
+			logger.Print("E", "启动Profile失败: "+err.Error())
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			return
+		}
+
+		// 养号流程使用独立 context，不受 HTTP 请求断开影响
+		bgCtx := context.Background()
+
+		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(bgCtx, res.Info.WebsocketLink, chromedp.NoModifyURL)
+		defer cancelAlloc()
+
+		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
+			chromedp.WithLogf(func(string, ...interface{}) {}),
+			chromedp.WithErrorf(func(string, ...interface{}) {}),
+		)
+		defer cancelBrowser()
+
+		// 清理多余标签页
+		chromedputil.CleanExtraTabs(browserCtx, logger, "NURTURE")
+
+		nurtureCtx, cancelNurture := context.WithTimeout(browserCtx, 30*time.Minute)
+		defer cancelNurture()
+
+		nurtureRes, nurtureErr := nurtureByPlatform(nurtureCtx, logger, req.Platform, nurture.NurtureRequest{
+			ProfileName:      req.ProfileName,
+			Platform:         req.Platform,
+			Host:             req.Host,
+			Port:             req.Port,
+			WaitSeconds:      req.WaitSeconds,
+			UndetectablePath: req.UndetectablePath,
+		})
+
+		stopProfileWithCleanup(context.Background(), logger, allocCtx, res.Host, res.Port, res.ProfileID)
+
+		if nurtureErr != nil {
+			logger.Print("E", "养号流程失败: "+nurtureErr.Error())
+			writeJSON(w, http.StatusOK, NurtureResponse{
+				Status: "error",
+				Info:   nurtureRes.ErrorInfo + " | " + nurtureRes.ActionsPerformed,
+			})
+			return
+		}
+
+		logger.Print("NURTURE", fmt.Sprintf("养号流程完成: profile=%s, platform=%s", req.ProfileName, req.Platform))
+		// 如果有错误但流程正常结束，也返回错误信息
+		if nurtureRes.Status == "error" {
+			writeJSON(w, http.StatusOK, NurtureResponse{
+				Status: "error",
+				Info:   nurtureRes.ErrorInfo + " | " + nurtureRes.ActionsPerformed,
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, NurtureResponse{
+			Status: "success",
+			Info:   nurtureRes.ActionsPerformed,
+		})
+	})
 
 	mux.HandleFunc("/undetectable/start", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

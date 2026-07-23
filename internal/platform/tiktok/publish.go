@@ -70,6 +70,10 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		chromedp.WithLogf(func(format string, v ...interface{}) { (&filterLogger{logger: logger}).Printf(format, v...) }),
 		chromedp.WithErrorf(func(format string, v ...interface{}) { (&filterLogger{logger: logger}).Printf(format, v...) }),
 	)
+
+	// 清理多余标签页
+	chromedputil.CleanExtraTabs(tabCtx, logger, "TT1")
+
 	defer func() {
 		logger.Print("TT7", "关闭标签页")
 		_ = chromedp.Run(tabCtx, chromedp.ActionFunc(func(ctx context.Context) error {
@@ -150,23 +154,42 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 			return fmt.Errorf("TT6 %v", err)
 		}
 	}
-	logger.Print("TT6", "已点击发布，等待页面跳转")
 	expectedURL := "https://www.tiktok.com/tiktokstudio/content"
-	redirectDeadline := time.Now().Add(30 * time.Second)
 	redirectOK := false
-	for time.Now().Before(redirectDeadline) {
-		var href string
-		locCtx, cancelLoc := context.WithTimeout(tabCtx, 1500*time.Millisecond)
-		_ = chromedp.Run(locCtx, chromedp.Location(&href))
-		cancelLoc()
-		if strings.HasPrefix(href, expectedURL) {
-			redirectOK = true
+	for attempt := 1; attempt <= 2; attempt++ {
+		logger.Print("TT6", fmt.Sprintf("已点击发布，等待页面跳转 (第%d次)", attempt))
+		redirectDeadline := time.Now().Add(30 * time.Second)
+		redirectOK = false
+		for time.Now().Before(redirectDeadline) {
+			var href string
+			locCtx, cancelLoc := context.WithTimeout(tabCtx, 1500*time.Millisecond)
+			_ = chromedp.Run(locCtx, chromedp.Location(&href))
+			cancelLoc()
+			if strings.HasPrefix(href, expectedURL) {
+				redirectOK = true
+				break
+			}
+			time.Sleep(800 * time.Millisecond)
+		}
+		if redirectOK {
 			break
 		}
-		time.Sleep(800 * time.Millisecond)
+		if attempt < 2 {
+			logger.Print("TT6", "30秒未跳转，重试点击发布")
+			if err := clickPost(tabCtx, logger); err != nil {
+				logger.Print("TT6", "重试点击发布失败: "+err.Error())
+				break
+			}
+			if handleContentCheckLiteModal(tabCtx, logger) {
+				if err := clickPost(tabCtx, logger); err != nil {
+					logger.Print("TT6", "重试点击发布失败: "+err.Error())
+					break
+				}
+			}
+		}
 	}
 	if !redirectOK {
-		logger.Print("TT6", "未跳转至TikTok Studio内容页，未知原因需要人为检查")
+		logger.Print("TT6", "重试后仍未跳转，未知原因需要人为检查")
 		time.Sleep(8 * time.Second)
 		return errors.New("TT6 未跳转至TikTok Studio内容页，未知原因需要人为检查")
 	}

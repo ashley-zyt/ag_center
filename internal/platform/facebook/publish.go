@@ -68,6 +68,9 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(ctx, req.WebsocketURL, chromedp.NoModifyURL)
 	defer cancelAlloc()
 
+	// 清理多余标签页
+	chromedputil.CleanExtraTabs(allocCtx, logger, "FB1")
+
 	// WithLogf 和 WithErrorf 是 ContextOption，应该传给 NewContext
 	tabCtx, cancelTab := chromedp.NewContext(allocCtx,
 		chromedp.WithLogf(func(format string, v ...interface{}) {

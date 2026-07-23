@@ -71,6 +71,9 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	)
 	defer cancelTab()
 
+	// 清理多余标签页
+	chromedputil.CleanExtraTabs(tabCtx, logger, "IG1")
+
 	defer func() {
 		logger.Print("IG7", "关闭标签页")
 		_ = chromedp.Run(tabCtx, chromedp.ActionFunc(func(ctx context.Context) error {
