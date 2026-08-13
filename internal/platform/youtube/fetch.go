@@ -3,6 +3,7 @@ package youtube
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +30,39 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 	targetURL := "https://studio.youtube.com/"
 	if err := chromedp.Run(silentCtx, chromedp.Navigate(targetURL)); err != nil {
 		return scraper.FetchResult{}, fmt.Errorf("navigate to studio failed: %w", err)
+	}
+
+	// 2.5 提取粉丝数：先获取当前Studio URL中的Channel ID，跳转到公开频道页提取订阅数，再返回Studio
+	var studioURL string
+	_ = chromedp.Run(silentCtx, chromedp.Location(&studioURL))
+	var totalFollowers int
+	if studioURL != "" {
+		// 从Studio URL中提取channel ID: https://studio.youtube.com/channel/UCxxx/...
+		re := regexp.MustCompile(`/channel/([^/]+)`)
+		if matches := re.FindStringSubmatch(studioURL); len(matches) >= 2 {
+			channelID := matches[1]
+			publicChannelURL := "https://www.youtube.com/channel/" + channelID
+			logger.Print("YT_FETCH", fmt.Sprintf("正在跳转至公开频道页提取粉丝数: %s", publicChannelURL))
+			if navErr := chromedp.Run(silentCtx, chromedp.Navigate(publicChannelURL)); navErr == nil {
+				time.Sleep(5 * time.Second)
+				var ariaLabel string
+				_ = chromedp.Run(silentCtx,
+					chromedp.AttributeValue(`span.ytContentMetadataViewModelMetadataText[aria-label]`, "aria-label", &ariaLabel, nil, chromedp.ByQuery),
+				)
+				if ariaLabel != "" {
+					// 从aria-label头部截取数字部分，例如 "12.5万 位订阅者" -> "12.5万" 或 "1.2M subscribers" -> "1.2M"
+					numRe := regexp.MustCompile(`^(\d[\d,\.]*\s*[kKmMbB万]?)`)
+					if numMatches := numRe.FindStringSubmatch(strings.TrimSpace(ariaLabel)); len(numMatches) >= 2 {
+						totalFollowers = parseYouTubeSubCount(numMatches[1])
+						logger.Print("YT_FETCH", fmt.Sprintf("账号总粉丝数(订阅者): %d (原始: %s)", totalFollowers, ariaLabel))
+					}
+				}
+				// 返回Studio页面继续原有流程
+				logger.Print("YT_FETCH", "粉丝数提取完成，返回Studio页面...")
+				_ = chromedp.Run(silentCtx, chromedp.Navigate(studioURL))
+				time.Sleep(3 * time.Second)
+			}
+		}
 	}
 
 	// 3. 执行内核重定向直达 Shorts 页面
@@ -283,7 +317,10 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 
 	// [精炼] 结束语精简
 	logger.Print("YT_FETCH", fmt.Sprintf("采集完成: 共收录 %d 条有效数据", len(posts)))
-	return scraper.FetchResult{Posts: posts}, nil
+	return scraper.FetchResult{
+		Posts:          posts,
+		TotalFollowers: totalFollowers,
+	}, nil
 }
 
 func truncate(s string, n int) string {
@@ -302,7 +339,7 @@ func parseYoutubeMetric(s string) int {
 
 	var clean strings.Builder
 	for _, r := range s {
-		if (r >= '0' && r <= '9') || r == '.' || r == 'k' || r == 'm' || r == 'b' {
+		if (r >= '0' && r <= '9') || r == '.' || r == 'k' || r == 'm' || r == 'b' || r == '万' {
 			clean.WriteRune(r)
 		} else if clean.Len() > 0 {
 			break
@@ -323,10 +360,35 @@ func parseYoutubeMetric(s string) int {
 		multiplier = 1000000000.0
 		s = strings.TrimSuffix(s, "b")
 	}
+	if strings.HasSuffix(s, "万") {
+		multiplier = 10000.0
+		s = strings.TrimSuffix(s, "万")
+	}
 
 	val, err := strconv.ParseFloat(s, 64)
 	if err != nil {
 		return 0
 	}
 	return int(val * multiplier)
+}
+
+// parseYouTubeSubCount 解析YouTube订阅数，支持 "1.2万", "12.5万", "1.2M", "123K" 等格式
+func parseYouTubeSubCount(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	// 处理中文"万"
+	if strings.Contains(s, "万") {
+		re := regexp.MustCompile(`([\d\.]+)\s*万`)
+		if matches := re.FindStringSubmatch(s); len(matches) >= 2 {
+			val, err := strconv.ParseFloat(matches[1], 64)
+			if err == nil {
+				return int(val * 10000)
+			}
+		}
+	}
+	// 处理英文 k/m/b
+	s2 := strings.ToLower(strings.ReplaceAll(s, ",", ""))
+	return parseYoutubeMetric(s2)
 }

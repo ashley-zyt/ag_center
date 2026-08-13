@@ -40,6 +40,52 @@ func FetchInstagramPosts(ctx context.Context, logger *logx.Logger, req scraper.F
 		backupCancel()
 	}
 
+	// 2.5 提取粉丝数：点击Reels后，在嗅探Reels列表前提取粉丝数
+	var totalFollowers int
+	time.Sleep(3 * time.Second) // 等待Reels页面加载
+	var followersText string
+	followersJS := `
+		(() => {
+			// 策略1: 查找带title属性且class包含x5n08af x1s688f的span（粉丝数span有title属性）
+			let spans = document.querySelectorAll('span.x5n08af.x1s688f[title]');
+			for (let s of spans) {
+				let t = (s.getAttribute("title") || s.innerText || "").trim();
+				if (/^[\d,\.]+[kKmM万]?$/.test(t.replace(/\s/g, ""))) {
+					// 检查是否在followers相关区域
+					let parent = s.parentElement;
+					for (let i = 0; i < 5 && parent; i++) {
+						if ((parent.innerText || "").toLowerCase().includes("follower")) {
+							return t;
+						}
+						parent = parent.parentElement;
+					}
+				}
+			}
+			// 策略2: 找到包含follower文本的a标签/li，提取其中的数字span
+			let allLinks = document.querySelectorAll('a, li, div');
+			for (let el of allLinks) {
+				let text = (el.innerText || "").toLowerCase();
+				if (text.includes("follower")) {
+					let numSpan = el.querySelector('span');
+					if (numSpan) {
+						let numText = (numSpan.getAttribute("title") || numSpan.innerText || "").trim();
+						if (/^[\d,\.]+[kKmM万]?$/.test(numText.replace(/\s/g, ""))) {
+							return numText;
+						}
+					}
+					// 从a标签文本头部提取数字
+					let m = (el.innerText || "").match(/^([\d,\.]+\s*[kKmM万]?)/);
+					if (m) return m[1];
+				}
+			}
+			return "";
+		})()
+	`
+	if err := chromedp.Run(silentCtx, chromedp.Evaluate(followersJS, &followersText)); err == nil && followersText != "" {
+		totalFollowers = parseInsMetric(followersText)
+		logger.Print("INS_FETCH", fmt.Sprintf("账号总粉丝数: %d (原始: %s)", totalFollowers, followersText))
+	}
+
 	// 3. 🌟 极速嗅探与验证：精准定位浏览量 DOM
 	type TempReelItem struct {
 		Link  string `json:"link"`
@@ -188,7 +234,10 @@ func FetchInstagramPosts(ctx context.Context, logger *logx.Logger, req scraper.F
 	}
 
 	logger.Print("INS_FETCH", fmt.Sprintf("Instagram 抓取执行完毕，本次成功收录 %d 条有效数据。", len(posts)))
-	return scraper.FetchResult{Posts: posts}, nil
+	return scraper.FetchResult{
+		Posts:          posts,
+		TotalFollowers: totalFollowers,
+	}, nil
 }
 
 // 辅助数字清洗工具
@@ -206,6 +255,9 @@ func parseInsMetric(s string) int {
 	} else if strings.HasSuffix(s, "m") {
 		multiplier = 1000000.0
 		s = strings.TrimSuffix(s, "m")
+	} else if strings.HasSuffix(s, "万") {
+		multiplier = 10000.0
+		s = strings.TrimSuffix(s, "万")
 	}
 
 	var clean strings.Builder

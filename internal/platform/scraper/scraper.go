@@ -22,5 +22,7 @@ type FetchRequest struct {
 
 // FetchResult is the output of a platform-specific fetcher.
 type FetchResult struct {
-	Posts []Post `json:"posts"`
+	Posts         []Post `json:"posts"`
+	TotalFollowers int    `json:"total_followers"`
+	TotalLikes     int    `json:"total_likes"`
 }

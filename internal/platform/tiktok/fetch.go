@@ -200,7 +200,30 @@ func FetchTikTokPosts(ctx context.Context, logger *logx.Logger, req scraper.Fetc
 	}
 
 	logger.Print("TT_FETCH", fmt.Sprintf("TikTok 抓取执行完毕。本次成功收录 %d 条发文", len(posts)))
-	return scraper.FetchResult{Posts: posts}, nil
+
+	// 7. 导航到个人主页提取总粉丝数和总点赞量
+	logger.Print("TT_FETCH", "正在导航到个人主页提取粉丝数和点赞量...")
+	if err := chromedp.Run(silentCtx, chromedp.Navigate("https://www.tiktok.com/profile")); err != nil {
+		logger.Print("TT_WARN", fmt.Sprintf("导航到个人主页失败: %v", err))
+		return scraper.FetchResult{Posts: posts}, nil
+	}
+	time.Sleep(5 * time.Second)
+
+	var followersStr, likesStr string
+	_ = chromedp.Run(silentCtx,
+		chromedp.Text(`strong[data-e2e="followers-count"]`, &followersStr, chromedp.ByQuery),
+		chromedp.Text(`strong[data-e2e="likes-count"]`, &likesStr, chromedp.ByQuery),
+	)
+
+	totalFollowers := parseTikTokMetric(followersStr)
+	totalLikes := parseTikTokMetric(likesStr)
+	logger.Print("TT_FETCH", fmt.Sprintf("账号总粉丝数: %d, 总点赞量: %d", totalFollowers, totalLikes))
+
+	return scraper.FetchResult{
+		Posts:         posts,
+		TotalFollowers: totalFollowers,
+		TotalLikes:     totalLikes,
+	}, nil
 }
 
 func truncate(s string, n int) string {

@@ -45,6 +45,30 @@ func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchReque
 	}
 	time.Sleep(2 * time.Second)
 
+	// 3.5 提取总粉丝数
+	var totalFollowers int
+	var followersText string
+	followersJS := `
+		(() => {
+			let a = document.querySelector('a[href*="/followers"]');
+			if (!a) return "";
+			// 优先查找a标签内第一个纯数字span
+			let spans = a.querySelectorAll('span');
+			for (let s of spans) {
+				let t = (s.innerText || "").trim();
+				if (/^[\d,\.]+[kKmM]?$/.test(t)) return t;
+			}
+			// fallback: 从a标签innerText头部提取数字
+			let text = (a.innerText || "").trim();
+			let m = text.match(/^([\d,\.]+\s*[kKmM]?)/);
+			return m ? m[1] : "";
+		})()
+	`
+	if err := chromedp.Run(silentCtx, chromedp.Evaluate(followersJS, &followersText)); err == nil && followersText != "" {
+		totalFollowers = parseTwitterMetric(followersText)
+		logger.Print("TW_FETCH", fmt.Sprintf("账号总粉丝数: %d (原始: %s)", totalFollowers, followersText))
+	}
+
 	// 4. 执行滚动采集
 	logger.Print("TW_FETCH", "正在执行动态滚动采集...")
 	runScrollScript := `
@@ -186,7 +210,10 @@ func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchReque
 	}
 
 	logger.Print("TW_FETCH", fmt.Sprintf("抓取流执行完毕。本次成功收录 %d 条有效发文", len(posts)))
-	return scraper.FetchResult{Posts: posts}, nil
+	return scraper.FetchResult{
+		Posts:          posts,
+		TotalFollowers: totalFollowers,
+	}, nil
 }
 
 func truncate(s string, n int) string {

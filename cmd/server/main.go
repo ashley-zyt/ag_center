@@ -623,15 +623,17 @@ type FetchPostsRequest struct {
 }
 
 type FetchPostsAccountResult struct {
-	AccountID   int            `json:"account_id"`
-	Platform    string         `json:"platform"`
-	SourceURL   string         `json:"source_url"`
-	Status      string         `json:"status"`
-	Posts       []scraper.Post `json:"posts"`
-	PostCount   int            `json:"post_count"`
-	ErrorInfo   string         `json:"error_info,omitempty"`
-	UpdateSent  bool           `json:"update_sent"`
-	UpdateError string         `json:"update_error,omitempty"`
+	AccountID      int            `json:"account_id"`
+	Platform       string         `json:"platform"`
+	SourceURL      string         `json:"source_url"`
+	Status         string         `json:"status"`
+	Posts          []scraper.Post `json:"posts"`
+	PostCount      int            `json:"post_count"`
+	TotalFollowers int            `json:"total_followers"`
+	TotalLikes     int            `json:"total_likes"`
+	ErrorInfo      string         `json:"error_info,omitempty"`
+	UpdateSent     bool           `json:"update_sent"`
+	UpdateError    string         `json:"update_error,omitempty"`
 }
 
 type FetchPostsResponse struct {
@@ -751,6 +753,8 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 					res.Posts = []scraper.Post{}
 				}
 				res.PostCount = len(res.Posts)
+				res.TotalFollowers = fetchRes.TotalFollowers
+				res.TotalLikes = fetchRes.TotalLikes
 				res.Status = "normal"
 			}
 
@@ -848,6 +852,7 @@ func callSinglePostUpdateAPI(ctx context.Context, logger *logx.Logger, endpoint 
 }
 func main() {
 	logger := logx.New(os.Stdout)
+	defer logger.Close()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
