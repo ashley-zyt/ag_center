@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"minimax_pro/internal/chromedputil"
 	chrome "minimax_pro/internal/clock"
@@ -97,10 +98,58 @@ const (
 	accountPostsUpdateURL = "http://47.89.235.227:3366/api/v1/post_stats"
 )
 
+// profileOpMu 确保同一Profile同时只能执行一个浏览器操作(fetch/nurture), 避免并发操作同一浏览器导致标签页混乱、导航互相干扰
+var (
+	profileOpLocks   = make(map[string]*sync.Mutex)
+	profileOpLocksMu sync.Mutex
+)
+
+// acquireProfileLock 获取指定Profile的操作锁, 返回释放函数
+func acquireProfileLock(profileName string, logger *logx.Logger) func() {
+	profileOpLocksMu.Lock()
+	mu, ok := profileOpLocks[profileName]
+	if !ok {
+		mu = &sync.Mutex{}
+		profileOpLocks[profileName] = mu
+	}
+	profileOpLocksMu.Unlock()
+
+	logger.Print("LOCK", fmt.Sprintf("等待Profile锁: %s", profileName))
+	mu.Lock()
+	logger.Print("LOCK", fmt.Sprintf("已获取Profile锁: %s", profileName))
+	return func() {
+		mu.Unlock()
+		logger.Print("LOCK", fmt.Sprintf("已释放Profile锁: %s", profileName))
+	}
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+	// 先编码到buffer,验证UTF-8合法性后再写入,防止非法字节导致Rails端编码错误
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(true)
+	if err := enc.Encode(v); err != nil {
+		// 编码失败时返回安全的错误JSON
+		buf.Reset()
+		buf.WriteString(`{"type":"error","error_info":"json encoding failed"}`)
+	}
+	// 验证并清理非法UTF-8字节
+	data := buf.Bytes()
+	if !utf8.Valid(data) {
+		cleaned := strings.ToValidUTF8(string(data), "")
+		data = []byte(cleaned)
+	}
+	_, _ = w.Write(data)
+}
+
+// sanitizeErr 清理错误信息中的非法UTF-8字符
+func sanitizeErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	return scraper.SanitizeString(err.Error())
 }
 
 func downloadVideoFromOss(ctx context.Context, logger *logx.Logger, ossURL string) (string, error) {
@@ -352,6 +401,10 @@ func checkAccountLogin(ctx context.Context, logger *logx.Logger, item AccountChe
 		res.StatusDesp = err.Error()
 		return res
 	}
+
+	// 获取Profile操作锁(防止同一Profile的check/fetch/nurture并发执行)
+	releaseLock := acquireProfileLock(item.ProfileName, logger)
+	defer releaseLock()
 
 	startRes, err := startProfileByName(ctx, logger, item.ProfileName, host, port, waitSeconds, undetectablePath)
 	if err != nil {
@@ -631,6 +684,7 @@ type FetchPostsAccountResult struct {
 	PostCount      int            `json:"post_count"`
 	TotalFollowers int            `json:"total_followers"`
 	TotalLikes     int            `json:"total_likes"`
+	TotalPosts     int            `json:"total_posts"`
 	ErrorInfo      string         `json:"error_info,omitempty"`
 	UpdateSent     bool           `json:"update_sent"`
 	UpdateError    string         `json:"update_error,omitempty"`
@@ -687,6 +741,10 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 
 		updateEndpoint := resolvePostsUpdateURL(req.UpdateAPIURL)
 
+		// 获取Profile操作锁(防止同一Profile的fetch和nurture并发执行导致浏览器混乱)
+		releaseLock := acquireProfileLock(req.ProfileName, logger)
+		defer releaseLock()
+
 		// 1. 启动指纹浏览器环境
 		logger.Print("FP1", fmt.Sprintf("启动Profile环境: %s (任务数: %d)", req.ProfileName, len(req.ActiveAccounts)))
 		startRes, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
@@ -718,6 +776,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 		results := make([]FetchPostsAccountResult, 0, len(req.ActiveAccounts))
 
 		// 2. 串行遍历账号采集
+		// 第一个账号复用browserCtx(已含错误抑制)，后续账号新建标签页(同样带错误抑制)，避免多余空白标签页
 		for i, acc := range req.ActiveAccounts {
 			res := FetchPostsAccountResult{
 				AccountID: acc.ID,
@@ -736,10 +795,20 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 
 			logger.Print("FP3", fmt.Sprintf("[%d/%d] 正在创建标签页任务 -> 平台: %s", i+1, len(req.ActiveAccounts), acc.Platform))
 
-			tabCtx, cancelTab := chromedp.NewContext(browserCtx)
+			var tabCtx context.Context
+			var cancelTab context.CancelFunc
+			if i == 0 {
+				// 首个账号复用browserCtx，避免创建多余空白标签
+				tabCtx = browserCtx
+				cancelTab = cancelBrowser // 使用已有的cancel，不重复defer
+			} else {
+				// 注意: WithLogf/WithErrorf 是 BrowserOption(分配浏览器时用), 不是 ContextOption(创建tab时用)
+				// 在已有的browserCtx上创建新tab时传入这些选项会导致 panic
+				tabCtx, cancelTab = chromedp.NewContext(browserCtx)
+			}
 			openedTabs = append(openedTabs, tabInfo{ctx: tabCtx, cancel: cancelTab})
 
-			fetchCtx, cancelFetch := context.WithTimeout(tabCtx, 3*time.Minute)
+			fetchCtx, cancelFetch := context.WithTimeout(tabCtx, 20*time.Minute)
 			fetchRes, fetchErr := fetchPostsByPlatform(fetchCtx, logger, acc.Platform, scraper.FetchRequest{
 				SourceURL: trimmedURL,
 			})
@@ -755,6 +824,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 				res.PostCount = len(res.Posts)
 				res.TotalFollowers = fetchRes.TotalFollowers
 				res.TotalLikes = fetchRes.TotalLikes
+				res.TotalPosts = fetchRes.TotalPosts
 				res.Status = "normal"
 			}
 
@@ -967,6 +1037,10 @@ func main() {
 		}
 
 		logger.Print("NURTURE", fmt.Sprintf("收到养号请求: profile=%s, platform=%s", req.ProfileName, req.Platform))
+
+		// 获取Profile操作锁(防止同一Profile的fetch和nurture并发执行导致浏览器混乱)
+		releaseLock := acquireProfileLock(req.ProfileName, logger)
+		defer releaseLock()
 
 		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
