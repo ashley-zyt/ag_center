@@ -203,7 +203,7 @@ func NurtureAccount(ctx context.Context, logger *logx.Logger, req nurture.Nurtur
 	logger.Print(tag, "登录状态检查通过")
 
 	// 3. 随机生成养号目标
-	nurtureMinutes := rand.Intn(4) + 12 // 12-15 分钟
+	nurtureMinutes := 10 // 固定10分钟
 	nurtureDuration := time.Duration(nurtureMinutes) * time.Minute
 	targetLikes := rand.Intn(3)   // 0-2
 	targetFollows := rand.Intn(2) // 0-1
@@ -288,7 +288,16 @@ func NurtureAccount(ctx context.Context, logger *logx.Logger, req nurture.Nurtur
 	avgWatchTime := 20 // 平均每个帖子停留20秒
 	estimatedPosts := int(nurtureDuration.Seconds() / float64(avgWatchTime))
 
+	// 硬性时间上限：10分钟
+	maxTotalDuration := 10 * time.Minute
+
 	for time.Since(startTime) < nurtureDuration {
+		// 检查是否超过硬性时间上限
+		if time.Since(startTime) >= maxTotalDuration {
+			logger.Print(tag, fmt.Sprintf("已达到硬性时间上限 %d 分钟，强制结束", int(maxTotalDuration.Minutes())))
+			goto endLoop
+		}
+
 		select {
 		case <-ctx.Done():
 			logger.Print(tag, "context 已取消，提前终止循环")

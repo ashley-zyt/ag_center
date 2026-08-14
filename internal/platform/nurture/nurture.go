@@ -96,8 +96,7 @@ func Run(ctx context.Context, logger *logx.Logger, p PlatformActions) (NurtureRe
 	logger.Print(tag, "登录状态检查通过")
 
 	// 3. 随机生成养号目标
-	nurtureMinutes := rand.Intn(2) + 12 // 12-15 分钟
-	// nurtureMinutes := rand.Intn(4) + 2 // 12-15 分钟
+	nurtureMinutes := 10 // 固定10分钟
 	nurtureDuration := time.Duration(nurtureMinutes) * time.Minute
 	targetLikes := rand.Intn(3)         // 0-2
 	targetFollows := rand.Intn(2)       // 0-1
@@ -124,8 +123,8 @@ func Run(ctx context.Context, logger *logx.Logger, p PlatformActions) (NurtureRe
 		recoveryURL = p.HomeURL()
 	}
 
-	// 硬性时间上限：15分钟
-	maxTotalDuration := 15 * time.Minute
+	// 硬性时间上限：10分钟
+	maxTotalDuration := 10 * time.Minute
 
 	logger.Print(tag, fmt.Sprintf("预估帖子数: %d, 最大停留: %d秒, 恢复URL: %s", estimatedPosts, maxWatchSeconds, recoveryURL))
 	logger.Print(tag, "进入主循环...")
