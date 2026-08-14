@@ -1,4 +1,4 @@
-package nurture
+﻿package nurture
 
 import (
 	"context"
@@ -61,27 +61,24 @@ type PlatformActions interface {
 // Run 统一养号流程控制
 func Run(ctx context.Context, logger *logx.Logger, p PlatformActions) (NurtureResult, error) {
 	tag := p.Tag()
-	silentCtx, silentCancel := chromedp.NewContext(ctx,
-		chromedp.WithErrorf(func(string, ...interface{}) {}),
-	)
-	defer silentCancel()
+	// ctx已由调用方配置错误抑制，直接使用(避免NewContext创建多余空白标签页)
 
 	// 1. 打开首页
 	homeURL := p.HomeURL()
 	logger.Print(tag, "正在导航至首页: "+homeURL)
-	if err := chromedp.Run(silentCtx, chromedp.Navigate(homeURL)); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Navigate(homeURL)); err != nil {
 		return NurtureResult{Status: "failed", ErrorInfo: "导航失败: " + err.Error()}, fmt.Errorf("navigate failed: %w", err)
 	}
 	time.Sleep(8 * time.Second)
 
 	// 1.5 导航后额外操作（如 Instagram 点击 Reels 按钮跳转）
-	if err := p.PreNurture(silentCtx); err != nil {
+	if err := p.PreNurture(ctx); err != nil {
 		logger.Print(tag, "导航后额外操作失败: "+err.Error())
 	}
 	time.Sleep(3 * time.Second)
 
 	// 2. 检查登录状态
-	loginStatus, err := p.CheckLogin(silentCtx)
+	loginStatus, err := p.CheckLogin(ctx)
 	if err != nil {
 		return NurtureResult{Status: "failed", ErrorInfo: "检查登录失败: " + err.Error()}, fmt.Errorf("check login failed: %w", err)
 	}
@@ -153,18 +150,18 @@ func Run(ctx context.Context, logger *logx.Logger, p PlatformActions) (NurtureRe
 		logger.Print(tag, fmt.Sprintf("=== 开始浏览第 %d 个帖子 ===", postsWatched))
 
 		// 检查 context 状态
-		if silentCtx.Err() != nil {
-			logger.Print(tag, "silentCtx 已失效: "+silentCtx.Err().Error())
+		if ctx.Err() != nil {
+			logger.Print(tag, "ctx 已失效: "+ctx.Err().Error())
 			goto endLoop
 		}
 
 		// 检测是否为广告
 		logger.Print(tag, "检测广告...")
-		isAd, err := p.IsAd(silentCtx)
+		isAd, err := p.IsAd(ctx)
 		if err != nil {
 			logger.Print(tag, "广告检测失败: "+err.Error())
 			// context 失效时直接退出
-			if silentCtx.Err() != nil {
+			if ctx.Err() != nil {
 				logger.Print(tag, "context 已失效，退出循环")
 				goto endLoop
 			}
@@ -172,7 +169,7 @@ func Run(ctx context.Context, logger *logx.Logger, p PlatformActions) (NurtureRe
 			logger.Print(tag, "检测到广告，跳过当前视频")
 			// 切换下一个帖子
 			if time.Since(startTime) < nurtureDuration {
-				if err := p.NextPost(silentCtx); err != nil {
+				if err := p.NextPost(ctx); err != nil {
 					logger.Print(tag, "切换失败: "+err.Error())
 					lastError = "切换帖子失败: " + err.Error()
 					goto endLoop
@@ -195,15 +192,15 @@ func Run(ctx context.Context, logger *logx.Logger, p PlatformActions) (NurtureRe
 		time.Sleep(watchDuration)
 
 		// 检查 context 状态
-		if silentCtx.Err() != nil {
-			logger.Print(tag, "浏览后 silentCtx 已失效: "+silentCtx.Err().Error())
+		if ctx.Err() != nil {
+			logger.Print(tag, "浏览后 ctx 已失效: "+ctx.Err().Error())
 			goto endLoop
 		}
 
 		// 检查是否超过最大停留时间
 		if maxWatchSeconds > 0 && watchDuration > time.Duration(maxWatchSeconds)*time.Second {
 			logger.Print(tag, fmt.Sprintf("视频停留超过 %d 秒，重新加载页面", maxWatchSeconds))
-			if err := chromedp.Run(silentCtx, chromedp.Navigate(recoveryURL)); err != nil {
+			if err := chromedp.Run(ctx, chromedp.Navigate(recoveryURL)); err != nil {
 				logger.Print(tag, "重新加载失败: "+err.Error())
 				lastError = "视频停留超时且恢复失败"
 				goto endLoop
@@ -213,9 +210,9 @@ func Run(ctx context.Context, logger *logx.Logger, p PlatformActions) (NurtureRe
 		}
 
 		// 检测页面错误（如 Instagram 的 "Something went wrong"）
-		if pageError, err := p.CheckPageError(silentCtx); err == nil && pageError {
+		if pageError, err := p.CheckPageError(ctx); err == nil && pageError {
 			logger.Print(tag, "检测到页面错误，重新加载页面")
-			if err := chromedp.Run(silentCtx, chromedp.Navigate(recoveryURL)); err != nil {
+			if err := chromedp.Run(ctx, chromedp.Navigate(recoveryURL)); err != nil {
 				logger.Print(tag, "重新加载失败: "+err.Error())
 				lastError = "页面错误且恢复失败"
 				goto endLoop
@@ -229,14 +226,14 @@ func Run(ctx context.Context, logger *logx.Logger, p PlatformActions) (NurtureRe
 			// 计算执行概率：剩余点赞数 / 剩余帖子数
 			likeProbability := float64(targetLikes-likesDone) / float64(remainingPosts)
 			if rand.Float64() < likeProbability {
-				if err := p.LikePost(silentCtx); err != nil {
+				if err := p.LikePost(ctx); err != nil {
 					logger.Print(tag, "点赞失败，刷新页面恢复: "+err.Error())
 					lastError = "点赞失败: " + err.Error()
 					if errors.Is(err, context.Canceled) {
 						goto endLoop
 					}
 					// 刷新页面恢复
-					if err := chromedp.Run(silentCtx, chromedp.Navigate(recoveryURL)); err != nil {
+					if err := chromedp.Run(ctx, chromedp.Navigate(recoveryURL)); err != nil {
 						logger.Print(tag, "刷新页面失败: "+err.Error())
 						lastError = "点赞失败且恢复失败"
 						goto endLoop
@@ -252,14 +249,14 @@ func Run(ctx context.Context, logger *logx.Logger, p PlatformActions) (NurtureRe
 
 		// 每隔 3-5 个帖子看评论
 		if postsWatched%commentInterval == 0 {
-			if err := p.BrowseComments(silentCtx); err != nil {
+			if err := p.BrowseComments(ctx); err != nil {
 				logger.Print(tag, "浏览评论异常，刷新页面恢复: "+err.Error())
 				lastError = "浏览评论失败: " + err.Error()
 				if errors.Is(err, context.Canceled) {
 					goto endLoop
 				}
 				// 刷新页面恢复
-				if err := chromedp.Run(silentCtx, chromedp.Navigate(recoveryURL)); err != nil {
+				if err := chromedp.Run(ctx, chromedp.Navigate(recoveryURL)); err != nil {
 					logger.Print(tag, "刷新页面失败: "+err.Error())
 					lastError = "评论失败且恢复失败"
 					goto endLoop
@@ -276,14 +273,14 @@ func Run(ctx context.Context, logger *logx.Logger, p PlatformActions) (NurtureRe
 			// 计算执行概率：剩余关注数 / 剩余帖子数
 			followProbability := float64(targetFollows-followsDone) / float64(remainingPosts)
 			if rand.Float64() < followProbability {
-				if err := p.FollowUser(silentCtx); err != nil {
+				if err := p.FollowUser(ctx); err != nil {
 					logger.Print(tag, "关注异常，刷新页面恢复: "+err.Error())
 					lastError = "关注失败: " + err.Error()
 					if errors.Is(err, context.Canceled) {
 						goto endLoop
 					}
 					// 刷新页面恢复
-					if err := chromedp.Run(silentCtx, chromedp.Navigate(recoveryURL)); err != nil {
+					if err := chromedp.Run(ctx, chromedp.Navigate(recoveryURL)); err != nil {
 						logger.Print(tag, "刷新页面失败: "+err.Error())
 						lastError = "关注失败且恢复失败"
 						goto endLoop
@@ -299,15 +296,15 @@ func Run(ctx context.Context, logger *logx.Logger, p PlatformActions) (NurtureRe
 		// 切换下一个帖子
 		if time.Since(startTime) < nurtureDuration {
 			// 检查 context 状态
-			if silentCtx.Err() != nil {
-				logger.Print(tag, "切换前 silentCtx 已失效: "+silentCtx.Err().Error())
+			if ctx.Err() != nil {
+				logger.Print(tag, "切换前 ctx 已失效: "+ctx.Err().Error())
 				goto endLoop
 			}
 			logger.Print(tag, "准备切换下一个视频...")
-			if err := p.NextPost(silentCtx); err != nil {
+			if err := p.NextPost(ctx); err != nil {
 				logger.Print(tag, "切换失败，重新加载页面: "+err.Error())
 				// 切换失败时重新加载恢复页面
-				if err := chromedp.Run(silentCtx, chromedp.Navigate(recoveryURL)); err != nil {
+				if err := chromedp.Run(ctx, chromedp.Navigate(recoveryURL)); err != nil {
 					logger.Print(tag, "重新加载失败: "+err.Error())
 					lastError = "切换失败且重新加载失败: " + err.Error()
 					goto endLoop

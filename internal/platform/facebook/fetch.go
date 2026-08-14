@@ -1,4 +1,4 @@
-package facebook
+﻿package facebook
 
 import (
 	"context"
@@ -14,20 +14,19 @@ import (
 func FetchFacebookPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchRequest) (scraper.FetchResult, error) {
 	logger.Print("FB_FETCH", "启用防御性抓取模式: "+req.SourceURL)
 
-	silentCtx, silentCancel := chromedp.NewContext(ctx, chromedp.WithErrorf(func(string, ...interface{}) {}))
-	defer silentCancel()
+	// ctx已由调用方配置错误抑制，直接使用(避免NewContext创建多余空白标签页)
 
-	if err := chromedp.Run(silentCtx, chromedp.Navigate(req.SourceURL)); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Navigate(req.SourceURL)); err != nil {
 		return scraper.FetchResult{}, err
 	}
 	time.Sleep(5 * time.Second)
 
 	// 滚动触发懒加载
-	_ = chromedp.Run(silentCtx, chromedp.Evaluate(`window.scrollBy(0, 2000);`, nil))
+	_ = chromedp.Run(ctx, chromedp.Evaluate(`window.scrollBy(0, 2000);`, nil))
 	time.Sleep(3 * time.Second)
 
 	var results []map[string]string
-	err := chromedp.Run(silentCtx, chromedp.Evaluate(`
+	err := chromedp.Run(ctx, chromedp.Evaluate(`
 		(() => {
 			let list = [];
 			let cards = document.querySelectorAll('div[aria-posinset]');
@@ -92,5 +91,5 @@ func FetchFacebookPosts(ctx context.Context, logger *logx.Logger, req scraper.Fe
 		})
 	}
 
-	return scraper.FetchResult{Posts: posts}, nil
+	return scraper.SanitizeResult(scraper.FetchResult{Posts: posts}), nil
 }

@@ -1,7 +1,8 @@
-package twitter
+﻿package twitter
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -17,56 +18,181 @@ import (
 func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchRequest) (scraper.FetchResult, error) {
 	logger.Print("TW_FETCH", "开始抓取 X 流程: "+req.SourceURL)
 
-	// 🌟 创建一个新的局部上下文，强行注入 WithErrorf 静音器
-	// 这会直接吞掉所有底层类似 "could not unmarshal event" 的非业务干扰错误
-	silentCtx, silentCancel := chromedp.NewContext(ctx,
-		chromedp.WithErrorf(func(string, ...interface{}) {}),
+	// ctx已由调用方配置错误抑制，直接使用(避免NewContext创建多余空白标签页)
+
+	// 1. 直接导航到目标用户主页(而非固定/home再点profile，避免多账号场景进错页面)
+	targetURL := strings.TrimSpace(req.SourceURL)
+	if targetURL == "" {
+		targetURL = "https://x.com/home"
+	}
+	if err := chromedp.Run(ctx, chromedp.Navigate(targetURL)); err != nil {
+		return scraper.FetchResult{}, fmt.Errorf("navigate to profile failed: %w", err)
+	}
+
+	// 2. 等待页面主体加载(profile头部或推文列表出现)
+	_ = chromedp.Run(ctx,
+		chromedp.PollFunction(`() => {
+			// 等待profile头部(含用户信息) 或 推文列表出现
+			const header = document.querySelector('div[data-testid="UserName"], h2[role="heading"]');
+			const cells = document.querySelectorAll('div[data-testid="cellInnerDiv"]');
+			return !!(header || cells.length > 0);
+		}`, nil, chromedp.WithPollingTimeout(15*time.Second), chromedp.WithPollingInterval(500*time.Millisecond)),
 	)
-	defer silentCancel()
-
-	// 1. 打开首页（使用 silentCtx）
-	if err := chromedp.Run(silentCtx, chromedp.Navigate("https://x.com/home")); err != nil {
-		return scraper.FetchResult{}, fmt.Errorf("navigate home failed: %w", err)
-	}
-
-	// 2. 点击个人主页
-	profileBtnSel := `a[data-testid="AppTabBar_Profile_Link"]`
-	if err := chromedp.Run(silentCtx,
-		chromedp.WaitVisible(profileBtnSel, chromedp.ByQuery),
-		chromedp.Click(profileBtnSel, chromedp.ByQuery),
-	); err != nil {
-		return scraper.FetchResult{}, fmt.Errorf("click profile link failed: %w", err)
-	}
+	time.Sleep(2 * time.Second)
 
 	// 3. 等待内容容器初始加载
 	cellSel := `div[data-testid="cellInnerDiv"]`
-	if err := chromedp.Run(silentCtx, chromedp.WaitVisible(cellSel, chromedp.ByQuery)); err != nil {
+	if err := chromedp.Run(ctx, chromedp.WaitVisible(cellSel, chromedp.ByQuery)); err != nil {
 		return scraper.FetchResult{}, fmt.Errorf("wait for posts failed: %w", err)
 	}
-	time.Sleep(2 * time.Second)
 
-	// 3.5 提取总粉丝数
+	// 3.5 提取总粉丝数: 使用PollFunction等待元素渲染完成，并增加多种fallback策略
 	var totalFollowers int
+	var totalPosts int
 	var followersText string
-	followersJS := `
-		(() => {
-			let a = document.querySelector('a[href*="/followers"]');
-			if (!a) return "";
-			// 优先查找a标签内第一个纯数字span
-			let spans = a.querySelectorAll('span');
-			for (let s of spans) {
-				let t = (s.innerText || "").trim();
-				if (/^[\d,\.]+[kKmM]?$/.test(t)) return t;
+
+	// 先尝试从页面嵌入的JSON数据中提取(最可靠,不依赖DOM渲染时序)
+	extractEmbeddedJS := `(() => {
+		try {
+			// 尝试从script标签中的__INITIAL_STATE__或类似变量提取
+			const scripts = document.querySelectorAll('script');
+			for (const s of scripts) {
+				const text = s.textContent || '';
+				// 查找followers_count字段
+				const m = text.match(/"followers_count"\s*:\s*(\d+)/);
+				const sM = text.match(/"statuses_count"\s*:\s*(\d+)/);
+				if (m) {
+					return JSON.stringify({
+						followers: m[1],
+						posts: sM ? sM[1] : "0"
+					});
+				}
 			}
-			// fallback: 从a标签innerText头部提取数字
-			let text = (a.innerText || "").trim();
-			let m = text.match(/^([\d,\.]+\s*[kKmM]?)/);
-			return m ? m[1] : "";
-		})()
-	`
-	if err := chromedp.Run(silentCtx, chromedp.Evaluate(followersJS, &followersText)); err == nil && followersText != "" {
-		totalFollowers = parseTwitterMetric(followersText)
-		logger.Print("TW_FETCH", fmt.Sprintf("账号总粉丝数: %d (原始: %s)", totalFollowers, followersText))
+			// 尝试从window对象中提取
+			if (window.__INITIAL_STATE__) {
+				const str = JSON.stringify(window.__INITIAL_STATE__);
+				const m = str.match(/"followers_count"\s*:\s*(\d+)/);
+				const sM = str.match(/"statuses_count"\s*:\s*(\d+)/);
+				if (m) {
+					return JSON.stringify({
+						followers: m[1],
+						posts: sM ? sM[1] : "0"
+					});
+				}
+			}
+		} catch(e) {}
+		return "";
+	})()`
+
+	var embeddedData string
+	if err := chromedp.Run(ctx, chromedp.Evaluate(extractEmbeddedJS, &embeddedData)); err == nil && embeddedData != "" {
+		// 解析嵌入数据
+		type embeddedResult struct {
+			Followers string `json:"followers"`
+			Posts     string `json:"posts"`
+		}
+		var emb embeddedResult
+		if jsonErr := parseJSON(embeddedData, &emb); jsonErr == nil {
+			if emb.Followers != "" {
+				if v, parseErr := strconv.Atoi(emb.Followers); parseErr == nil {
+					totalFollowers = v
+					followersText = emb.Followers
+				}
+			}
+			if emb.Posts != "" {
+				if v, parseErr := strconv.Atoi(emb.Posts); parseErr == nil {
+					totalPosts = v
+				}
+			}
+		}
+	}
+
+	if totalFollowers > 0 {
+		logger.Print("TW_FETCH", fmt.Sprintf("账号总粉丝数(从嵌入JSON提取): %d", totalFollowers))
+	} else {
+		// Fallback: 从DOM提取, 使用PollFunction等待元素出现(最长15秒)
+		followersJS := `(() => {
+			// 查找所有href包含/followers的a标签(覆盖/verified_followers和/followers两种URL格式)
+			const links = document.querySelectorAll('a[href*="/followers"]');
+			// 多语言粉丝关键词(包括单数Follower和复数Followers)
+			const followerRe = /follower|粉丝|フォロワー|팔로워|подписчик|abonn/i;
+			for (const a of links) {
+				const href = a.getAttribute('href') || '';
+				const text = (a.textContent || '').trim().toLowerCase();
+				// 排除/followers_you_follow等非粉丝数链接
+				if (/\/followers_you_follow|\/followers_known|\/followers\/suggest|\/followers\?/.test(href)) continue;
+				// 验证文本包含粉丝关键词(处理Follower/Followers单复数)
+				if (!followerRe.test(text)) continue;
+				// 查找第一个含数字的span(粉丝数在Followers文本span之前)
+				const spans = a.querySelectorAll('span');
+				for (const s of spans) {
+					const t = (s.textContent || '').trim();
+					// 匹配纯数字或带K/M/万后缀的数字
+					if (/^[\d,\.\s\u00a0]+[kKmM万]?$/.test(t) && /\d/.test(t) && t.length <= 20) {
+						return t;
+					}
+				}
+				// Fallback: 从a标签文本中正则提取数字
+				const m = (a.textContent || '').match(/([\d,\.]+\s*[kKmM万]?)/);
+				if (m && /\d/.test(m[1])) return m[1];
+			}
+			// 更宽松的fallback: 直接在profile区域找所有a标签,匹配包含Follower文字的
+			const profileHeader = document.querySelector('header[role="banner"], div[data-testid="primaryColumn"]') || document;
+			const allLinks = profileHeader.querySelectorAll('a');
+			for (const a of allLinks) {
+				const href = a.getAttribute('href') || '';
+				const text = (a.textContent || '').trim();
+				if (/follower/i.test(text) && /\d/.test(text)) {
+					const m = text.match(/([\d,\.]+\s*[kKmM万]?)/);
+					if (m) return m[1];
+				}
+			}
+			return "";
+		})()`
+
+		// 使用PollFunction等待粉丝数元素出现
+		for attempt := 0; attempt < 10; attempt++ {
+			if err := chromedp.Run(ctx, chromedp.Evaluate(followersJS, &followersText)); err == nil && followersText != "" {
+				totalFollowers = parseTwitterMetric(followersText)
+				if totalFollowers > 0 {
+					break
+				}
+			}
+			time.Sleep(1 * time.Second)
+		}
+
+		if totalFollowers > 0 {
+			logger.Print("TW_FETCH", fmt.Sprintf("账号总粉丝数(从DOM提取): %d (原始: %s)", totalFollowers, followersText))
+		} else {
+			logger.Print("TW_FETCH", "TW_FETCH_SUB 未找到粉丝数(DOM和嵌入JSON均未提取到)")
+		}
+	}
+
+	// 同样尝试从DOM提取帖子数(totalPosts),如果嵌入JSON未提供
+	if totalPosts == 0 {
+		postsCountJS := `(() => {
+			// 查找导航栏中Posts/Replies等tab的数字, 或查找profile头部的posts数
+			// 方式1: 查找包含数字+Posts/帖子关键词的元素
+			const allLinks = document.querySelectorAll('a');
+			for (const a of allLinks) {
+				const href = a.getAttribute('href') || '';
+				const text = (a.textContent || '').trim();
+				// 匹配类似 "123 Posts" 的格式(在profile导航tab中)
+				if (/posts|帖子|ポスト|게시물/i.test(text) && /\d/.test(text)) {
+					// 排除非profile的链接
+					if (!href.includes('/status/') && !href.includes('/followers')) {
+						const m = text.match(/([\d,\.]+\s*[kKmM万]?)/);
+						if (m) return m[1];
+					}
+				}
+			}
+			return "";
+		})()`
+		var postsText string
+		_ = chromedp.Run(ctx, chromedp.Evaluate(postsCountJS, &postsText))
+		if postsText != "" {
+			totalPosts = parseTwitterMetric(postsText)
+		}
 	}
 
 	// 4. 执行滚动采集
@@ -159,14 +285,14 @@ func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchReque
 	})()
 	`
 
-	if err := chromedp.Run(silentCtx, chromedp.Evaluate(runScrollScript, nil)); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Evaluate(runScrollScript, nil)); err != nil {
 		return scraper.FetchResult{}, fmt.Errorf("inject scroll script failed: %w", err)
 	}
 
 	// 5. 等待 JS 结束标记并取回数据
 	var isDone bool
 	for i := 0; i < 10; i++ {
-		_ = chromedp.Run(silentCtx, chromedp.Evaluate("window._xScrollDone || false", &isDone))
+		_ = chromedp.Run(ctx, chromedp.Evaluate("window._xScrollDone || false", &isDone))
 		if isDone {
 			break
 		}
@@ -174,7 +300,7 @@ func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchReque
 	}
 
 	var jsResult []map[string]string
-	if err := chromedp.Run(silentCtx, chromedp.Evaluate("window._xPostsData || []", &jsResult)); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Evaluate("window._xPostsData || []", &jsResult)); err != nil {
 		return scraper.FetchResult{}, fmt.Errorf("retrieve standard json data failed: %w", err)
 	}
 
@@ -210,10 +336,17 @@ func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchReque
 	}
 
 	logger.Print("TW_FETCH", fmt.Sprintf("抓取流执行完毕。本次成功收录 %d 条有效发文", len(posts)))
-	return scraper.FetchResult{
+	result := scraper.FetchResult{
 		Posts:          posts,
 		TotalFollowers: totalFollowers,
-	}, nil
+		TotalPosts:     totalPosts,
+	}
+	return scraper.SanitizeResult(result), nil
+}
+
+// parseJSON 解析JSON字符串到目标结构
+func parseJSON(data string, v interface{}) error {
+	return json.Unmarshal([]byte(data), v)
 }
 
 func truncate(s string, n int) string {
@@ -223,33 +356,62 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
+// parseTwitterMetric 解析Twitter数字，支持:
+// "8", "1,234", "12.5K", "1.5M", "1.2万", "1 234"(空格千分), "1,2K"(欧洲小数)
 func parseTwitterMetric(s string) int {
 	s = strings.TrimSpace(strings.ToLower(s))
-	if s == "" || strings.HasPrefix(s, "0 ") {
+	if s == "" {
 		return 0
 	}
-	s = strings.ReplaceAll(s, ",", "")
-
-	var clean strings.Builder
-	for _, r := range s {
-		if (r >= '0' && r <= '9') || r == '.' || r == 'k' || r == 'm' || r == 'b' {
-			clean.WriteRune(r)
-		} else if clean.Len() > 0 {
-			break
-		}
-	}
-	s = clean.String()
+	// 移除空格和不间断空格
+	s = strings.ReplaceAll(s, "\u00a0", "")
+	s = strings.ReplaceAll(s, " ", "")
 
 	multiplier := 1.0
-	if strings.HasSuffix(s, "k") {
-		multiplier = 1000.0
-		s = strings.TrimSuffix(s, "k")
-	} else if strings.HasSuffix(s, "m") {
-		multiplier = 1000000.0
-		s = strings.TrimSuffix(s, "m")
-	} else if strings.HasSuffix(s, "b") {
-		multiplier = 1000000000.0
-		s = strings.TrimSuffix(s, "b")
+	hasSuffix := true
+	switch {
+	case strings.HasSuffix(s, "万"):
+		multiplier = 10000.0
+		s = strings.TrimSuffix(s, "万")
+	case strings.HasSuffix(s, "亿"):
+		multiplier = 100000000.0
+		s = strings.TrimSuffix(s, "亿")
+	case strings.HasSuffix(s, "億"):
+		multiplier = 100000000.0
+		s = strings.TrimSuffix(s, "億")
+	default:
+		if len(s) > 0 {
+			last := s[len(s)-1:]
+			switch last {
+			case "k":
+				multiplier = 1000.0
+				s = s[:len(s)-1]
+			case "m":
+				multiplier = 1000000.0
+				s = s[:len(s)-1]
+			case "b":
+				multiplier = 1000000000.0
+				s = s[:len(s)-1]
+			default:
+				hasSuffix = false
+			}
+		}
+	}
+
+	// 处理千分位/小数分隔符
+	if strings.Contains(s, ",") && strings.Contains(s, ".") {
+		if strings.LastIndex(s, ",") > strings.LastIndex(s, ".") {
+			s = strings.ReplaceAll(s, ".", "")
+			s = strings.ReplaceAll(s, ",", ".")
+		} else {
+			s = strings.ReplaceAll(s, ",", "")
+		}
+	} else if strings.Contains(s, ",") {
+		if hasSuffix {
+			s = strings.ReplaceAll(s, ",", ".")
+		} else {
+			s = strings.ReplaceAll(s, ",", "")
+		}
 	}
 
 	val, err := strconv.ParseFloat(s, 64)

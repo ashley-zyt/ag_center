@@ -1,4 +1,4 @@
-package twitter
+﻿package twitter
 
 import (
 	"context"
@@ -174,21 +174,18 @@ func NurtureAccount(ctx context.Context, logger *logx.Logger, req nurture.Nurtur
 		ctx:    ctx,
 	}
 	tag := actions.Tag()
-	silentCtx, silentCancel := chromedp.NewContext(ctx,
-		chromedp.WithErrorf(func(string, ...interface{}) {}),
-	)
-	defer silentCancel()
+	// ctx已由调用方配置错误抑制，直接使用(避免NewContext创建多余空白标签页)
 
 	// 1. 打开首页
 	homeURL := actions.HomeURL()
 	logger.Print(tag, "正在导航至首页: "+homeURL)
-	if err := chromedp.Run(silentCtx, chromedp.Navigate(homeURL)); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Navigate(homeURL)); err != nil {
 		return nurture.NurtureResult{Status: "failed", ErrorInfo: "导航失败: " + err.Error()}, fmt.Errorf("navigate failed: %w", err)
 	}
 	time.Sleep(8 * time.Second)
 
 	// 2. 检查登录状态
-	loginStatus, err := actions.CheckLogin(silentCtx)
+	loginStatus, err := actions.CheckLogin(ctx)
 	if err != nil {
 		return nurture.NurtureResult{Status: "failed", ErrorInfo: "检查登录失败: " + err.Error()}, fmt.Errorf("check login failed: %w", err)
 	}
@@ -318,7 +315,7 @@ func NurtureAccount(ctx context.Context, logger *logx.Logger, req nurture.Nurtur
 		scrollAmount := rand.Intn(201) + 300
 		logger.Print(tag, fmt.Sprintf("滚动 %d px", scrollAmount))
 		scrollJs := fmt.Sprintf("window.scrollBy(0, %d)", scrollAmount)
-		if err := chromedp.Run(silentCtx, chromedp.Evaluate(scrollJs, nil)); err != nil {
+		if err := chromedp.Run(ctx, chromedp.Evaluate(scrollJs, nil)); err != nil {
 			logger.Print(tag, "滚动失败: "+err.Error())
 			lastError = "滚动失败: " + err.Error()
 			goto endLoop
@@ -340,7 +337,7 @@ func NurtureAccount(ctx context.Context, logger *logx.Logger, req nurture.Nurtur
 		// 定位当前视口中央的帖子
 		logger.Print(tag, "定位当前帖子...")
 		var tweetIdx int
-		if err := chromedp.Run(silentCtx, chromedp.Evaluate(findCenterTweetJs, &tweetIdx)); err != nil {
+		if err := chromedp.Run(ctx, chromedp.Evaluate(findCenterTweetJs, &tweetIdx)); err != nil {
 			logger.Print(tag, "定位帖子失败: "+err.Error())
 			continue
 		}
@@ -358,7 +355,7 @@ func NurtureAccount(ctx context.Context, logger *logx.Logger, req nurture.Nurtur
 				logger.Print(tag, "尝试点赞...")
 				var liked bool
 				js := fmt.Sprintf(likeInTweetJs, tweetIdx)
-				if err := chromedp.Run(silentCtx, chromedp.Evaluate(js, &liked)); err != nil {
+				if err := chromedp.Run(ctx, chromedp.Evaluate(js, &liked)); err != nil {
 					logger.Print(tag, "点赞失败: "+err.Error())
 				} else if liked {
 					likesDone++
@@ -373,18 +370,18 @@ func NurtureAccount(ctx context.Context, logger *logx.Logger, req nurture.Nurtur
 			logger.Print(tag, "准备查看评论...")
 			var opened bool
 			js := fmt.Sprintf(openCommentInTweetJs, tweetIdx)
-			if err := chromedp.Run(silentCtx, chromedp.Evaluate(js, &opened)); err != nil {
+			if err := chromedp.Run(ctx, chromedp.Evaluate(js, &opened)); err != nil {
 				logger.Print(tag, "打开评论失败: "+err.Error())
 			} else if opened {
 				logger.Print(tag, "进入详情页，等待加载...")
 				time.Sleep(5 * time.Second)
 				logger.Print(tag, "下滑 800px 到评论区")
-				_ = chromedp.Run(silentCtx, chromedp.Evaluate("window.scrollBy(0, 800)", nil))
+				_ = chromedp.Run(ctx, chromedp.Evaluate("window.scrollBy(0, 800)", nil))
 				browseDuration := time.Duration(rand.Intn(6)+10) * time.Second
 				logger.Print(tag, fmt.Sprintf("浏览评论 %.0f 秒", browseDuration.Seconds()))
 				time.Sleep(browseDuration)
 				logger.Print(tag, "点击返回按钮...")
-				_ = chromedp.Run(silentCtx, chromedp.Click(`button[data-testid="app-bar-back"]`, chromedp.ByQuery))
+				_ = chromedp.Run(ctx, chromedp.Click(`button[data-testid="app-bar-back"]`, chromedp.ByQuery))
 				time.Sleep(3 * time.Second)
 				commentsBrowsed++
 				logger.Print(tag, "已返回上一页")
@@ -399,12 +396,12 @@ func NurtureAccount(ctx context.Context, logger *logx.Logger, req nurture.Nurtur
 				logger.Print(tag, "准备关注用户...")
 				var userURL string
 				js := fmt.Sprintf(getUserLinkInTweetJs, tweetIdx)
-				if err := chromedp.Run(silentCtx, chromedp.Evaluate(js, &userURL)); err != nil {
+				if err := chromedp.Run(ctx, chromedp.Evaluate(js, &userURL)); err != nil {
 					logger.Print(tag, "获取用户链接失败: "+err.Error())
 				} else if userURL != "" {
 					logger.Print(tag, "找到用户链接: "+userURL)
 					logger.Print(tag, "导航至用户主页...")
-					if err := chromedp.Run(silentCtx, chromedp.Navigate(userURL)); err != nil {
+					if err := chromedp.Run(ctx, chromedp.Navigate(userURL)); err != nil {
 						logger.Print(tag, "导航至用户主页失败: "+err.Error())
 					} else {
 						logger.Print(tag, "已进入用户主页，等待加载...")
@@ -417,7 +414,7 @@ func NurtureAccount(ctx context.Context, logger *logx.Logger, req nurture.Nurtur
 				})()`
 						var followed bool
 						logger.Print(tag, "查找关注按钮...")
-						if err := chromedp.Run(silentCtx, chromedp.Evaluate(followJs, &followed)); err == nil && followed {
+						if err := chromedp.Run(ctx, chromedp.Evaluate(followJs, &followed)); err == nil && followed {
 							followsDone++
 							logger.Print(tag, "关注成功")
 						} else {
@@ -425,7 +422,7 @@ func NurtureAccount(ctx context.Context, logger *logx.Logger, req nurture.Nurtur
 						}
 						logger.Print(tag, "返回首页...")
 						time.Sleep(3 * time.Second)
-						_ = chromedp.Run(silentCtx, chromedp.Navigate("https://x.com/home"))
+						_ = chromedp.Run(ctx, chromedp.Navigate("https://x.com/home"))
 						time.Sleep(5 * time.Second)
 					}
 				} else {
