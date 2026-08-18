@@ -17,7 +17,9 @@ type Post struct {
 
 // FetchRequest is the input passed to a platform-specific fetcher.
 type FetchRequest struct {
-	SourceURL string
+	SourceURL            string
+	AccountID            int64  // 账号ID,用于上报账号统计数据
+	AccountStatsEndpoint string // 账号统计更新API地址,为空则不上报
 }
 
 // FetchResult is the output of a platform-specific fetcher.

@@ -324,6 +324,9 @@ func FetchTikTokPosts(ctx context.Context, logger *logx.Logger, req scraper.Fetc
 	totalLikes := parseTikTokMetric(likesStr)
 	logger.Print("TT_FETCH", fmt.Sprintf("账号总粉丝数: %d, 总点赞量: %d", totalFollowers, totalLikes))
 
+	// 上报账号统计数据(TikTok不提取totalPosts,传0),失败不中断流程
+	scraper.ReportAccountStats(ctx, logger, req.AccountID, totalFollowers, 0, req.AccountStatsEndpoint)
+
 	return scraper.SanitizeResult(scraper.FetchResult{
 		Posts:         posts,
 		TotalFollowers: totalFollowers,

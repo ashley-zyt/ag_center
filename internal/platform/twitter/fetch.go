@@ -195,6 +195,9 @@ func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchReque
 		}
 	}
 
+	// 立即上报账号统计数据(粉丝数+发帖数),失败不中断流程
+	scraper.ReportAccountStats(ctx, logger, req.AccountID, totalFollowers, totalPosts, req.AccountStatsEndpoint)
+
 	// 4. 执行滚动采集
 	logger.Print("TW_FETCH", "正在执行动态滚动采集...")
 	runScrollScript := `

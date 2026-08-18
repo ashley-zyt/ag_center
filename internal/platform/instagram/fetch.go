@@ -195,6 +195,9 @@ func FetchInstagramPosts(ctx context.Context, logger *logx.Logger, req scraper.F
 		logger.Print("INS_WARN", fmt.Sprintf("提取粉丝/发帖数脚本执行失败: %v", err))
 	}
 
+	// 立即上报账号统计数据(粉丝数+发帖数),失败不中断流程
+	scraper.ReportAccountStats(ctx, logger, req.AccountID, totalFollowers, totalPosts, req.AccountStatsEndpoint)
+
 	// 3. 🌟 极速嗅探与验证：精准定位浏览量 DOM
 	type TempReelItem struct {
 		Link  string `json:"link"`

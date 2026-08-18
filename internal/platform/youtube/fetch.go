@@ -141,6 +141,9 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 					}
 				}
 
+				// 立即上报账号统计数据(粉丝数+发帖数),失败不中断流程
+				scraper.ReportAccountStats(ctx, logger, req.AccountID, totalFollowers, totalPosts, req.AccountStatsEndpoint)
+
 				// 返回Studio页面继续原有流程
 				logger.Print("YT_FETCH", "粉丝数/视频数提取完成，返回Studio页面...")
 				_ = chromedp.Run(ctx, chromedp.Navigate(studioURL))
@@ -254,7 +257,7 @@ func collectStudioTab(ctx context.Context, logger *logx.Logger, tabURL string, i
 	)
 	time.Sleep(2 * time.Second)
 
-	// 滚动表格区域以触发懒加载, 确保所有行都被渲染
+	// 滚动表格区域以触发懒加载, 确保前10行被渲染(不需要滚动到底加载全部30条)
 	scrollJS := `
 		(() => {
 			const table = document.querySelector('ytcp-video-section-content#video-list');
@@ -264,17 +267,12 @@ func collectStudioTab(ctx context.Context, logger *logx.Logger, tabURL string, i
 			// 向上滚先
 			if (sc) sc.scrollTop = 0;
 			window.scrollTo(0, 0);
-			// 分多次向下滚动触发懒加载
-			let totalHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-			let step = 500;
-			for (let y = 0; y < totalHeight; y += step) {
-				window.scrollTo(0, y);
-			}
-			window.scrollTo(0, 0);
+			// 只滚动一小段距离触发前10条的懒加载(每行约80px, 10条约800px, 留余量滚1200px)
+			window.scrollTo(0, 600);
 		})()
 	`
 	_ = chromedp.Run(ctx, chromedp.Evaluate(scrollJS, nil))
-	time.Sleep(2 * time.Second)
+	time.Sleep(1500 * time.Millisecond)
 
 	// 注入采集脚本(重复注入以确保拿到滚动后的数据)
 	if err := chromedp.Run(ctx, chromedp.Evaluate(ytStudioCollectJS, nil)); err != nil {
@@ -290,7 +288,15 @@ func collectStudioTab(ctx context.Context, logger *logx.Logger, tabURL string, i
 		logger.Print(tag, "该Tab下未发现视频数据")
 		return nil, nil
 	}
-	logger.Print(tag, fmt.Sprintf("嗅探到 %d 条记录，开始追溯点赞明细...", len(jsResult)))
+
+	// 每个Tab最多只处理前10条
+	const maxPostsPerTab = 10
+	if len(jsResult) > maxPostsPerTab {
+		logger.Print(tag, fmt.Sprintf("嗅探到 %d 条记录，仅处理前 %d 条", len(jsResult), maxPostsPerTab))
+		jsResult = jsResult[:maxPostsPerTab]
+	} else {
+		logger.Print(tag, fmt.Sprintf("嗅探到 %d 条记录，开始追溯点赞明细...", len(jsResult)))
+	}
 
 	// 遍历详情页获取点赞数(直接在当前标签页导航, 不创建新标签页, 避免标签页管理混乱)
 	var posts []scraper.Post
