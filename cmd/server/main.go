@@ -96,6 +96,11 @@ const (
 	// via the POSTS_UPDATE_API_URL environment variable. When empty, the
 	// update call is skipped and only logged.
 	accountPostsUpdateURL = "http://47.89.235.227:3366/api/v1/post_stats"
+
+	// accountStatsUpdateURL is the endpoint that receives batch account
+	// statistics (followers, total posts) after post scraping completes.
+	// Can be overridden via ACCOUNT_STATS_UPDATE_API_URL environment variable.
+	accountStatsUpdateURL = "http://47.89.235.227:3366/api/v1/account_stats/batch_update"
 )
 
 // profileOpMu 确保同一Profile同时只能执行一个浏览器操作(fetch/nurture), 避免并发操作同一浏览器导致标签页混乱、导航互相干扰
@@ -309,6 +314,59 @@ func resolvePostsUpdateURL(override string) string {
 		return v
 	}
 	return accountPostsUpdateURL
+}
+
+// resolveAccountStatsUpdateURL returns the URL used to batch-update account
+// statistics (followers, total posts). Priority: env var > compile-time const.
+func resolveAccountStatsUpdateURL() string {
+	if v := strings.TrimSpace(os.Getenv("ACCOUNT_STATS_UPDATE_API_URL")); v != "" {
+		return v
+	}
+	return accountStatsUpdateURL
+}
+
+// AccountStatParam is a single account's stats payload sent to the batch API.
+type AccountStatParam struct {
+	AccountID      int64 `json:"account_id"`
+	TotalFollowers int   `json:"total_followers"`
+	TotalPosts     int   `json:"total_posts"`
+}
+
+// accountStatsBatchPayload is the request body for the batch account stats API.
+type accountStatsBatchPayload struct {
+	Results []AccountStatParam `json:"results"`
+}
+
+// callBatchAccountStatsUpdateAPI POSTs batch account stats to the configured endpoint.
+func callBatchAccountStatsUpdateAPI(ctx context.Context, logger *logx.Logger, endpoint string, stats []AccountStatParam) error {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" || len(stats) == 0 {
+		return nil
+	}
+	payload := accountStatsBatchPayload{Results: stats}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", accountCheckUA)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("http status %d: %s", resp.StatusCode, safeSnippet(string(raw), 300))
+	}
+
+	logger.Print("ACCT_STATS", fmt.Sprintf("已成功批量推送账号统计数据 (共 %d 个账号)", len(stats)))
+	return nil
 }
 
 // callPostsUpdateAPI POSTs the scraped posts for a single account to the
@@ -774,6 +832,10 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 		}
 		openedTabs := make([]tabInfo, 0, len(req.ActiveAccounts))
 		results := make([]FetchPostsAccountResult, 0, len(req.ActiveAccounts))
+		statsEndpoint := resolveAccountStatsUpdateURL()
+		if statsEndpoint != "" {
+			logger.Print("FP3", fmt.Sprintf("账号统计更新API: %s (采集到粉丝数后立即上报)", statsEndpoint))
+		}
 
 		// 2. 串行遍历账号采集
 		// 第一个账号复用browserCtx(已含错误抑制)，后续账号新建标签页(同样带错误抑制)，避免多余空白标签页
@@ -810,7 +872,9 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 
 			fetchCtx, cancelFetch := context.WithTimeout(tabCtx, 20*time.Minute)
 			fetchRes, fetchErr := fetchPostsByPlatform(fetchCtx, logger, acc.Platform, scraper.FetchRequest{
-				SourceURL: trimmedURL,
+				SourceURL:            trimmedURL,
+				AccountID:            int64(acc.ID),
+				AccountStatsEndpoint: statsEndpoint,
 			})
 			cancelFetch()
 
