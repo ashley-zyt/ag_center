@@ -22,6 +22,7 @@ import (
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/platform/facebook"
 	"minimax_pro/internal/platform/instagram"
+	"minimax_pro/internal/platform/message"
 	"minimax_pro/internal/platform/nurture"
 	"minimax_pro/internal/platform/scraper"
 	"minimax_pro/internal/platform/tiktok"
@@ -715,6 +716,120 @@ func nurtureByPlatform(ctx context.Context, logger *logx.Logger, platform string
 	}
 }
 
+// sendMessageByPlatform 分发批量私信任务到平台实现
+func sendMessageByPlatform(ctx context.Context, logger *logx.Logger, platform string, tasks []message.SendTask) (message.SendResult, error) {
+	switch strings.ToLower(strings.TrimSpace(platform)) {
+	case "tiktok", "tt":
+		return tiktok.SendTikTokMessage(ctx, logger, tasks)
+	case "instagram", "ig":
+		return instagram.SendInstagramMessage(ctx, logger, tasks)
+	case "twitter", "x":
+		return twitter.SendTwitterMessage(ctx, logger, tasks)
+	case "facebook", "fb":
+		return facebook.SendFacebookMessage(ctx, logger, tasks)
+	case "youtube", "yt":
+		// YouTube 已下线站内私信(Direct Messages)功能, 无可实现入口
+		return message.SendResult{Status: "failed", ErrorInfo: "youtube 平台无站内私信功能(YouTube 已下线 Direct Messages)"}, fmt.Errorf("message send: youtube does not support direct messages")
+	default:
+		return message.SendResult{Status: "failed", ErrorInfo: "unsupported platform: " + platform}, fmt.Errorf("message send: unsupported platform %q", platform)
+	}
+}
+
+// fetchMessagesByPlatform 分发会话列表拉取任务到平台实现
+func fetchMessagesByPlatform(ctx context.Context, logger *logx.Logger, platform string, opts message.FetchOptions) (message.FetchConversationsResult, error) {
+	switch strings.ToLower(strings.TrimSpace(platform)) {
+	case "tiktok", "tt":
+		return tiktok.FetchTikTokConversations(ctx, logger, opts)
+	case "instagram", "ig":
+		return instagram.FetchInstagramConversations(ctx, logger, opts)
+	case "twitter", "x":
+		return twitter.FetchTwitterConversations(ctx, logger, opts)
+	case "facebook", "fb":
+		return facebook.FetchFacebookConversations(ctx, logger, opts)
+	case "youtube", "yt":
+		return message.FetchConversationsResult{Status: "failed", ErrorInfo: "youtube 平台无站内私信功能(YouTube 已下线 Direct Messages)"}, fmt.Errorf("message fetch: youtube does not support direct messages")
+	default:
+		return message.FetchConversationsResult{Status: "failed", ErrorInfo: "unsupported platform: " + platform}, fmt.Errorf("message fetch: unsupported platform %q", platform)
+	}
+}
+
+// ─────────────────────────── 私信模块请求/响应结构 ───────────────────────────
+
+// SendMessageItem 单条主动发送任务
+type SendMessageItem struct {
+	TargetURL      string `json:"target_url"`             // 对方账号主页链接(主页型平台: TikTok/Instagram/Facebook)
+	AccountName    string `json:"account_name,omitempty"` // 对方账号名(搜索型平台: X/Twitter, 如 @Widino)
+	MessageContent string `json:"message_content"`        // 消息内容
+	Passcode       string `json:"passcode,omitempty"`     // 平台密码验证(如 X 私信 Passcode, 默认1472)
+}
+
+// SendMessageRequest POST /accounts/send_message 请求体
+type SendMessageRequest struct {
+	ProfileName      string            `json:"profile_name"`
+	Platform         string            `json:"platform"`
+	Messages         []SendMessageItem `json:"messages"`
+	Host             string            `json:"host"`
+	Port             int               `json:"port"`
+	WaitSeconds      int               `json:"wait_seconds"`
+	UndetectablePath string            `json:"undetectable_path"`
+}
+
+// SendMessageResponse POST /accounts/send_message 响应
+type SendMessageResponse struct {
+	Type      string                `json:"type"`
+	ProfileID string                `json:"profile_id"`
+	Status    string                `json:"status"` // completed / partial_failed / failed / not_logged_in / error
+	Results   []message.SendOutcome `json:"results"`
+	ErrorInfo string                `json:"error_info,omitempty"`
+}
+
+// SendSingleMessageRequest POST /accounts/send_single_message 请求体(单条私信, 非批量)
+type SendSingleMessageRequest struct {
+	ProfileName      string `json:"profile_name"`           // 浏览器名称
+	Platform         string `json:"platform"`               // 平台名
+	TargetURL        string `json:"target_url"`             // 对方账号URL(主页型平台: TikTok/Instagram/Facebook)
+	AccountName      string `json:"account_name,omitempty"` // 对方账号名(搜索型平台: X/Twitter, 如 @Widino)
+	MessageContent   string `json:"message_content"`        // 发消息的内容
+	Passcode         string `json:"passcode,omitempty"`     // 平台密码验证(如 X 私信 Passcode, 默认1472)
+	AccountID        int64  `json:"account_id"`             // 账号ID(由调用方传入, 用于追踪)
+	Host             string `json:"host"`
+	Port             int    `json:"port"`
+	WaitSeconds      int    `json:"wait_seconds"`
+	UndetectablePath string `json:"undetectable_path"`
+}
+
+// SendSingleMessageResponse POST /accounts/send_single_message 响应
+type SendSingleMessageResponse struct {
+	Type      string               `json:"type"`
+	ProfileID string               `json:"profile_id"`
+	AccountID int64                `json:"account_id"`
+	Status    string               `json:"status"` // completed / failed / not_logged_in / error
+	Result    *message.SendOutcome `json:"result,omitempty"`
+	ErrorInfo string               `json:"error_info,omitempty"`
+}
+
+// FetchMessagesRequest POST /accounts/fetch_messages 请求体
+type FetchMessagesRequest struct {
+	ProfileName                string `json:"profile_name"`
+	Platform                   string `json:"platform"`
+	MaxConversations           int    `json:"max_conversations"`             // 默认10
+	MaxMessagesPerConversation int    `json:"max_messages_per_conversation"` // 默认20
+	Passcode                   string `json:"passcode,omitempty"`            // 平台密码验证(如 X 私信 Passcode, 默认1472)
+	Host                       string `json:"host"`
+	Port                       int    `json:"port"`
+	WaitSeconds                int    `json:"wait_seconds"`
+	UndetectablePath           string `json:"undetectable_path"`
+}
+
+// FetchMessagesResponse POST /accounts/fetch_messages 响应
+type FetchMessagesResponse struct {
+	Type          string                 `json:"type"`
+	ProfileID     string                 `json:"profile_id"`
+	Status        string                 `json:"status"` // completed / failed / not_logged_in / error
+	Conversations []message.Conversation `json:"conversations"`
+	ErrorInfo     string                 `json:"error_info,omitempty"`
+}
+
 type FetchPostsAccount struct {
 	ID        int    `json:"id"`
 	Platform  string `json:"platform"`
@@ -983,6 +1098,327 @@ func callSinglePostUpdateAPI(ctx context.Context, logger *logx.Logger, endpoint 
 	}
 
 	return nil
+}
+
+// handleSendMessage POST /accounts/send_message 主动给对方账号批量发私信
+func handleSendMessage(logger *logx.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
+			return
+		}
+
+		var req SendMessageRequest
+		_, err := decodeJSONBody(r, &req, 1<<20)
+		if err != nil {
+			logger.Print("MSG", "send_message JSON解析失败: "+err.Error())
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
+			return
+		}
+
+		if req.ProfileName == "" || req.Platform == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name and platform are required"})
+			return
+		}
+		if len(req.Messages) == 0 {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "messages is required"})
+			return
+		}
+		if len(req.Messages) > 20 {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "messages exceeds limit 20"})
+			return
+		}
+		if req.Host == "" {
+			req.Host = accountDefaultHost
+		}
+		if req.Port == 0 {
+			req.Port = accountDefaultPort
+		}
+		if req.WaitSeconds <= 0 {
+			req.WaitSeconds = accountDefaultWaitS
+		}
+
+		tasks := make([]message.SendTask, 0, len(req.Messages))
+		for _, m := range req.Messages {
+			tasks = append(tasks, message.SendTask{
+				TargetURL:      m.TargetURL,
+				AccountName:    m.AccountName,
+				MessageContent: m.MessageContent,
+				Passcode:       m.Passcode,
+			})
+		}
+
+		logger.Print("MSG", fmt.Sprintf("收到私信请求: profile=%s, platform=%s, 任务数=%d", req.ProfileName, req.Platform, len(tasks)))
+
+		// 获取Profile操作锁(防止同一Profile的fetch/nurture/message并发执行导致浏览器混乱)
+		releaseLock := acquireProfileLock(req.ProfileName, logger)
+		defer releaseLock()
+
+		startRes, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		if err != nil {
+			logger.Print("MSG", "启动Profile失败: "+err.Error())
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			return
+		}
+
+		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(r.Context(), startRes.Info.WebsocketLink, chromedp.NoModifyURL)
+		defer cancelAlloc()
+
+		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
+			chromedp.WithLogf(func(string, ...interface{}) {}),
+			chromedp.WithErrorf(func(string, ...interface{}) {}),
+		)
+		defer cancelBrowser()
+
+		chromedputil.CleanExtraTabs(browserCtx, logger, "MSG")
+
+		// 批量发送整体超时: 每任务最长约5分钟
+		msgCtx, cancelMsg := context.WithTimeout(browserCtx, time.Duration(len(tasks))*5*time.Minute)
+		defer cancelMsg()
+
+		sendRes, sendErr := sendMessageByPlatform(msgCtx, logger, req.Platform, tasks)
+
+		for i := range sendRes.Results {
+			sendRes.Results[i].ErrorInfo = scraper.SanitizeString(sendRes.Results[i].ErrorInfo)
+			sendRes.Results[i].TargetURL = scraper.SanitizeString(sendRes.Results[i].TargetURL)
+		}
+		sendRes.ErrorInfo = scraper.SanitizeString(sendRes.ErrorInfo)
+
+		stopProfileWithCleanup(context.Background(), logger, allocCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+
+		if sendErr != nil {
+			logger.Print("MSG", "私信流程失败: "+sendErr.Error())
+			writeJSON(w, http.StatusOK, SendMessageResponse{
+				Type:      "error",
+				ProfileID: startRes.ProfileID,
+				Status:    sendRes.Status,
+				Results:   sendRes.Results,
+				ErrorInfo: sendRes.ErrorInfo + " | " + sanitizeErr(sendErr),
+			})
+			return
+		}
+
+		logger.Print("MSG", fmt.Sprintf("私信流程完成: profile=%s, platform=%s, 状态=%s", req.ProfileName, req.Platform, sendRes.Status))
+		writeJSON(w, http.StatusOK, SendMessageResponse{
+			Type:      "success",
+			ProfileID: startRes.ProfileID,
+			Status:    sendRes.Status,
+			Results:   sendRes.Results,
+			ErrorInfo: sendRes.ErrorInfo,
+		})
+	}
+}
+
+// handleSendSingleMessage POST /accounts/send_single_message 主动给单个对方账号发私信(非批量)
+func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
+			return
+		}
+
+		var req SendSingleMessageRequest
+		_, err := decodeJSONBody(r, &req, 1<<20)
+		if err != nil {
+			logger.Print("MSG", "send_single_message JSON解析失败: "+err.Error())
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
+			return
+		}
+
+		if req.ProfileName == "" || req.Platform == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name and platform are required"})
+			return
+		}
+		if req.TargetURL == "" && req.AccountName == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "target_url or account_name is required"})
+			return
+		}
+		if req.MessageContent == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "message_content is required"})
+			return
+		}
+		if req.AccountID <= 0 {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "account_id is required"})
+			return
+		}
+		if req.Host == "" {
+			req.Host = accountDefaultHost
+		}
+		if req.Port == 0 {
+			req.Port = accountDefaultPort
+		}
+		if req.WaitSeconds <= 0 {
+			req.WaitSeconds = accountDefaultWaitS
+		}
+
+		// 单条发送: 构造只含一个任务的切片, 复用批量发送的平台分发逻辑
+		tasks := []message.SendTask{{
+			TargetURL:      req.TargetURL,
+			AccountName:    req.AccountName,
+			MessageContent: req.MessageContent,
+			Passcode:       req.Passcode,
+		}}
+
+		target := req.TargetURL
+		if target == "" {
+			target = req.AccountName
+		}
+		logger.Print("MSG", fmt.Sprintf("收到单条私信请求: profile=%s, platform=%s, account_id=%d, target=%s", req.ProfileName, req.Platform, req.AccountID, target))
+
+		// 获取Profile操作锁(防止同一Profile的fetch/nurture/message并发执行导致浏览器混乱)
+		releaseLock := acquireProfileLock(req.ProfileName, logger)
+		defer releaseLock()
+
+		startRes, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		if err != nil {
+			logger.Print("MSG", "启动Profile失败: "+err.Error())
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			return
+		}
+
+		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(r.Context(), startRes.Info.WebsocketLink, chromedp.NoModifyURL)
+		defer cancelAlloc()
+
+		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
+			chromedp.WithLogf(func(string, ...interface{}) {}),
+			chromedp.WithErrorf(func(string, ...interface{}) {}),
+		)
+		defer cancelBrowser()
+
+		chromedputil.CleanExtraTabs(browserCtx, logger, "MSG")
+
+		// 单条私信整体超时: 最长约5分钟
+		msgCtx, cancelMsg := context.WithTimeout(browserCtx, 5*time.Minute)
+		defer cancelMsg()
+
+		sendRes, sendErr := sendMessageByPlatform(msgCtx, logger, req.Platform, tasks)
+
+		for i := range sendRes.Results {
+			sendRes.Results[i].ErrorInfo = scraper.SanitizeString(sendRes.Results[i].ErrorInfo)
+			sendRes.Results[i].TargetURL = scraper.SanitizeString(sendRes.Results[i].TargetURL)
+		}
+		sendRes.ErrorInfo = scraper.SanitizeString(sendRes.ErrorInfo)
+
+		stopProfileWithCleanup(context.Background(), logger, allocCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+
+		var outcome *message.SendOutcome
+		if len(sendRes.Results) > 0 {
+			o := sendRes.Results[0]
+			outcome = &o
+		}
+
+		if sendErr != nil {
+			logger.Print("MSG", "单条私信流程失败: "+sendErr.Error())
+			writeJSON(w, http.StatusOK, SendSingleMessageResponse{
+				Type:      "error",
+				ProfileID: startRes.ProfileID,
+				AccountID: req.AccountID,
+				Status:    sendRes.Status,
+				Result:    outcome,
+				ErrorInfo: sendRes.ErrorInfo + " | " + sanitizeErr(sendErr),
+			})
+			return
+		}
+
+		logger.Print("MSG", fmt.Sprintf("单条私信流程完成: profile=%s, platform=%s, account_id=%d, 状态=%s", req.ProfileName, req.Platform, req.AccountID, sendRes.Status))
+		writeJSON(w, http.StatusOK, SendSingleMessageResponse{
+			Type:      "success",
+			ProfileID: startRes.ProfileID,
+			AccountID: req.AccountID,
+			Status:    sendRes.Status,
+			Result:    outcome,
+			ErrorInfo: sendRes.ErrorInfo,
+		})
+	}
+}
+
+// handleFetchMessages POST /accounts/fetch_messages 获取会话列表与每个会话的最新消息
+func handleFetchMessages(logger *logx.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
+			return
+		}
+
+		var req FetchMessagesRequest
+		_, err := decodeJSONBody(r, &req, 1<<20)
+		if err != nil {
+			logger.Print("MSG", "fetch_messages JSON解析失败: "+err.Error())
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
+			return
+		}
+
+		if req.ProfileName == "" || req.Platform == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name and platform are required"})
+			return
+		}
+		if req.Host == "" {
+			req.Host = accountDefaultHost
+		}
+		if req.Port == 0 {
+			req.Port = accountDefaultPort
+		}
+		if req.WaitSeconds <= 0 {
+			req.WaitSeconds = accountDefaultWaitS
+		}
+
+		logger.Print("MSG", fmt.Sprintf("收到会话拉取请求: profile=%s, platform=%s, max_conversations=%d, max_messages=%d",
+			req.ProfileName, req.Platform, req.MaxConversations, req.MaxMessagesPerConversation))
+
+		releaseLock := acquireProfileLock(req.ProfileName, logger)
+		defer releaseLock()
+
+		startRes, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		if err != nil {
+			logger.Print("MSG", "启动Profile失败: "+err.Error())
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			return
+		}
+
+		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(r.Context(), startRes.Info.WebsocketLink, chromedp.NoModifyURL)
+		defer cancelAlloc()
+
+		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
+			chromedp.WithLogf(func(string, ...interface{}) {}),
+			chromedp.WithErrorf(func(string, ...interface{}) {}),
+		)
+		defer cancelBrowser()
+
+		chromedputil.CleanExtraTabs(browserCtx, logger, "MSG")
+
+		fetchCtx, cancelFetch := context.WithTimeout(browserCtx, 20*time.Minute)
+		defer cancelFetch()
+
+		fetchRes, fetchErr := fetchMessagesByPlatform(fetchCtx, logger, req.Platform, message.FetchOptions{
+			MaxConversations:           req.MaxConversations,
+			MaxMessagesPerConversation: req.MaxMessagesPerConversation,
+			Passcode:                   req.Passcode,
+		})
+
+		stopProfileWithCleanup(context.Background(), logger, allocCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+
+		if fetchErr != nil {
+			logger.Print("MSG", "会话拉取失败: "+fetchErr.Error())
+			writeJSON(w, http.StatusOK, FetchMessagesResponse{
+				Type:          "error",
+				ProfileID:     startRes.ProfileID,
+				Status:        fetchRes.Status,
+				Conversations: fetchRes.Conversations,
+				ErrorInfo:     fetchRes.ErrorInfo + " | " + sanitizeErr(fetchErr),
+			})
+			return
+		}
+
+		logger.Print("MSG", fmt.Sprintf("会话拉取完成: profile=%s, platform=%s, 会话数=%d, 状态=%s",
+			req.ProfileName, req.Platform, len(fetchRes.Conversations), fetchRes.Status))
+		writeJSON(w, http.StatusOK, FetchMessagesResponse{
+			Type:          "success",
+			ProfileID:     startRes.ProfileID,
+			Status:        fetchRes.Status,
+			Conversations: fetchRes.Conversations,
+			ErrorInfo:     fetchRes.ErrorInfo,
+		})
+	}
 }
 func main() {
 	logger := logx.New(os.Stdout)
@@ -1775,6 +2211,11 @@ func main() {
 			UndetectablePort: res.Port,
 		})
 	})
+	// 私信模块: 主动发消息(批量/单条) + 会话最新消息拉取
+	mux.HandleFunc("/accounts/send_message", handleSendMessage(logger))
+	mux.HandleFunc("/accounts/send_single_message", handleSendSingleMessage(logger))
+	mux.HandleFunc("/accounts/fetch_messages", handleFetchMessages(logger))
+
 	mux.HandleFunc("/api/browser/locked", chrome.GetLockedProfilesHandler(logger, "127.0.0.1", 25325))
 	addr := ":8080"
 	logger.Print("BOOT", "listening on "+addr)
