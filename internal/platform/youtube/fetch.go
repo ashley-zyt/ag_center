@@ -195,15 +195,10 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 func collectStudioTab(ctx context.Context, logger *logx.Logger, tabURL string, isShorts bool) ([]scraper.Post, error) {
 	tag := "YT_SHORTS"
 	detailURLPrefix := "https://www.youtube.com/shorts/"
-	pageWaitSelector := `ytd-reel-video-renderer`
 	if !isShorts {
 		tag = "YT_VIDEOS"
 		detailURLPrefix = "https://www.youtube.com/watch?v="
-		pageWaitSelector = `ytd-watch-flexy`
 	}
-
-	// 点赞数提取JS: Shorts和长视频页面通用
-	extractLikesJS := ytExtractLikesJS
 
 	// 导航到Tab页面
 	logger.Print(tag, fmt.Sprintf("正在导航至: %s", tabURL))
@@ -309,65 +304,7 @@ func collectStudioTab(ctx context.Context, logger *logx.Logger, tabURL string, i
 		}
 
 		fullDetailURL := detailURLPrefix + videoID
-		likesStr := "0"
-
-		// 直接在当前tab导航到详情页(每个详情页15秒超时)
-		detailTimeoutCtx, detailTimeoutCancel := context.WithTimeout(ctx, 20*time.Second)
-		err := chromedp.Run(detailTimeoutCtx,
-			chromedp.Navigate(fullDetailURL),
-			chromedp.Sleep(2*time.Second),
-			chromedp.WaitVisible(pageWaitSelector, chromedp.ByQuery),
-		)
-		// 等待点赞按钮就绪
-		if err == nil {
-			_ = chromedp.Run(detailTimeoutCtx,
-				chromedp.PollFunction(`() => {
-					// 查找点赞按钮宿主(优先在action bar容器内)
-					const actionBar = document.querySelector('reel-action-bar-view-model, .ytwReelActionBarViewModelHost, #top-level-buttons-computed, #menu-container ytd-menu-renderer');
-					const searchRoot = actionBar || document;
-					const btn = searchRoot.querySelector('like-button-view-model, .ytLikeButtonViewModelHost, #segmented-like-button');
-					if (!btn) return false;
-					// 递归穿透shadowRoot查找数字文本或含数字的aria-label
-					function checkNode(root) {
-						if (!root) return false;
-						const spans = root.querySelectorAll('div.ytSpecButtonShapeWithLabelLabel span, span.ytAttributedStringHost, span.yt-core-attributed-string, .yt-spec-button-shape-next__text, .yt-spec-button-shape-next__button-text-content');
-						for (const s of spans) {
-							const t = (s.textContent || '').trim();
-							if (t && t.length <= 15 && /\d/.test(t) && !/^(Like|赞)$/.test(t)) return true;
-						}
-						const btns = root.querySelectorAll('button[aria-label*="like"], button[aria-label*="Like"]');
-						for (const b of btns) { if (/\d/.test(b.getAttribute('aria-label')||'')) return true; }
-						const all = root.querySelectorAll('*');
-						for (const el of all) { if (el.shadowRoot && checkNode(el.shadowRoot)) return true; }
-						return false;
-					}
-					if (checkNode(btn)) return true;
-					if (btn.shadowRoot && checkNode(btn.shadowRoot)) return true;
-					return false;
-				}`, nil, chromedp.WithPollingTimeout(10*time.Second), chromedp.WithPollingInterval(300*time.Millisecond)),
-			)
-			// 提取点赞数
-			err = chromedp.Run(detailTimeoutCtx, chromedp.Evaluate(extractLikesJS, &likesStr))
-			if err != nil || likesStr == "" || likesStr == "0" {
-				// 等待后重试一次
-				time.Sleep(2 * time.Second)
-				_ = chromedp.Run(detailTimeoutCtx, chromedp.Evaluate(extractLikesJS, &likesStr))
-				if likesStr != "" {
-					err = nil
-				}
-			}
-		}
-		detailTimeoutCancel()
-
-		if err != nil {
-			logger.Print(tag+"_WARN", fmt.Sprintf("视频 [%s] 点赞抓取失败(超时/受限)", videoID))
-			likesStr = "0"
-		}
-
-		likesStr = strings.TrimSpace(likesStr)
-		if likesStr == "" || strings.EqualFold(likesStr, "like") {
-			likesStr = "0"
-		}
+		likesStr := fetchVideoLikes(ctx, logger, tag, fullDetailURL, videoID, isShorts)
 
 		shortDate := raw["publishTime"]
 		if parts := strings.Split(shortDate, " "); len(parts) > 0 {
@@ -411,6 +348,116 @@ func collectStudioTab(ctx context.Context, logger *logx.Logger, tabURL string, i
 	time.Sleep(2 * time.Second)
 
 	return posts, nil
+}
+
+// fetchVideoLikes 导航到视频详情页并提取点赞数。
+// 解决 Shorts 自动连播问题: 视频播放完后 YouTube 会自动跳转到别的大V视频, 导致点赞数采错。
+// 防护策略: 提取前后校验当前 URL 是否仍指向目标 videoID, 若已跳转则重新导航重试。
+func fetchVideoLikes(ctx context.Context, logger *logx.Logger, tag, fullDetailURL, videoID string, isShorts bool) string {
+	pageWaitSelector := `ytd-reel-video-renderer`
+	if !isShorts {
+		pageWaitSelector = `ytd-watch-flexy`
+	}
+
+	const maxAttempts = 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		detailCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+
+		err := chromedp.Run(detailCtx,
+			chromedp.Navigate(fullDetailURL),
+			chromedp.Sleep(2*time.Second),
+			chromedp.WaitVisible(pageWaitSelector, chromedp.ByQuery),
+		)
+		if err != nil {
+			cancel()
+			continue
+		}
+
+		// 等待点赞按钮就绪
+		_ = chromedp.Run(detailCtx,
+			chromedp.PollFunction(`() => {
+				const actionBar = document.querySelector('reel-action-bar-view-model, .ytwReelActionBarViewModelHost, #top-level-buttons-computed, #menu-container ytd-menu-renderer');
+				const searchRoot = actionBar || document;
+				const btn = searchRoot.querySelector('like-button-view-model, .ytLikeButtonViewModelHost, #segmented-like-button');
+				if (!btn) return false;
+				function checkNode(root) {
+					if (!root) return false;
+					const spans = root.querySelectorAll('div.ytSpecButtonShapeWithLabelLabel span, span.ytAttributedStringHost, span.yt-core-attributed-string, .yt-spec-button-shape-next__text, .yt-spec-button-shape-next__button-text-content');
+					for (const s of spans) {
+						const t = (s.textContent || '').trim();
+						if (t && t.length <= 15 && /\d/.test(t) && !/^(Like|赞)$/.test(t)) return true;
+					}
+					const btns = root.querySelectorAll('button[aria-label*="like"], button[aria-label*="Like"]');
+					for (const b of btns) { if (/\d/.test(b.getAttribute('aria-label')||'')) return true; }
+					const all = root.querySelectorAll('*');
+					for (const el of all) { if (el.shadowRoot && checkNode(el.shadowRoot)) return true; }
+					return false;
+				}
+				if (checkNode(btn)) return true;
+				if (btn.shadowRoot && checkNode(btn.shadowRoot)) return true;
+				return false;
+			}`, nil, chromedp.WithPollingTimeout(10*time.Second), chromedp.WithPollingInterval(300*time.Millisecond)),
+		)
+
+		// 提取前校验 URL: 确保仍停留在目标视频, 未被自动连播跳转
+		var currentURL string
+		_ = chromedp.Run(detailCtx, chromedp.Location(&currentURL))
+		if !isTargetVideoURL(currentURL, videoID) {
+			logger.Print(tag+"_WARN", fmt.Sprintf("视频 [%s] 提取前发现页面已跳转(%s), 第%d次重试", videoID, currentURL, attempt))
+			cancel()
+			continue
+		}
+
+		// 提取点赞数
+		var likesStr string
+		err = chromedp.Run(detailCtx, chromedp.Evaluate(ytExtractLikesJS, &likesStr))
+
+		// 提取后再校验一次 URL, 防止提取过程中发生跳转
+		_ = chromedp.Run(detailCtx, chromedp.Location(&currentURL))
+		if err == nil && isTargetVideoURL(currentURL, videoID) {
+			cancel()
+			likesStr = strings.TrimSpace(likesStr)
+			if likesStr == "" || strings.EqualFold(likesStr, "like") {
+				likesStr = "0"
+			}
+			return likesStr
+		}
+
+		logger.Print(tag+"_WARN", fmt.Sprintf("视频 [%s] 提取后页面已跳转或提取失败, 第%d次重试", videoID, attempt))
+		cancel()
+	}
+
+	logger.Print(tag+"_WARN", fmt.Sprintf("视频 [%s] 点赞抓取失败(自动连播跳转或超时)", videoID))
+	return "0"
+}
+
+// isTargetVideoURL 判断当前 URL 是否仍指向目标 videoID。
+// YouTube 详情页存在多种链接格式, 已知:
+//   - https://www.youtube.com/watch?v=VIDEO_ID
+//   - https://www.youtube.com/shorts/VIDEO_ID
+// 校验 videoID 后必须紧跟分隔符(参数/路径/锚点/结尾), 避免子串误判。
+func isTargetVideoURL(currentURL, videoID string) bool {
+	if videoID == "" || currentURL == "" {
+		return false
+	}
+
+	// watch?v=VIDEO_ID 格式: videoID 后应为 &、# 或字符串结尾
+	if strings.Contains(currentURL, "v="+videoID) {
+		idx := strings.Index(currentURL, "v="+videoID) + len("v=") + len(videoID)
+		if idx >= len(currentURL) || strings.ContainsRune("&#", rune(currentURL[idx])) {
+			return true
+		}
+	}
+
+	// shorts/VIDEO_ID 格式: videoID 后应为 ?、/、# 或字符串结尾
+	if strings.Contains(currentURL, "/shorts/"+videoID) {
+		idx := strings.Index(currentURL, "/shorts/"+videoID) + len("/shorts/") + len(videoID)
+		if idx >= len(currentURL) || strings.ContainsRune("?/#", rune(currentURL[idx])) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // ytStudioCollectJS 是在Studio页面采集视频列表的JS脚本(Shorts和Videos通用)

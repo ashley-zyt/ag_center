@@ -480,7 +480,7 @@ func checkAccountLogin(ctx context.Context, logger *logx.Logger, item AccountChe
 	// 清理多余标签页
 	chromedputil.CleanExtraTabs(tabCtx, logger, "CHECK")
 
-	defer stopProfileWithCleanup(context.Background(), logger, allocCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+	defer stopProfileWithCleanup(context.Background(), logger, tabCtx, startRes.Host, startRes.Port, startRes.ProfileID)
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 30*time.Second)
 	defer cancelTimeout()
@@ -606,9 +606,9 @@ func startProfileByName(ctx context.Context, logger *logx.Logger, profileName st
 	return startByNameResult{ProfileID: profileID, Info: info, Host: host, Port: port, Path: path}, nil
 }
 
-func stopProfileWithCleanup(ctx context.Context, logger *logx.Logger, allocCtx context.Context, host string, port int, profileID string) {
-	if allocCtx != nil {
-		closeCtx, cancelClose := context.WithTimeout(allocCtx, 10*time.Second)
+func stopProfileWithCleanup(ctx context.Context, logger *logx.Logger, browserCtx context.Context, host string, port int, profileID string) {
+	if browserCtx != nil {
+		closeCtx, cancelClose := context.WithTimeout(browserCtx, 10*time.Second)
 		_ = chromedputil.CloseAllTabsThenBrowser(closeCtx)
 		cancelClose()
 	}
@@ -753,6 +753,16 @@ func fetchMessagesByPlatform(ctx context.Context, logger *logx.Logger, platform 
 	}
 }
 
+// checkReplyByPlatform 分发"判断对方是否回复"任务到平台实现
+func checkReplyByPlatform(ctx context.Context, logger *logx.Logger, platform string, opts message.CheckReplyOptions) (message.CheckReplyResult, error) {
+	switch strings.ToLower(strings.TrimSpace(platform)) {
+	case "twitter", "x":
+		return twitter.CheckTwitterReply(ctx, logger, opts)
+	default:
+		return message.CheckReplyResult{Status: "failed", ErrorInfo: "unsupported platform: " + platform}, fmt.Errorf("message check_reply: unsupported platform %q", platform)
+	}
+}
+
 // ─────────────────────────── 私信模块请求/响应结构 ───────────────────────────
 
 // SendMessageItem 单条主动发送任务
@@ -830,6 +840,35 @@ type FetchMessagesResponse struct {
 	ErrorInfo     string                 `json:"error_info,omitempty"`
 }
 
+// CheckReplyRequest POST /accounts/check_reply 请求体(判断对方是否回复)
+type CheckReplyRequest struct {
+	ProfileName        string `json:"profile_name"` // 浏览器名称
+	Platform           string `json:"platform"`     // 平台名
+	TargetURL          string `json:"target_url"`   // 对方账号URL(主页型平台)
+	AccountName        string `json:"account_name,omitempty"` // 对方账号名(搜索型平台: X/Twitter, 如 @ashly35856)
+	Passcode           string `json:"passcode,omitempty"`     // 平台密码验证(如 X 私信 Passcode, 默认1472)
+	AccountID          int64  `json:"account_id"`             // 账号ID(由调用方传入, 用于追踪)
+	SinceIncomingCount int    `json:"since_incoming_count"`   // 上次已看到的对方消息数(增量基线)
+	Host               string `json:"host"`
+	Port               int    `json:"port"`
+	WaitSeconds        int    `json:"wait_seconds"`
+	UndetectablePath   string `json:"undetectable_path"`
+}
+
+// CheckReplyResponse POST /accounts/check_reply 响应
+type CheckReplyResponse struct {
+	Type        string            `json:"type"`
+	ProfileID   string            `json:"profile_id"`
+	AccountID   int64             `json:"account_id"`
+	Status      string            `json:"status"`       // completed / failed / not_logged_in / error
+	ReplyStatus string            `json:"reply_status"` // replied=对方已回复 / awaiting_reply=等待对方回复
+	HasReply    bool              `json:"has_reply"`    // 对方是否已回复
+	ReplyCount  int               `json:"reply_count"`  // 本次返回的对方新回复条数
+	Replies     []message.Message `json:"replies"`      // 对方发来的新回复(时间正序)
+	CheckedAt   string            `json:"checked_at,omitempty"` // 本次查询的服务端时间(RFC3339)
+	ErrorInfo   string            `json:"error_info,omitempty"`
+}
+
 type FetchPostsAccount struct {
 	ID        int    `json:"id"`
 	Platform  string `json:"platform"`
@@ -858,6 +897,7 @@ type FetchPostsAccountResult struct {
 	TotalFollowers int            `json:"total_followers"`
 	TotalLikes     int            `json:"total_likes"`
 	TotalPosts     int            `json:"total_posts"`
+	StalledURL     string         `json:"stalled_url,omitempty"` // 页面停留超时卡住的页面链接
 	ErrorInfo      string         `json:"error_info,omitempty"`
 	UpdateSent     bool           `json:"update_sent"`
 	UpdateError    string         `json:"update_error,omitempty"`
@@ -986,15 +1026,23 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			openedTabs = append(openedTabs, tabInfo{ctx: tabCtx, cancel: cancelTab})
 
 			fetchCtx, cancelFetch := context.WithTimeout(tabCtx, 20*time.Minute)
-			fetchRes, fetchErr := fetchPostsByPlatform(fetchCtx, logger, acc.Platform, scraper.FetchRequest{
+			stallCtx, cancelStall, watcher := chromedputil.WatchPageStall(fetchCtx, logger, 30*time.Second)
+			fetchRes, fetchErr := fetchPostsByPlatform(stallCtx, logger, acc.Platform, scraper.FetchRequest{
 				SourceURL:            trimmedURL,
 				AccountID:            int64(acc.ID),
 				AccountStatsEndpoint: statsEndpoint,
 			})
+			cancelStall()
 			cancelFetch()
 
 			if fetchErr != nil {
-				res.ErrorInfo = fetchErr.Error()
+				if watcher.Stalled() {
+					res.StalledURL = watcher.URL()
+					res.ErrorInfo = "页面停留超时(30s), 卡在页面: " + watcher.URL()
+					logger.Print("FP3", fmt.Sprintf("[%d/%d] 页面停留超时, 卡在: %s", i+1, len(req.ActiveAccounts), watcher.URL()))
+				} else {
+					res.ErrorInfo = fetchErr.Error()
+				}
 			} else {
 				res.Posts = fetchRes.Posts
 				if res.Posts == nil {
@@ -1063,7 +1111,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			tab.cancel()
 		}
 
-		stopProfileWithCleanup(context.Background(), logger, allocCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+		stopProfileWithCleanup(context.Background(), logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
 
 		writeJSON(w, http.StatusOK, FetchPostsResponse{
 			Type:      "success",
@@ -1184,7 +1232,7 @@ func handleSendMessage(logger *logx.Logger) http.HandlerFunc {
 		}
 		sendRes.ErrorInfo = scraper.SanitizeString(sendRes.ErrorInfo)
 
-		stopProfileWithCleanup(context.Background(), logger, allocCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+		stopProfileWithCleanup(context.Background(), logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
 
 		if sendErr != nil {
 			logger.Print("MSG", "私信流程失败: "+sendErr.Error())
@@ -1299,7 +1347,7 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 		}
 		sendRes.ErrorInfo = scraper.SanitizeString(sendRes.ErrorInfo)
 
-		stopProfileWithCleanup(context.Background(), logger, allocCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+		stopProfileWithCleanup(context.Background(), logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
 
 		var outcome *message.SendOutcome
 		if len(sendRes.Results) > 0 {
@@ -1395,7 +1443,7 @@ func handleFetchMessages(logger *logx.Logger) http.HandlerFunc {
 			Passcode:                   req.Passcode,
 		})
 
-		stopProfileWithCleanup(context.Background(), logger, allocCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+		stopProfileWithCleanup(context.Background(), logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
 
 		if fetchErr != nil {
 			logger.Print("MSG", "会话拉取失败: "+fetchErr.Error())
@@ -1420,6 +1468,122 @@ func handleFetchMessages(logger *logx.Logger) http.HandlerFunc {
 		})
 	}
 }
+
+// handleCheckReply POST /accounts/check_reply 判断对方是否回复(单个对方账号)
+func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
+			return
+		}
+
+		var req CheckReplyRequest
+		_, err := decodeJSONBody(r, &req, 1<<20)
+		if err != nil {
+			logger.Print("MSG", "check_reply JSON解析失败: "+err.Error())
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
+			return
+		}
+
+		if req.ProfileName == "" || req.Platform == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name and platform are required"})
+			return
+		}
+		if req.TargetURL == "" && req.AccountName == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "target_url or account_name is required"})
+			return
+		}
+		if req.Host == "" {
+			req.Host = accountDefaultHost
+		}
+		if req.Port == 0 {
+			req.Port = accountDefaultPort
+		}
+		if req.WaitSeconds <= 0 {
+			req.WaitSeconds = accountDefaultWaitS
+		}
+
+		target := req.TargetURL
+		if target == "" {
+			target = req.AccountName
+		}
+		logger.Print("MSG", fmt.Sprintf("收到判断回复请求: profile=%s, platform=%s, account_id=%d, target=%s, since=%d",
+			req.ProfileName, req.Platform, req.AccountID, target, req.SinceIncomingCount))
+
+		releaseLock := acquireProfileLock(req.ProfileName, logger)
+		defer releaseLock()
+
+		startRes, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		if err != nil {
+			logger.Print("MSG", "启动Profile失败: "+err.Error())
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			return
+		}
+
+		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(r.Context(), startRes.Info.WebsocketLink, chromedp.NoModifyURL)
+		defer cancelAlloc()
+
+		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
+			chromedp.WithLogf(func(string, ...interface{}) {}),
+			chromedp.WithErrorf(func(string, ...interface{}) {}),
+		)
+		defer cancelBrowser()
+
+		chromedputil.CleanExtraTabs(browserCtx, logger, "MSG")
+
+		checkCtx, cancelCheck := context.WithTimeout(browserCtx, 5*time.Minute)
+		defer cancelCheck()
+
+		checkRes, checkErr := checkReplyByPlatform(checkCtx, logger, req.Platform, message.CheckReplyOptions{
+			TargetURL:          req.TargetURL,
+			AccountName:        req.AccountName,
+			Passcode:           req.Passcode,
+			SinceIncomingCount: req.SinceIncomingCount,
+		})
+
+		stopProfileWithCleanup(context.Background(), logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+
+		for i := range checkRes.Replies {
+			checkRes.Replies[i].SenderName = scraper.SanitizeString(checkRes.Replies[i].SenderName)
+			checkRes.Replies[i].Content = scraper.SanitizeString(checkRes.Replies[i].Content)
+			checkRes.Replies[i].SentAt = scraper.SanitizeString(checkRes.Replies[i].SentAt)
+		}
+		checkRes.ErrorInfo = scraper.SanitizeString(checkRes.ErrorInfo)
+
+		if checkErr != nil {
+			logger.Print("MSG", "判断回复流程失败: "+checkErr.Error())
+			writeJSON(w, http.StatusOK, CheckReplyResponse{
+				Type:        "error",
+				ProfileID:   startRes.ProfileID,
+				AccountID:   req.AccountID,
+				Status:      checkRes.Status,
+				ReplyStatus: checkRes.ReplyStatus,
+				HasReply:    checkRes.HasReply,
+				ReplyCount:  checkRes.ReplyCount,
+				Replies:     checkRes.Replies,
+				CheckedAt:   checkRes.CheckedAt,
+				ErrorInfo:   checkRes.ErrorInfo + " | " + sanitizeErr(checkErr),
+			})
+			return
+		}
+
+		logger.Print("MSG", fmt.Sprintf("判断回复完成: profile=%s, platform=%s, account_id=%d, 状态=%s, 回复状态=%s, 新回复=%d",
+			req.ProfileName, req.Platform, req.AccountID, checkRes.Status, checkRes.ReplyStatus, checkRes.ReplyCount))
+		writeJSON(w, http.StatusOK, CheckReplyResponse{
+			Type:        "success",
+			ProfileID:   startRes.ProfileID,
+			AccountID:   req.AccountID,
+			Status:      checkRes.Status,
+			ReplyStatus: checkRes.ReplyStatus,
+			HasReply:    checkRes.HasReply,
+			ReplyCount:  checkRes.ReplyCount,
+			Replies:     checkRes.Replies,
+			CheckedAt:   checkRes.CheckedAt,
+			ErrorInfo:   checkRes.ErrorInfo,
+		})
+	}
+}
+
 func main() {
 	logger := logx.New(os.Stdout)
 	defer logger.Close()
@@ -1576,7 +1740,7 @@ func main() {
 			UndetectablePath: req.UndetectablePath,
 		})
 
-		stopProfileWithCleanup(context.Background(), logger, allocCtx, res.Host, res.Port, res.ProfileID)
+		stopProfileWithCleanup(context.Background(), logger, browserCtx, res.Host, res.Port, res.ProfileID)
 
 		if nurtureErr != nil {
 			logger.Print("E", "养号流程失败: "+nurtureErr.Error())
@@ -2211,10 +2375,11 @@ func main() {
 			UndetectablePort: res.Port,
 		})
 	})
-	// 私信模块: 主动发消息(批量/单条) + 会话最新消息拉取
+	// 私信模块: 主动发消息(批量/单条) + 会话最新消息拉取 + 判断回复
 	mux.HandleFunc("/accounts/send_message", handleSendMessage(logger))
 	mux.HandleFunc("/accounts/send_single_message", handleSendSingleMessage(logger))
 	mux.HandleFunc("/accounts/fetch_messages", handleFetchMessages(logger))
+	mux.HandleFunc("/accounts/check_reply", handleCheckReply(logger))
 
 	mux.HandleFunc("/api/browser/locked", chrome.GetLockedProfilesHandler(logger, "127.0.0.1", 25325))
 	addr := ":8080"

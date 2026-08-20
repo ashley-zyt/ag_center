@@ -82,7 +82,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 			var result interface{}
 			return chromedp.Run(closeTabCtx, chromedp.Evaluate(`window.close()`, &result))
 		}))
-		chromedputil.CloseTabsAndStopProfile(ctx, allocCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "IG7")
+		chromedputil.CloseTabsAndStopProfile(ctx, tabCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "IG7")
 	}()
 	defer cancelAlloc()
 

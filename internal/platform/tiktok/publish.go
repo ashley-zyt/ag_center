@@ -84,7 +84,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		}))
 
 		logger.Print("TT7", "关闭所有标签页")
-		closeCtx, cancelClose := context.WithTimeout(allocCtx, 10*time.Second)
+		closeCtx, cancelClose := context.WithTimeout(tabCtx, 10*time.Second)
 		if err := chromedputil.CloseAllTabsThenBrowser(closeCtx); err != nil {
 			logger.Print("TT7", "关闭标签页失败: "+err.Error())
 		} else {

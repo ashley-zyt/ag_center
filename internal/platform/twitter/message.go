@@ -57,10 +57,10 @@ var twMessageContainerSelectors = []string{
 }
 
 // twMessageItemSelectors 会话内单条消息候选
+// 消息容器为 data-testid="message-<uuid>", 文本节点为 message-text-<uuid>,
+// 通过 :not 排除文本节点, 只保留消息容器(否则会重复命中且无法区分方向)。
 var twMessageItemSelectors = []string{
-	`div[data-testid="dm-message-scroller"] [data-index]`,
-	`div[data-testid="messageEntry"]`,
-	`div[data-testid="DmActivityItem"]`,
+	`[data-testid^="message-"]:not([data-testid^="message-text-"])`,
 }
 
 // ─────────────────────────── 入口函数 ───────────────────────────
@@ -76,6 +76,13 @@ func SendTwitterMessage(ctx context.Context, logger *logx.Logger, tasks []messag
 func FetchTwitterConversations(ctx context.Context, logger *logx.Logger, opts message.FetchOptions) (message.FetchConversationsResult, error) {
 	m := &twitterMessenger{logger: logger}
 	return message.RunFetchConversations(ctx, logger, m, opts), nil
+}
+
+// CheckTwitterReply 判断对方是否回复的入口:
+// 私信主页(/i/chat) -> Passcode验证 -> New message -> 搜索账号 -> 进入会话 -> 解析对方回复
+func CheckTwitterReply(ctx context.Context, logger *logx.Logger, opts message.CheckReplyOptions) (message.CheckReplyResult, error) {
+	m := &twitterMessenger{logger: logger}
+	return message.RunCheckReply(ctx, logger, m, opts), nil
 }
 
 // twitterMessenger 实现 message.MessengerActions
@@ -335,7 +342,7 @@ func (m *twitterMessenger) OpenConversationFromProfile(ctx context.Context, task
 	if err := chromedp.Run(waitCtx, chromedp.WaitVisible(selSearchInput, chromedp.ByQuery)); err != nil {
 		return fmt.Errorf("未出现联系人搜索框: %v", err)
 	}
-	time.Sleep(1 * time.Second)
+	time.Sleep(10 * time.Second)
 
 	// 点击搜索框并输入目标账号名
 	m.logger.Print("TW_MSG3", "搜索目标账号: "+accountName)
@@ -347,23 +354,26 @@ func (m *twitterMessenger) OpenConversationFromProfile(ctx context.Context, task
 	); err != nil {
 		return fmt.Errorf("输入搜索账号名失败: %v", err)
 	}
+	time.Sleep(10 * time.Second)
 
-	// 等待搜索结果并点击第一项: 在唯一搜索结果容器内取第一个建议项(DOM顺序即列表顺序),
-	// 不使用页面文字, 也不依赖会被账号ID动态拼接的 data-testid 精确值。
-	found := false
+	// 等待搜索结果并检测第一项是否可选:
+	// 可选(aria-disabled != "true") -> 点击第一项进入会话;
+	// 不可选(aria-disabled == "true", 对方未开启私信) -> 返回账号私信功能不可用, 终止后续流程。
+	searchState := ""
 	resultDeadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(resultDeadline) && !found {
+	for time.Now().Before(resultDeadline) && searchState == "" {
 		evalCtx, cancelEval := context.WithTimeout(ctx, 5*time.Second)
 		err := chromedp.Run(evalCtx, chromedp.Evaluate(`(function(){
 			var list = document.querySelector('`+selSuggestList+`');
-			if (!list) return false;
+			if (!list) return '';
 			var item = list.querySelector('[data-testid^="new-dm-user-suggestion-"]');
-			if (!item) return false;
+			if (!item) return '';
+			if (item.getAttribute('aria-disabled') === 'true') return 'unavailable';
 			item.click();
-			return true;
-		})()`, &found))
+			return 'ok';
+		})()`, &searchState))
 		cancelEval()
-		if err == nil && found {
+		if err == nil && searchState != "" {
 			break
 		}
 		select {
@@ -372,8 +382,12 @@ func (m *twitterMessenger) OpenConversationFromProfile(ctx context.Context, task
 			return ctx.Err()
 		}
 	}
-	if !found {
+	switch searchState {
+	case "":
 		return fmt.Errorf("30秒内未搜索到账号 %s 的结果", accountName)
+	case "unavailable":
+		m.logger.Print("TW_MSG3", "账号私信功能不可用(对方未开启私信)")
+		return errors.New("账号私信功能不可用")
 	}
 	m.logger.Print("TW_MSG3", "已点击搜索结果第一项, 进入会话")
 
@@ -413,8 +427,9 @@ func (m *twitterMessenger) SendInConversation(ctx context.Context, content strin
 	return m.verifySent(ctx, content)
 }
 
-// verifySent 轮询聊天记录容器, 确认发送的内容已显示在页面消息列表中
-// (按发送内容本身匹配, 内容为接口传入数据而非界面文案, 不受界面语言影响)
+// verifySent 轮询聊天记录容器, 确认发送的内容已显示在页面消息列表中。
+// 判定标准: 文本匹配到发送内容, 且该消息元素的祖先节点带有 data-send-status="sent"
+// (真正的"已发送"标记, 避免把对方发来的同名消息误判成自己发成功)。
 func (m *twitterMessenger) verifySent(ctx context.Context, content string) error {
 	needle := strings.TrimSpace(content)
 	scrollerJS := `document.querySelector('` + selMessageScroller + `') || document.querySelector('` +
@@ -426,11 +441,17 @@ func (m *twitterMessenger) verifySent(ctx context.Context, content string) error
 		err := chromedp.Run(evalCtx, chromedp.Evaluate(fmt.Sprintf(`(function(needle){
 			var scroller = %s;
 			if (!scroller) return false;
-			return (scroller.innerText || '').indexOf(needle) !== -1;
+			var texts = scroller.querySelectorAll('[data-testid^="message-text-"]');
+			for (var i = 0; i < texts.length; i++) {
+				if ((texts[i].innerText || '').indexOf(needle) === -1) continue;
+				var wrapper = texts[i].closest('[data-testid^="message-"]:not([data-testid^="message-text-"])');
+				if (wrapper && (wrapper.className || '').indexOf('justify-end') !== -1) return true;
+			}
+			return false;
 		})(%q)`, scrollerJS, needle), &ok))
 		cancel()
 		if err == nil && ok {
-			m.logger.Print("TW_MSG5", "消息已出现在聊天记录中, 发送成功")
+			m.logger.Print("TW_MSG5", "消息已发送成功(data-send-status=sent)")
 			return nil
 		}
 		select {
@@ -439,7 +460,7 @@ func (m *twitterMessenger) verifySent(ctx context.Context, content string) error
 			return fmt.Errorf("验证发送结果时上下文超时: %v", ctx.Err())
 		}
 	}
-	return errors.New("20秒内未在聊天记录中发现发送的内容, 判定发送失败")
+	return errors.New("20秒内未在聊天记录中发现已发送的消息, 判定发送失败")
 }
 
 // FetchConversationList 解析收件箱会话列表(先处理可能出现的 Passcode 拦截)。
@@ -553,8 +574,9 @@ func (m *twitterMessenger) OpenConversation(ctx context.Context, conv message.Co
 	return nil
 }
 
-// FetchConversationMessages 解析当前会话的最新消息(时间正序)
-// TODO(校准): direction 依据消息项内是否含自己头像判断, 需在有消息的会话中实测校准
+// FetchConversationMessages 解析当前会话的消息(时间正序)。
+// 方向判断: 消息容器 class 含 justify-end 为自己发出(outgoing), justify-start 为对方发来(incoming)。
+// 该特征已通过真实 dump 验证, 且与 data-send-status 无关(两侧均为 sent)。
 func (m *twitterMessenger) FetchConversationMessages(ctx context.Context) ([]message.Message, error) {
 	msgSels, _ := json.Marshal(twMessageItemSelectors)
 	containerSel := strings.Join(twMessageContainerSelectors, ", ")
@@ -570,10 +592,24 @@ func (m *twitterMessenger) FetchConversationMessages(ctx context.Context) ([]mes
 		}
 		if (!items.length) return "[]";
 		var out = items.map(function(it){
-			var outgoing = !it.querySelector('img');
-			var content = (it.innerText || '').split('\n').map(function(x){ return x.trim(); }).filter(Boolean).join(' ');
+			var cls = (typeof it.className === 'string') ? it.className : '';
+			var outgoing = cls.indexOf('justify-end') !== -1;
+			var textEl = it.querySelector('[data-testid^="message-text-"]');
+			// 真正承载消息文本的是 span[dir="auto"], 时间戳在相邻的 aria-hidden span 与绝对定位 div 中,
+			// 直接用 textEl.innerText 会混入时间(如 "what a aaaa\n5:11 AM\n5:11 AM")。
+			var content = '';
+			if (textEl) {
+				var autoSpan = textEl.querySelector('span[dir="auto"]');
+				if (autoSpan) {
+					content = (autoSpan.innerText || '').trim();
+				} else {
+					content = (textEl.innerText || '').trim();
+				}
+			} else {
+				content = (it.innerText || '').trim();
+			}
 			var sentAt = '';
-			var timeMatch = (it.getAttribute('aria-label') || '').match(/\d{1,2}:\d{2}/);
+			var timeMatch = (it.innerText || '').match(/\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?/);
 			if (timeMatch) sentAt = timeMatch[0];
 			return {
 				direction: outgoing ? 'outgoing' : 'incoming',

@@ -68,9 +68,6 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(ctx, req.WebsocketURL, chromedp.NoModifyURL)
 	defer cancelAlloc()
 
-	// 清理多余标签页
-	chromedputil.CleanExtraTabs(allocCtx, logger, "FB1")
-
 	// WithLogf 和 WithErrorf 是 ContextOption，应该传给 NewContext
 	tabCtx, cancelTab := chromedp.NewContext(allocCtx,
 		chromedp.WithLogf(func(format string, v ...interface{}) {
@@ -81,7 +78,11 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		}),
 	)
 	defer cancelTab()
-	defer chromedputil.CloseTabsAndStopProfile(ctx, allocCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "FB7")
+
+	// 清理多余标签页
+	chromedputil.CleanExtraTabs(tabCtx, logger, "FB1")
+
+	defer chromedputil.CloseTabsAndStopProfile(ctx, tabCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "FB7")
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 4*time.Minute)
 	defer cancelTimeout()

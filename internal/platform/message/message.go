@@ -23,6 +23,7 @@ type Message struct {
 	Direction  string `json:"direction"`         // outgoing=自己发出 / incoming=对方发来
 	Content    string `json:"content"`           // 消息文本
 	SentAt     string `json:"sent_at,omitempty"` // 页面展示时间原文(平台格式各异,不做转换)
+	ObservedAt string `json:"observed_at,omitempty"` // 本次查询观察到该消息的服务端时间(RFC3339, 仅check_reply填充)
 }
 
 // Conversation 会话(对方+最新消息)
@@ -71,6 +72,25 @@ type FetchConversationsResult struct {
 	Status        string         `json:"status"` // completed / failed / not_logged_in / error
 	Conversations []Conversation `json:"conversations"`
 	ErrorInfo     string         `json:"error_info,omitempty"`
+}
+
+// CheckReplyOptions 判断对方是否回复的选项
+type CheckReplyOptions struct {
+	TargetURL          string // 对方账号主页链接(主页型平台: TikTok/Instagram/Facebook)
+	AccountName        string // 对方账号名(搜索型平台: X/Twitter, 如 @ashly35856)
+	Passcode           string // 平台密码验证(如 X 私信 Passcode)
+	SinceIncomingCount int    // [已废弃] 保留字段, 当前逻辑改为按"最后一条消息方向"判断, 不再使用该基线
+}
+
+// CheckReplyResult 判断回复结果
+type CheckReplyResult struct {
+	Status      string    `json:"status"`      // completed / failed / not_logged_in / error
+	ReplyStatus string    `json:"reply_status"` // replied=对方已回复(最新一条是对方发的) / awaiting_reply=等待对方回复(最新一条是自己发的)
+	HasReply    bool      `json:"has_reply"`   // 对方是否已回复(等价于 reply_status == replied)
+	ReplyCount  int       `json:"reply_count"` // 本次返回的对方新回复条数
+	Replies     []Message `json:"replies"`     // 对方发来的新回复(时间正序)
+	CheckedAt   string    `json:"checked_at,omitempty"` // 本次查询的服务端时间(RFC3339)
+	ErrorInfo   string    `json:"error_info,omitempty"`
 }
 
 const (
@@ -189,6 +209,103 @@ func RunSend(ctx context.Context, logger *logx.Logger, m MessengerActions, tasks
 		}
 	}
 	logger.Print(tag+"6", fmt.Sprintf("批量私信流程结束: 成功 %d/%d, 状态: %s", sentCount, len(tasks), result.Status))
+	return result
+}
+
+// RunCheckReply 判断对方是否回复的统一流程:
+// 打开私信主页 -> 登录检测 -> 搜索账号进入会话 -> 解析消息 -> 过滤对方发来的消息 -> 按增量基线返回新回复。
+// 与 RunSend 复用相同的打开会话前置步骤, 差异在于最后一步只读取消息而非发送。
+func RunCheckReply(ctx context.Context, logger *logx.Logger, m MessengerActions, opts CheckReplyOptions) CheckReplyResult {
+	tag := m.Tag()
+	checkedAt := time.Now().Format(time.RFC3339)
+	result := CheckReplyResult{Status: "completed", Replies: []Message{}, CheckedAt: checkedAt}
+
+	task := SendTask{
+		TargetURL:   opts.TargetURL,
+		AccountName: opts.AccountName,
+		Passcode:    opts.Passcode,
+	}
+	target := opts.TargetURL
+	if target == "" {
+		target = opts.AccountName
+	}
+	logger.Print(tag+"R1", "开始判断回复流程: "+target)
+
+	if err := m.OpenTargetProfile(ctx, task); err != nil {
+		result.Status = "failed"
+		result.ErrorInfo = fmt.Sprintf("%sR2 打开私信主页失败: %v", tag, err)
+		return result
+	}
+
+	loginStatus, err := m.CheckLogin(ctx)
+	if err != nil {
+		logger.Print(tag+"R2", "登录检测异常: "+err.Error())
+	}
+	if loginStatus != StatusLoggedIn {
+		result.Status = StatusNotLoggedIn
+		if loginStatus == StatusAbnormal {
+			result.ErrorInfo = fmt.Sprintf("%sR2 账号状态异常", tag)
+		} else {
+			result.ErrorInfo = fmt.Sprintf("%sR2 账号未登录", tag)
+		}
+		return result
+	}
+
+	if err := m.OpenConversationFromProfile(ctx, task); err != nil {
+		result.Status = "failed"
+		result.ErrorInfo = fmt.Sprintf("%sR3 进入会话失败: %v", tag, err)
+		return result
+	}
+
+	msgs, err := m.FetchConversationMessages(ctx)
+	if err != nil {
+		result.Status = "failed"
+		result.ErrorInfo = fmt.Sprintf("%sR4 解析会话消息失败: %v", tag, err)
+		return result
+	}
+
+	// 核心判断: 最后一条消息是谁发的。
+	// 若最后一条是自己发出(outgoing) => 对方还没回复我的最新消息;
+	// 若最后一条是对方发出(incoming) => 对方已回复。
+	lastOutgoing := false
+	lastOutgoingIdx := -1
+	for i, msg := range msgs {
+		if msg.Direction == "outgoing" {
+			lastOutgoing = true
+			lastOutgoingIdx = i
+		} else if msg.Direction == "incoming" {
+			lastOutgoing = false
+		}
+	}
+
+	if lastOutgoing || len(msgs) == 0 {
+		// 等待对方回复(或会话尚无消息)
+		result.ReplyStatus = "awaiting_reply"
+		result.HasReply = false
+		result.ReplyCount = 0
+		result.Replies = []Message{}
+		logger.Print(tag+"R5", "判断回复完成: 对方尚未回复(最后一条为自己发出)")
+		return result
+	}
+
+	// 对方已回复: 返回"最后一次自己发言之后"对方发来的所有消息(时间正序)。
+	// 这样天然只对应最新一轮对话, 不依赖调用方维护增量基线, 也不会返回前期旧回复。
+	replies := make([]Message, 0)
+	for i := lastOutgoingIdx + 1; i < len(msgs); i++ {
+		if msgs[i].Direction == "incoming" {
+			msgs[i].ObservedAt = checkedAt
+			replies = append(replies, msgs[i])
+		}
+	}
+	if replies == nil {
+		replies = []Message{}
+	}
+
+	result.ReplyStatus = "replied"
+	result.HasReply = len(replies) > 0
+	result.ReplyCount = len(replies)
+	result.Replies = replies
+	logger.Print(tag+"R5", fmt.Sprintf("判断回复完成: 对方已回复, 返回 %d 条新回复", result.ReplyCount))
 	return result
 }
 

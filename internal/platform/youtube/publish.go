@@ -73,7 +73,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	// 清理多余标签页
 	chromedputil.CleanExtraTabs(tabCtx, logger, "YTB1")
 
-	defer chromedputil.CloseTabsAndStopProfile(ctx, allocCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "YTB12")
+	defer chromedputil.CloseTabsAndStopProfile(ctx, tabCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "YTB12")
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 6*time.Minute)
 	defer cancelTimeout()
