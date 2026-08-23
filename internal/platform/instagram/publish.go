@@ -169,6 +169,11 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		return fmt.Errorf("IG4 %v", err)
 	}
 
+	logger.Print("IG4", "修改视频格式为 Original(原始比例)")
+	if err := setOriginalVideoFormat(tabCtx, logger); err != nil {
+		return fmt.Errorf("IG4 %v", err)
+	}
+
 	logger.Print("IG4", "等待Next按钮出现（素材已选择）")
 	if err := waitAndClick(tabCtx, logger, `div[role="dialog"]>div[role="button"]`, "Next"); err != nil {
 		return fmt.Errorf("IG4 %v", err)
@@ -567,6 +572,105 @@ func waitAndUploadFile(ctx context.Context, logger *logx.Logger, absVideoPath st
 	}
 	logger.Print("IG4", "开始选择视频文件: "+absVideoPath)
 	return chromedp.Run(ctx, chromedp.SetUploadFiles(found, []string{absVideoPath}, chromedp.BySearch))
+}
+
+// setOriginalVideoFormat 修改视频格式(crop/画面比例)为 Original(原始比例)。
+// 步骤: 点击视频框左下角"放大"按钮(Select crop) -> 等待比例选项出现 -> 点击 Original。
+func setOriginalVideoFormat(ctx context.Context, logger *logx.Logger) error {
+	logger.Print("IG4", "点击视频框左下角放大按钮(Select crop)")
+	if err := clickExpandCropButton(ctx, logger); err != nil {
+		return err
+	}
+
+	logger.Print("IG4", "等待 Original 选项出现并点击")
+	if err := clickOriginalOption(ctx, logger); err != nil {
+		return err
+	}
+
+	time.Sleep(2 * time.Second)
+	logger.Print("IG4", "已选择 Original 格式")
+	return nil
+}
+
+// clickExpandCropButton 点击视频框左下角的"放大"按钮(svg[aria-label="Select crop"])
+func clickExpandCropButton(ctx context.Context, logger *logx.Logger) error {
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		var ok bool
+		js := `(function(){
+			var svg = document.querySelector('svg[aria-label="Select crop"]');
+			if(!svg) return false;
+			var btn = svg.closest('button') || svg.parentElement;
+			if(btn){ try{ btn.click(); return true; }catch(e){ return false; } }
+			try{ svg.click(); return true; }catch(e){ return false; }
+		})()`
+		evalCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_ = chromedp.Run(evalCtx, chromedp.Evaluate(js, &ok))
+		cancel()
+		if ok {
+			logger.Print("IG4", "已点击放大按钮")
+			time.Sleep(2 * time.Second)
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return errors.New("未找到视频框左下角的放大按钮(Select crop)")
+}
+
+// clickOriginalOption 点击视频格式选项中的 Original
+func clickOriginalOption(ctx context.Context, logger *logx.Logger) error {
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		var ok bool
+		js := `(function(){
+			function isVisible(el){
+				if(!el) return false;
+				var r = el.getBoundingClientRect();
+				if(r.width === 0 && r.height === 0) return false;
+				var st = window.getComputedStyle(el);
+				return st.display !== 'none' && st.visibility !== 'hidden';
+			}
+			function tryClick(el){
+				if(!el) return false;
+				try{ el.click(); return true; }catch(e){ return false; }
+			}
+			// 1) 确认结构: Original 是 div[role=button] 内的 span[dir="auto"], 文本恰为 Original
+			var spans = document.querySelectorAll('span[dir="auto"]');
+			for(var i=0;i<spans.length;i++){
+				if((spans[i].textContent||'').trim() !== 'Original') continue;
+				var btn = spans[i].closest('[role="button"]') || spans[i].closest('button');
+				if(btn && isVisible(btn)){ return tryClick(btn); }
+				if(isVisible(spans[i])){ return tryClick(spans[i]); }
+			}
+			// 2) 兜底: 文本恰为 Original 的最内层可见元素, 点击其最近可点击容器
+			var all = document.querySelectorAll('button, [role="button"], div, span');
+			for(var j=0;j<all.length;j++){
+				var el = all[j];
+				var txt = (el.textContent||'').trim();
+				if(txt !== 'Original') continue;
+				var hasTextChild = false;
+				for(var k=0;k<el.children.length;k++){
+					if((el.children[k].textContent||'').trim() === 'Original'){ hasTextChild = true; break; }
+				}
+				if(hasTextChild) continue;
+				if(isVisible(el)){
+					var c = el.closest('[role="button"]') || el.closest('button') || el;
+					return tryClick(c);
+				}
+			}
+			return false;
+		})()`
+		evalCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_ = chromedp.Run(evalCtx, chromedp.Evaluate(js, &ok))
+		cancel()
+		if ok {
+			logger.Print("IG4", "已点击 Original 选项")
+			time.Sleep(2 * time.Second)
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return errors.New("未找到 Original 视频格式选项")
 }
 
 func fillCaption(ctx context.Context, logger *logx.Logger, text string) error {

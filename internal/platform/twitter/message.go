@@ -12,6 +12,7 @@ import (
 	"minimax_pro/internal/platform/message"
 
 	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/chromedp"
 )
 
@@ -401,14 +402,18 @@ func (m *twitterMessenger) OpenConversationFromProfile(ctx context.Context, task
 	return nil
 }
 
-// SendInConversation 点击消息输入框填入内容, 回车发送, 并验证消息出现在聊天记录中
+// SendInConversation 点击消息输入框填入内容, 回车发送, 并验证消息出现在聊天记录中。
+// 填入内容使用 Input.insertText(模拟IME插入文本), 而非 SendKeys(逐字符模拟按键),
+// 否则文案中的 \n 会被 SendKeys 强制转成回车(Enter)触发多次发送, 导致消息被拆段/内容丢失。
 func (m *twitterMessenger) SendInConversation(ctx context.Context, content string) error {
 	m.logger.Print("TW_MSG4", "填写消息内容")
 	typeCtx, cancelType := context.WithTimeout(ctx, 15*time.Second)
 	defer cancelType()
 	if err := chromedp.Run(typeCtx,
 		chromedp.Click(selComposer, chromedp.ByQuery),
-		chromedp.SendKeys(selComposer, content, chromedp.ByQuery),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			return input.InsertText(content).Do(ctx)
+		}),
 	); err != nil {
 		return fmt.Errorf("填写消息内容失败: %v", err)
 	}
@@ -427,40 +432,100 @@ func (m *twitterMessenger) SendInConversation(ctx context.Context, content strin
 	return m.verifySent(ctx, content)
 }
 
-// verifySent 轮询聊天记录容器, 确认发送的内容已显示在页面消息列表中。
-// 判定标准: 文本匹配到发送内容, 且该消息元素的祖先节点带有 data-send-status="sent"
-// (真正的"已发送"标记, 避免把对方发来的同名消息误判成自己发成功)。
+// lastMsg 会话最后一条消息的方向与文本
+type lastMsg struct {
+	direction string // "outgoing" / "incoming" / ""(无消息)
+	content   string
+}
+
+// verifySent 轮询聊天记录容器, 强校验"最后一条消息就是我方刚发出的消息":
+//  1. 取当前会话最后一条消息;
+//  2. 其方向必须是我方发出(outgoing, class 含 justify-end);
+//  3. 其文本前 5 个字符必须与本次发送内容的前 5 个字符一致。
+//
+// 三者同时满足才算真正发送成功, 否则持续轮询; 超时后返回带具体原因的失败错误。
+// 相比旧的"任意 outgoing 消息包含内容即成功", 本实现避免了"返回成功但实际没有发出"的误判。
 func (m *twitterMessenger) verifySent(ctx context.Context, content string) error {
-	needle := strings.TrimSpace(content)
-	scrollerJS := `document.querySelector('` + selMessageScroller + `') || document.querySelector('` +
-		`div[data-testid="dm-message-list-container"]` + `')`
+	needle := firstNChars(strings.TrimSpace(content), 5)
+	scrollerJS := `document.querySelector('` + selMessageScroller + `') || document.querySelector(` +
+		`'div[data-testid="dm-message-list-container"]'` + `')`
 	deadline := time.Now().Add(20 * time.Second)
+
 	for time.Now().Before(deadline) {
-		var ok bool
-		evalCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := chromedp.Run(evalCtx, chromedp.Evaluate(fmt.Sprintf(`(function(needle){
-			var scroller = %s;
-			if (!scroller) return false;
-			var texts = scroller.querySelectorAll('[data-testid^="message-text-"]');
-			for (var i = 0; i < texts.length; i++) {
-				if ((texts[i].innerText || '').indexOf(needle) === -1) continue;
-				var wrapper = texts[i].closest('[data-testid^="message-"]:not([data-testid^="message-text-"])');
-				if (wrapper && (wrapper.className || '').indexOf('justify-end') !== -1) return true;
-			}
-			return false;
-		})(%q)`, scrollerJS, needle), &ok))
-		cancel()
-		if err == nil && ok {
-			m.logger.Print("TW_MSG5", "消息已发送成功(data-send-status=sent)")
+		last, err := m.lastMessage(ctx, scrollerJS)
+		if err == nil && last.direction == "outgoing" && firstNChars(strings.TrimSpace(last.content), 5) == needle {
+			m.logger.Print("TW_MSG5", "消息已发送成功(最后一条消息为我方发出且前5字符匹配)")
 			return nil
 		}
+
 		select {
 		case <-time.After(2 * time.Second):
 		case <-ctx.Done():
 			return fmt.Errorf("验证发送结果时上下文超时: %v", ctx.Err())
 		}
 	}
-	return errors.New("20秒内未在聊天记录中发现已发送的消息, 判定发送失败")
+
+	// 超时: 返回带具体原因的错误, 便于调用方区分处理
+	last, err := m.lastMessage(ctx, scrollerJS)
+	if err != nil {
+		return fmt.Errorf("20秒内未确认消息发送成功(读取最后一条消息失败: %v)", err)
+	}
+	if last.direction == "" {
+		return errors.New("20秒内未确认消息发送成功: 聊天记录中没有任何消息")
+	}
+	if last.direction != "outgoing" {
+		return fmt.Errorf("20秒内未确认消息发送成功: 会话最后一条消息仍是对方消息(direction=%s), 我方消息未出现在聊天记录中", last.direction)
+	}
+	return fmt.Errorf("20秒内未确认消息发送成功: 最后一条是我方消息但内容不匹配(期望前5字符=%q, 实际=%q)",
+		needle, firstNChars(strings.TrimSpace(last.content), 5))
+}
+
+// lastMessage 读取当前会话最后一条消息的方向与文本(与 FetchConversationMessages 取文本逻辑一致: 优先 span[dir="auto"])
+func (m *twitterMessenger) lastMessage(ctx context.Context, scrollerJS string) (lastMsg, error) {
+	var raw string
+	evalCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	js := fmt.Sprintf(`(function(){
+		var scroller = %s;
+		if (!scroller) return '';
+		var items = scroller.querySelectorAll('[data-testid^="message-"]:not([data-testid^="message-text-"])');
+		if (!items || !items.length) return '';
+		var it = items[items.length - 1];
+		var cls = (typeof it.className === 'string') ? it.className : '';
+		var outgoing = cls.indexOf('justify-end') !== -1;
+		var textEl = it.querySelector('[data-testid^="message-text-"]');
+		var content = '';
+		if (textEl) {
+			var autoSpan = textEl.querySelector('span[dir="auto"]');
+			content = autoSpan ? (autoSpan.innerText || '').trim() : (textEl.innerText || '').trim();
+		} else {
+			content = (it.innerText || '').trim();
+		}
+		return JSON.stringify({d: outgoing ? 'outgoing' : 'incoming', c: content});
+	})()`, scrollerJS)
+	if err := chromedp.Run(evalCtx, chromedp.Evaluate(js, &raw)); err != nil {
+		return lastMsg{}, err
+	}
+	if raw == "" {
+		return lastMsg{}, nil
+	}
+	var obj struct {
+		D string `json:"d"`
+		C string `json:"c"`
+	}
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		return lastMsg{}, fmt.Errorf("解析最后一条消息JSON失败: %v", err)
+	}
+	return lastMsg{direction: obj.D, content: obj.C}, nil
+}
+
+// firstNChars 取字符串前 n 个字符(按 Unicode 码点计算, 兼容中文/emoji)
+func firstNChars(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return string(r)
+	}
+	return string(r[:n])
 }
 
 // FetchConversationList 解析收件箱会话列表(先处理可能出现的 Passcode 拦截)。
