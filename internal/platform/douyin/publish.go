@@ -140,12 +140,13 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		return fmt.Errorf("DY3 %v", err)
 	}
 
-	// 关闭上传后的提示弹窗
+	// 关闭上传后的提示弹窗（缩短超时，快速退出）
 	_ = dismissPopups(tabCtx, logger)
 
-	// 等待视频处理上传
-	logger.Print("DY4", "等待视频上传处理")
-	time.Sleep(30 * time.Second)
+	// 智能等待视频上传完成（进度条消失 + 封面出现）
+	if err := waitForUploadComplete(tabCtx, logger); err != nil {
+		return fmt.Errorf("DY4 %v", err)
+	}
 
 	// 填写视频描述/文案
 	if req.Text != "" {
@@ -155,8 +156,8 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	}
 	logger.Print("DY6", "已填写标题，等待点击发布")
 
-	// 等待视频处理完成后再点击发布
-	time.Sleep(30 * time.Second)
+	// 短暂等待确保视频处理完成后再点击发布（封面已出现时无需长等待）
+	time.Sleep(5 * time.Second)
 
 	if err := clickPublish(tabCtx, logger); err != nil {
 		return fmt.Errorf("DY6 %v", err)
@@ -299,6 +300,62 @@ func waitAndUploadFile(ctx context.Context, logger *logx.Logger, absVideoPath st
 	return nil
 }
 
+// waitForUploadComplete 智能等待视频上传完成。
+// 检测条件：进度条消失 + 封面图出现，或页面上出现“发布”相关元素。
+// 最长等待 5 分钟，最短可 5 秒内完成。
+func waitForUploadComplete(ctx context.Context, logger *logx.Logger) error {
+	logger.Print("DY4", "智能等待视频上传完成...")
+	deadline := time.Now().Add(5 * time.Minute)
+
+	for time.Now().Before(deadline) {
+		// 检查是否还在上传中（仅依赖上传进度文本，避免误判视频播放器进度条）
+		var uploading bool
+		checkCtx, cancelCheck := context.WithTimeout(ctx, 3*time.Second)
+		_ = chromedp.Run(checkCtx, chromedp.Evaluate(`(function(){
+			var body = document.body ? (document.body.innerText || "") : "";
+			// 检测上传进度相关文本（注意：不要用 class*="progress"，会误中视频播放器进度条）
+			if(body.indexOf("上传过程中请不要删除") >= 0) return true;
+			if(body.indexOf("正在上传") >= 0) return true;
+			if(body.indexOf("上传中") >= 0) return true;
+			// 检测上传百分比文本（如 "88%" 紧跟在上传提示后）
+			var m = body.match(/\u4e0a\u4f20[^\n]*?(\d{1,3})%/);
+			if(m) return true;
+			return false;
+		})()`, &uploading))
+		cancelCheck()
+
+		if !uploading {
+			// 进一步确认：检查是否出现封面选择区或重新上传按钮（表示上传完成）
+			var hasPreview bool
+			previewCtx, cancelPreview := context.WithTimeout(ctx, 3*time.Second)
+			_ = chromedp.Run(previewCtx, chromedp.Evaluate(`(function(){
+				var body = document.body ? (document.body.innerText || "") : "";
+				// 上传完成后才会出现的页面元素文本（实测抖音创作者中心）
+				if(body.indexOf("设置封面") >= 0) return true;
+				if(body.indexOf("选择封面") >= 0) return true;
+				if(body.indexOf("重新上传") >= 0) return true;
+				if(body.indexOf("更换封面") >= 0) return true;
+				// 发布按钮已可点击（上传完成且视频处理完毕）
+				var publishBtn = document.querySelector('#popover-tip-container > button:not([disabled]), button[class*="publish"]:not([disabled])');
+				if(publishBtn) return true;
+				return false;
+			})()`, &hasPreview))
+			cancelPreview()
+
+			if hasPreview {
+				logger.Print("DY4", "视频上传完成，检测到封面选择区/发布按钮已就绪")
+				return nil
+			}
+		}
+
+		time.Sleep(3 * time.Second)
+	}
+
+	// 超时后不报错，继续流程（可能是小视频已上传完成但封面检测未命中）
+	logger.Print("DY4", "等待上传超时(5分钟)，继续执行后续流程")
+	return nil
+}
+
 // dismissPopups 关闭上传过程中的提示弹窗
 func dismissPopups(ctx context.Context, logger *logx.Logger) error {
 	logger.Print("DY9", "尝试关闭提示窗口")
@@ -309,7 +366,7 @@ func dismissPopups(ctx context.Context, logger *logx.Logger) error {
 		`//div[contains(@class,'close')]`,
 		`//div[contains(@class,'mask')]//div[contains(@class,'close')]`,
 	}
-	deadline := time.Now().Add(25 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		clicked := false
 		for _, xp := range candidates {
