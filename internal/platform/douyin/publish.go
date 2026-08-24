@@ -1,0 +1,611 @@
+package douyin
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"minimax_pro/internal/chromedputil"
+	"minimax_pro/internal/logx"
+	"minimax_pro/internal/undetectable"
+
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/chromedp"
+)
+
+type filterLogger struct {
+	logger *logx.Logger
+}
+
+func (l *filterLogger) Printf(format string, v ...interface{}) {
+	msg := ""
+	if len(v) > 0 {
+		msg = fmt.Sprintf(format, v...)
+	} else {
+		msg = format
+	}
+	if strings.Contains(msg, "could not unmarshal event: unknown PrivateNetworkRequestPolicy value") ||
+		strings.Contains(msg, "could not unmarshal event: unknown ClientNavigationReason value") {
+		return
+	}
+}
+
+// PublishRequest 抖音发布请求参数
+type PublishRequest struct {
+	WebsocketURL     string
+	Text             string
+	VideoPath        string // 本地视频文件路径
+	UndetectableHost string
+	UndetectablePort int
+	ProfileID        string
+}
+
+// PublishVideo 连接远程浏览器，打开抖音上传页，上传视频、填写标题，点击发布，
+// 然后等待并关闭浏览器，最终删除本地视频文件
+func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) error {
+	if req.WebsocketURL == "" {
+		return errors.New("DY0 websocket_url is required")
+	}
+	if req.VideoPath == "" {
+		return errors.New("DY0 video_path is required")
+	}
+	absVideoPath, err := filepath.Abs(req.VideoPath)
+	if err != nil {
+		return fmt.Errorf("DY0 %v", err)
+	}
+	if _, err := os.Stat(absVideoPath); err != nil {
+		return fmt.Errorf("DY0 %v", err)
+	}
+
+	logger.Print("DY1", "连接浏览器WebSocket")
+	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(ctx, req.WebsocketURL, chromedp.NoModifyURL)
+	defer cancelAlloc()
+
+	tabCtx, _ := chromedp.NewContext(allocCtx,
+		chromedp.WithLogf(func(format string, v ...interface{}) { (&filterLogger{logger: logger}).Printf(format, v...) }),
+		chromedp.WithErrorf(func(format string, v ...interface{}) { (&filterLogger{logger: logger}).Printf(format, v...) }),
+	)
+
+	// 清理多余标签页
+	chromedputil.CleanExtraTabs(tabCtx, logger, "DY1")
+
+	defer func() {
+		logger.Print("DY7", "关闭标签页")
+		_ = chromedp.Run(tabCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+			closeTabCtx, cancelCloseTab := context.WithTimeout(ctx, 6*time.Second)
+			defer cancelCloseTab()
+			var result interface{}
+			return chromedp.Run(closeTabCtx, chromedp.Evaluate(`window.close()`, &result))
+		}))
+
+		logger.Print("DY7", "关闭所有标签页")
+		closeCtx, cancelClose := context.WithTimeout(tabCtx, 10*time.Second)
+		if err := chromedputil.CloseAllTabsThenBrowser(closeCtx); err != nil {
+			logger.Print("DY7", "关闭标签页失败: "+err.Error())
+		} else {
+			logger.Print("DY7", "已关闭所有标签页")
+		}
+		cancelClose()
+
+		if req.ProfileID != "" && req.UndetectableHost != "" && req.UndetectablePort != 0 {
+			stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
+			defer cancelStop()
+			_ = undetectable.NewClient(req.UndetectableHost, req.UndetectablePort).StopProfileBestEffort(stopCtx, req.ProfileID)
+			logger.Print("DY7", "已请求停止Undetectable Profile")
+		}
+		logger.Print("DY7", "资源清理完成")
+	}()
+
+	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 5*time.Minute)
+	defer cancelTimeout()
+
+	// 打开抖音创作者中心上传页
+	if err := chromedp.Run(tabCtx, chromedp.Navigate("https://creator.douyin.com/creator-micro/content/upload"), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
+		return fmt.Errorf("DY2 %v", err)
+	}
+	logger.Print("DY2", "已打开抖音创作者中心上传页")
+
+	// 检查是否需要登录
+	loginCheckCtx, cancelLoginCheck := context.WithTimeout(tabCtx, 5*time.Second)
+	var loginNodes []*cdp.Node
+	_ = chromedp.Run(loginCheckCtx, chromedp.Nodes(`//*[contains(text(), '登录') or contains(text(), '扫码登录') or contains(text(), '手机号登录') or contains(text(), '请登录')]`, &loginNodes, chromedp.BySearch))
+	cancelLoginCheck()
+	if len(loginNodes) > 0 {
+		// 进一步确认是登录页面而非普通弹窗
+		urlCheckCtx, cancelUrlCheck := context.WithTimeout(tabCtx, 3*time.Second)
+		var href string
+		_ = chromedp.Run(urlCheckCtx, chromedp.Location(&href))
+		cancelUrlCheck()
+		if strings.Contains(href, "login") || strings.Contains(href, "passport") {
+			return errors.New("DY2 douyin not logged in in this profile")
+		}
+	}
+
+	// 前置检查账号异常/功能不可用
+	anomalyCheckCtx, cancelAnomalyCheck := context.WithTimeout(tabCtx, 4*time.Second)
+	var anomalyNodes []*cdp.Node
+	_ = chromedp.Run(anomalyCheckCtx, chromedp.Nodes(`//*[contains(text(), '账号异常') or contains(text(), '功能受限') or contains(text(), '暂时无法') or contains(text(), '违规')]`, &anomalyNodes, chromedp.BySearch))
+	cancelAnomalyCheck()
+	if len(anomalyNodes) > 0 {
+		return errors.New("DY2 douyin account anomaly pre-check: account restricted")
+	}
+
+	// 上传视频文件
+	if err := waitAndUploadFile(tabCtx, logger, absVideoPath); err != nil {
+		return fmt.Errorf("DY3 %v", err)
+	}
+
+	// 关闭上传后的提示弹窗
+	_ = dismissPopups(tabCtx, logger)
+
+	// 等待视频处理上传
+	logger.Print("DY4", "等待视频上传处理")
+	time.Sleep(30 * time.Second)
+
+	// 填写视频描述/文案
+	if req.Text != "" {
+		if err := fillText(tabCtx, logger, req.Text); err != nil {
+			return fmt.Errorf("DY5 %v", err)
+		}
+	}
+	logger.Print("DY6", "已填写标题，等待点击发布")
+
+	// 等待视频处理完成后再点击发布
+	time.Sleep(30 * time.Second)
+
+	if err := clickPublish(tabCtx, logger); err != nil {
+		return fmt.Errorf("DY6 %v", err)
+	}
+
+	// 等待页面跳转确认发布成功
+	redirectOK := false
+	verificationHandled := false
+	for attempt := 1; attempt <= 2; attempt++ {
+		logger.Print("DY6", fmt.Sprintf("已点击发布，等待页面跳转 (第%d次)", attempt))
+		redirectDeadline := time.Now().Add(120 * time.Second)
+		redirectOK = false
+		for time.Now().Before(redirectDeadline) {
+			// 检测是否出现短信验证码弹窗
+			if !verificationHandled {
+				verifyCtx, cancelVerify := context.WithTimeout(tabCtx, 2*time.Second)
+				var verifyNodes []*cdp.Node
+				_ = chromedp.Run(verifyCtx, chromedp.Nodes(`//*[contains(text(), '验证码') or contains(text(), '短信验证') or contains(text(), '手机验证') or contains(text(), '安全验证')]`, &verifyNodes, chromedp.BySearch))
+				cancelVerify()
+				if len(verifyNodes) > 0 {
+					logger.Print("DY6", "⚠️ 检测到短信验证码弹窗，请在浏览器中手动输入验证码并完成验证")
+					logger.Print("DY6", "等待人工处理验证码... (最长等待3分钟)")
+					verificationHandled = true
+					// 等待验证码弹窗消失(用户手动处理)
+					verifyDeadline := time.Now().Add(3 * time.Minute)
+					for time.Now().Before(verifyDeadline) {
+						time.Sleep(3 * time.Second)
+						checkCtx, cancelCheck := context.WithTimeout(tabCtx, 2*time.Second)
+						var stillNodes []*cdp.Node
+						_ = chromedp.Run(checkCtx, chromedp.Nodes(`//*[contains(text(), '验证码') or contains(text(), '短信验证') or contains(text(), '手机验证') or contains(text(), '安全验证')]`, &stillNodes, chromedp.BySearch))
+						cancelCheck()
+						if len(stillNodes) == 0 {
+							logger.Print("DY6", "验证码弹窗已消失，继续等待页面跳转")
+							break
+						}
+					}
+				}
+			}
+
+			var href string
+			locCtx, cancelLoc := context.WithTimeout(tabCtx, 1500*time.Millisecond)
+			_ = chromedp.Run(locCtx, chromedp.Location(&href))
+			cancelLoc()
+			if strings.Contains(href, "content/manage") || strings.Contains(href, "content/publish") {
+				redirectOK = true
+				break
+			}
+			time.Sleep(800 * time.Millisecond)
+		}
+		if redirectOK {
+			break
+		}
+		if attempt < 2 {
+			logger.Print("DY6", "超时未跳转，重试点击发布")
+			if err := clickPublish(tabCtx, logger); err != nil {
+				logger.Print("DY6", "重试点击发布失败: "+err.Error())
+				break
+			}
+		}
+	}
+	if !redirectOK {
+		// 兜底：检查页面是否出现发布成功的提示
+		successCheckCtx, cancelSuccess := context.WithTimeout(tabCtx, 3*time.Second)
+		var successNodes []*cdp.Node
+		_ = chromedp.Run(successCheckCtx, chromedp.Nodes(`//*[contains(text(), '发布成功') or contains(text(), '作品发布成功')]`, &successNodes, chromedp.BySearch))
+		cancelSuccess()
+		if len(successNodes) > 0 {
+			logger.Print("DY6", "检测到发布成功提示，判定发布成功")
+			redirectOK = true
+		}
+	}
+	if !redirectOK {
+		logger.Print("DY6", "重试后仍未跳转，未知原因需要人为检查")
+		time.Sleep(8 * time.Second)
+		return errors.New("DY6 未跳转至抖音内容管理页，未知原因需要人为检查")
+	}
+	logger.Print("DY6", "发布成功")
+	time.Sleep(8 * time.Second)
+	if err := os.Remove(absVideoPath); err != nil {
+		logger.Print("DY8", "删除本地视频失败: "+err.Error())
+	} else {
+		logger.Print("DY8", "已删除本地视频: "+absVideoPath)
+	}
+	return nil
+}
+
+// waitAndUploadFile 等待文件上传控件并选择本地视频
+func waitAndUploadFile(ctx context.Context, logger *logx.Logger, absVideoPath string) error {
+	logger.Print("DY3", "等待视频上传控件")
+	uploadSelectors := []string{
+		`//input[@type='file']`,
+		`//div[contains(@class,'upload')]//input[@type='file']`,
+		`//div[contains(@class,'container')]//input[@type='file']`,
+		`//input[@accept='video/*']`,
+	}
+	var found string
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		// 动态监测页面是否突发账号异常
+		anomalyCtx, cancelAnomaly := context.WithTimeout(ctx, 2*time.Second)
+		var anomalyNodes []*cdp.Node
+		_ = chromedp.Run(anomalyCtx, chromedp.Nodes(`//*[contains(text(), '账号异常') or contains(text(), '功能受限') or contains(text(), '暂时无法') or contains(text(), '违规')]`, &anomalyNodes, chromedp.BySearch))
+		cancelAnomaly()
+		if len(anomalyNodes) > 0 {
+			return errors.New("DY3 douyin account anomaly: account restricted")
+		}
+
+		for _, sel := range uploadSelectors {
+			checkCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+			var nodes []*cdp.Node
+			_ = chromedp.Run(checkCtx, chromedp.Nodes(sel, &nodes, chromedp.BySearch))
+			cancel()
+			if len(nodes) > 0 {
+				found = sel
+				break
+			}
+		}
+		if found != "" {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if found == "" {
+		return errors.New("DY3 video upload control not found within 60 seconds")
+	}
+
+	logger.Print("DY3", "使用选择器: "+found)
+
+	uploadCtx, cancelUpload := context.WithTimeout(ctx, 20*time.Second)
+	defer cancelUpload()
+
+	if err := chromedp.Run(uploadCtx, chromedp.WaitReady(found, chromedp.BySearch)); err != nil {
+		return checkAnomalyContext(ctx, fmt.Errorf("DY3 wait upload input ready failed: %v", err))
+	}
+
+	logger.Print("DY4", "开始选择视频文件: "+absVideoPath)
+	if err := chromedp.Run(uploadCtx, chromedp.SetUploadFiles(found, []string{absVideoPath}, chromedp.BySearch)); err != nil {
+		return checkAnomalyContext(ctx, fmt.Errorf("DY4 set upload files failed: %v", err))
+	}
+	return nil
+}
+
+// dismissPopups 关闭上传过程中的提示弹窗
+func dismissPopups(ctx context.Context, logger *logx.Logger) error {
+	logger.Print("DY9", "尝试关闭提示窗口")
+	candidates := []string{
+		`//div[contains(@class,'modal')]//button[contains(.,'确定') or contains(.,'知道了') or contains(.,'关闭') or contains(.,'取消') or contains(.,'跳过') or contains(.,'我知道了')]`,
+		`//div[contains(@class,'dialog')]//button[contains(.,'确定') or contains(.,'知道了') or contains(.,'关闭') or contains(.,'取消') or contains(.,'跳过') or contains(.,'我知道了')]`,
+		`//button[contains(.,'确定') or contains(.,'知道了') or contains(.,'关闭') or contains(.,'我知道了')]`,
+		`//div[contains(@class,'close')]`,
+		`//div[contains(@class,'mask')]//div[contains(@class,'close')]`,
+	}
+	deadline := time.Now().Add(25 * time.Second)
+	for time.Now().Before(deadline) {
+		clicked := false
+		for _, xp := range candidates {
+			stepCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			var nodes []*cdp.Node
+			_ = chromedp.Run(stepCtx, chromedp.Nodes(xp, &nodes, chromedp.BySearch))
+			cancel()
+			if len(nodes) == 0 {
+				continue
+			}
+			clickCtx, cancelClick := context.WithTimeout(ctx, 6*time.Second)
+			err := chromedp.Run(clickCtx, chromedp.ScrollIntoView(xp, chromedp.BySearch), chromedp.WaitVisible(xp, chromedp.BySearch), chromedp.Click(xp, chromedp.BySearch))
+			cancelClick()
+			if err == nil {
+				logger.Print("DY9", "已关闭提示")
+				clicked = true
+				break
+			}
+		}
+		if !clicked {
+			time.Sleep(600 * time.Millisecond)
+		} else {
+			time.Sleep(800 * time.Millisecond)
+		}
+	}
+	return nil
+}
+
+// fillText 填写视频描述/文案
+func fillText(ctx context.Context, logger *logx.Logger, text string) error {
+	logger.Print("DY5", "========== 开始填写视频文案 ==========")
+	logger.Print("DY5", "待填写文本长度: "+strconv.Itoa(len(text))+" 字符")
+	logger.Print("DY5", "文本预览(前100字符): "+text[:min(len(text), 100)])
+
+	time.Sleep(6 * time.Second)
+	if checkSomethingWentWrong(ctx) {
+		logger.Print("DY5", "【错误】在等待6秒后检测到页面错误")
+		return errors.New("DY5 page error detected after initial sleep")
+	}
+
+	// 抖音的标题/描述输入框选择器
+	titleSelectors := []string{
+		`div[contenteditable='true'][data-placeholder]`,
+		`div[class*='title'] [contenteditable='true']`,
+		`div[class*='desc'] [contenteditable='true']`,
+		`div[class*='caption'] [contenteditable='true']`,
+		`div[class*='editor'] [contenteditable='true']`,
+		`div[contenteditable='true']`,
+		`textarea[placeholder*='标题']`,
+		`textarea[placeholder*='描述']`,
+		`textarea`,
+	}
+
+	var foundSel string
+	var foundBy chromedp.QueryOption
+
+	// 查找可用的标题输入框
+	for _, sel := range titleSelectors {
+		checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		var nodes []*cdp.Node
+		_ = chromedp.Run(checkCtx, chromedp.Nodes(sel, &nodes, chromedp.ByQuery))
+		cancel()
+		if len(nodes) > 0 {
+			foundSel = sel
+			foundBy = chromedp.ByQuery
+			break
+		}
+		// 也尝试 BySearch
+		checkCtx2, cancel2 := context.WithTimeout(ctx, 3*time.Second)
+		_ = chromedp.Run(checkCtx2, chromedp.Nodes(sel, &nodes, chromedp.BySearch))
+		cancel2()
+		if len(nodes) > 0 {
+			foundSel = sel
+			foundBy = chromedp.BySearch
+			break
+		}
+	}
+
+	if foundSel == "" {
+		// 兜底：使用 JS 查找
+		logger.Print("DY5", "未通过选择器找到标题输入框，尝试JS兜底")
+		var jsFound bool
+		js := `(function(){
+			var els = document.querySelectorAll('[contenteditable="true"]');
+			for(var i=0;i<els.length;i++){
+				var el = els[i];
+				if(el.offsetHeight > 0 && el.offsetWidth > 0){
+					return true;
+				}
+			}
+			var ta = document.querySelectorAll('textarea');
+			for(var i=0;i<ta.length;i++){
+				if(ta[i].offsetHeight > 0 && ta[i].offsetWidth > 0){
+					return true;
+				}
+			}
+			return false;
+		})()`
+		jsCtx, cancelJs := context.WithTimeout(ctx, 5*time.Second)
+		_ = chromedp.Run(jsCtx, chromedp.Evaluate(js, &jsFound))
+		cancelJs()
+		if !jsFound {
+			return errors.New("DY5 cannot find douyin title/description input")
+		}
+		foundSel = `div[contenteditable='true']`
+		foundBy = chromedp.ByQuery
+	}
+
+	logger.Print("DY5", "定位标题容器: "+foundSel)
+
+	// Step1: 等待元素可见并点击获取焦点
+	stepCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	err := chromedp.Run(stepCtx,
+		chromedp.WaitVisible(foundSel, foundBy),
+		chromedp.Click(foundSel, foundBy),
+		chromedp.Focus(foundSel, foundBy),
+	)
+	cancel()
+	if err != nil {
+		logger.Print("DY5", "Step1 失败: 未找到标题元素 - "+err.Error())
+		return errors.New("DY5 cannot find douyin caption input")
+	}
+	logger.Print("DY5", "Step1 完成: 已点击并获取焦点")
+
+	time.Sleep(3 * time.Second)
+
+	// Step2: 输入文本
+	logger.Print("DY5", "Step2: 输入文本内容")
+
+	// 先尝试全选清空已有内容，然后输入
+	selectJs := fmt.Sprintf(`(function(sel){
+		var el=document.querySelector(sel);
+		if(!el){return false;}
+		el.focus();
+		try{
+			var selection=window.getSelection();
+			if(selection){
+				selection.removeAllRanges();
+				var range=document.createRange();
+				range.selectNodeContents(el);
+				selection.addRange(range);
+			}
+		}catch(e){}
+		return true;
+	})(%q)`, foundSel)
+
+	var selectOk bool
+	typeCtx, cancelType := context.WithTimeout(ctx, 10*time.Second)
+	err = chromedp.Run(typeCtx,
+		chromedp.Click(foundSel, foundBy),
+		chromedp.Focus(foundSel, foundBy),
+		chromedp.Evaluate(selectJs, &selectOk),
+		chromedp.SendKeys(foundSel, text, foundBy),
+	)
+	cancelType()
+	if err != nil || !selectOk {
+		if err != nil {
+			logger.Print("DY5", "Step2 警告: SendKeys 执行异常 - "+err.Error())
+		} else {
+			logger.Print("DY5", "Step2 警告: JavaScript 全选失败")
+		}
+		// 兜底：使用 JS insertText
+		logger.Print("DY5", "Step2: 尝试使用 JavaScript 插入文本")
+		var inputOk bool
+		inputJs := fmt.Sprintf(`(function(T){
+			var el=document.querySelector(%q);
+			if(!el){return false;}
+			el.focus();
+			try{document.execCommand('selectAll', false, null);}catch(e){}
+			try{document.execCommand('insertText', false, T);}catch(e){}
+			return true;
+		})(%q)`, foundSel, text)
+		jsCtx, cancelJs := context.WithTimeout(ctx, 5*time.Second)
+		if err := chromedp.Run(jsCtx, chromedp.Evaluate(inputJs, &inputOk)); err != nil {
+			cancelJs()
+			logger.Print("DY5", "Step2 失败: JavaScript 插入也失败 - "+err.Error())
+			return errors.New("DY5 cannot input text via SendKeys or JavaScript")
+		}
+		cancelJs()
+		if !inputOk {
+			logger.Print("DY5", "Step2 失败: JavaScript 插入返回 false")
+			return errors.New("DY5 JavaScript input returned false")
+		}
+		logger.Print("DY5", "Step2 完成: 使用 JavaScript 插入文本成功")
+	} else {
+		logger.Print("DY5", "Step2 完成: 使用 JavaScript 全选 + SendKeys 输入成功")
+	}
+
+	// 验证最终文本
+	var finalText string
+	checkCtx, cancelCheck := context.WithTimeout(ctx, 3*time.Second)
+	chromedp.Run(checkCtx, chromedp.Evaluate(fmt.Sprintf(`(function(sel){
+		var el=document.querySelector(sel);
+		return el ? el.textContent : '';
+	})(%q)`, foundSel), &finalText))
+	cancelCheck()
+	logger.Print("DY5", "Step2: 最终文本内容(前100字符): "+finalText[:min(len(finalText), 100)])
+
+	time.Sleep(3 * time.Second)
+
+	if checkSomethingWentWrong(ctx) {
+		logger.Print("DY5", "【错误】在输入后检测到页面错误")
+		return errors.New("DY5 page error detected after input")
+	}
+
+	logger.Print("DY5", "========== 填写视频文案完成 ==========")
+	return nil
+}
+
+// clickPublish 查找并点击"发布"按钮
+func clickPublish(ctx context.Context, logger *logx.Logger) error {
+	logger.Print("DY6", "查找发布按钮")
+	type selEntry struct {
+		s  string
+		by chromedp.QueryOption
+	}
+	sels := []selEntry{
+		{`#popover-tip-container > button:not([disabled])`, chromedp.ByQuery},
+		// {`//button[contains(.,'发布') and not(@disabled)]`, chromedp.BySearch},
+		// {`//div[@role='button'][contains(.,'发布') and not(contains(@class,'disabled'))]`, chromedp.BySearch},
+		// {`//button[contains(@class,'publish') and not(@disabled)]`, chromedp.BySearch},
+		// {`//button[contains(@class,'submit') and not(@disabled)]`, chromedp.BySearch},
+		// {`//span[contains(text(),'发布')]/ancestor::button[1][not(@disabled)]`, chromedp.BySearch},
+		// {`//span[contains(text(),'发布')]/ancestor::div[@role='button'][1]`, chromedp.BySearch},
+		// {`//button[contains(text(),'Post') and not(@disabled)]`, chromedp.BySearch},
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, e := range sels {
+			var nodes []*cdp.Node
+			stepCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+			_ = chromedp.Run(stepCtx, chromedp.Nodes(e.s, &nodes, e.by))
+			cancel()
+			if len(nodes) == 0 {
+				continue
+			}
+			logger.Print("DY6", "找到发布按钮: "+e.s)
+			clickCtx, cancelClick := context.WithTimeout(ctx, 10*time.Second)
+			err := chromedp.Run(clickCtx,
+				chromedp.ScrollIntoView(e.s, e.by),
+				chromedp.WaitVisible(e.s, e.by),
+				chromedp.Click(e.s, e.by),
+			)
+			cancelClick()
+
+			if err == nil {
+				logger.Print("DY6", "已点击发布按钮")
+				return nil
+			}
+
+			// JS 兜底点击
+			var ok bool
+			js := `(function(sel){
+				var el = sel.startsWith("//") ? (document.evaluate(sel, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue) : document.querySelector(sel);
+				if(!el) return false;
+				try{el.scrollIntoView({block:'center',inline:'center'});}catch(e){}
+				try{el.click();return true;}catch(e){return false;}
+			})(` + fmt.Sprintf("%q", e.s) + `)`
+			eCtx, cancelEval := context.WithTimeout(ctx, 3*time.Second)
+			_ = chromedp.Run(eCtx, chromedp.Evaluate(js, &ok))
+			cancelEval()
+
+			if ok {
+				logger.Print("DY6", "通过 JS 兜底点击发布按钮成功")
+				return nil
+			}
+		}
+		time.Sleep(800 * time.Millisecond)
+	}
+	return errors.New("DY6 cannot find publish button on douyin page")
+}
+
+func checkAnomalyContext(ctx context.Context, originalErr error) error {
+	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	var nodes []*cdp.Node
+	_ = chromedp.Run(checkCtx, chromedp.Nodes(`//*[contains(text(), '账号异常') or contains(text(), '功能受限') or contains(text(), '暂时无法') or contains(text(), '违规')]`, &nodes, chromedp.BySearch))
+	if len(nodes) > 0 {
+		return errors.New("DY3 douyin account anomaly: account restricted interrupted the upload process")
+	}
+	return originalErr
+}
+
+func checkSomethingWentWrong(ctx context.Context) bool {
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	var hasError bool
+	checkJs := `(function(){
+		var body = document.body ? (document.body.innerText || "") : "";
+		if(body.indexOf('页面出错') >= 0 || body.indexOf('加载失败') >= 0 || body.indexOf('请刷新') >= 0){
+			return true;
+		}
+		return false;
+	})()`
+
+	_ = chromedp.Run(checkCtx, chromedp.Evaluate(checkJs, &hasError))
+	return hasError
+}

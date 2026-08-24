@@ -25,6 +25,7 @@ import (
 	"minimax_pro/internal/platform/message"
 	"minimax_pro/internal/platform/nurture"
 	"minimax_pro/internal/platform/scraper"
+	"minimax_pro/internal/platform/douyin"
 	"minimax_pro/internal/platform/tiktok"
 	"minimax_pro/internal/platform/twitter"
 	"minimax_pro/internal/platform/youtube"
@@ -411,6 +412,8 @@ func platformRule(platform string) (string, []string, error) {
 		return "https://x.com/home", []string{"already have an account", "create account", "sign in"}, nil
 	case "tiktok":
 		return "https://www.tiktok.com/tiktokstudio/upload", []string{"log in to tiktok", "sign up", "don't have an account", "don’t have an account"}, nil
+	case "douyin":
+		return "https://creator.douyin.com/creator-micro/content/upload", []string{"登录", "扫码登录", "手机号登录", "请登录"}, nil
 	case "facebook":
 		return "https://www.facebook.com/", []string{"confirm your identity", "confirm you're human to use your account", "log in", "sign up"}, nil
 	default:
@@ -2254,6 +2257,116 @@ func main() {
 		cancelStop()
 		_ = os.Remove(absVideoPath)
 		writeJSON(w, http.StatusOK, TikTokPublishResponse{
+			Type:             "success",
+			ProfileID:        res.ProfileID,
+			DebugPort:        res.Info.DebugPort,
+			WebsocketLink:    res.Info.WebsocketLink,
+			Status:           "publish_triggered",
+			UndetectableHost: res.Host,
+			UndetectablePort: res.Port,
+		})
+	})
+
+	mux.HandleFunc("/douyin/publish", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
+			return
+		}
+		type DouyinPublishRequest struct {
+			ProfileName      string `json:"profile_name"`
+			Text             string `json:"text"`
+			Title            string `json:"title"`
+			VideoOssURL      string `json:"video_oss_url"`
+			VideoPath        string `json:"video_path"`
+			Host             string `json:"host"`
+			Port             int    `json:"port"`
+			WaitSeconds      int    `json:"wait_seconds"`
+			UndetectablePath string `json:"undetectable_path"`
+		}
+		type DouyinPublishResponse struct {
+			Type             string `json:"type"`
+			ProfileID        string `json:"profile_id"`
+			DebugPort        string `json:"debug_port"`
+			WebsocketLink    string `json:"websocket_link"`
+			Status           string `json:"status"`
+			UndetectableHost string `json:"undetectable_host"`
+			UndetectablePort int    `json:"undetectable_port"`
+			ErrorInfo        string `json:"error_info,omitempty"`
+		}
+		var req DouyinPublishRequest
+		raw, err := decodeJSONBody(r, &req, 2<<20)
+		if err != nil {
+			logger.Print("E", "JSON解析失败: "+err.Error())
+			logger.Print("E", "Content-Type: "+r.Header.Get("Content-Type"))
+			if raw != "" {
+				logger.Print("E", "Body: "+safeSnippet(raw, 1200))
+			}
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
+			return
+		}
+		logger.Print("DY_REQ", "Content-Type: "+r.Header.Get("Content-Type"))
+		logger.Print("DY_REQ", "Body: "+safeSnippet(raw, 1200))
+		if req.ProfileName == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
+			return
+		}
+		if req.VideoOssURL == "" && req.VideoPath == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url or video_path is required"})
+			return
+		}
+
+		var absVideoPath string
+		if req.VideoOssURL != "" {
+			var err error
+			absVideoPath, err = downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+				return
+			}
+		} else {
+			var err error
+			absVideoPath, err = filepath.Abs(req.VideoPath)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid video_path: " + err.Error()})
+				return
+			}
+			if _, err := os.Stat(absVideoPath); err != nil {
+				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path file not found"})
+				return
+			}
+		}
+
+		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		if err != nil {
+			logger.Print("E", err.Error())
+			_ = os.Remove(absVideoPath)
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			return
+		}
+		logger.Print("DY", "开始抖音发布流程")
+		textToUse := strings.TrimSpace(req.Text)
+		if textToUse == "" && strings.TrimSpace(req.Title) != "" {
+			textToUse = req.Title
+		}
+		if err := douyin.PublishVideo(r.Context(), logger, douyin.PublishRequest{
+			WebsocketURL:     res.Info.WebsocketLink,
+			Text:             textToUse,
+			VideoPath:        absVideoPath,
+			UndetectableHost: res.Host,
+			UndetectablePort: res.Port,
+			ProfileID:        res.ProfileID,
+		}); err != nil {
+			logger.Print("E", err.Error())
+			_ = os.Remove(absVideoPath)
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			return
+		}
+		time.Sleep(8 * time.Second)
+		stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
+		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
+		cancelStop()
+		_ = os.Remove(absVideoPath)
+		writeJSON(w, http.StatusOK, DouyinPublishResponse{
 			Type:             "success",
 			ProfileID:        res.ProfileID,
 			DebugPort:        res.Info.DebugPort,
