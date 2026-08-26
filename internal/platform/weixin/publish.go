@@ -21,6 +21,7 @@ import (
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/dom"
 	"github.com/chromedp/cdproto/emulation"
+	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/cdproto/runtime"
@@ -1069,25 +1070,113 @@ func injectFileCrossFrame(fs frameScope, logger *logx.Logger, absVideoPath strin
 		logger.Print("WX3", "CDP直接注入文件失败: "+err.Error())
 		return false
 	}
-	// 4. 跨框架派发 change/input 事件，让 antd 组件感知文件注入启动上传；返回是否确认 files 已设置
-	hasFiles := ""
-	_ = fs.evaluate(&hasFiles, `(function(){
+	// 4. 注入后同域复查 files 并派发事件：事件对象用 input 所属文档的构造函数创建（避免跨域 Event），返回详细诊断便于排查
+	var diag string
+	_ = fs.evaluate(&diag, `(function(){
 		var els = document.querySelectorAll('input[type="file"]');
 		for (var i = 0; i < els.length; i++) {
-			if (els[i].files && els[i].files.length > 0) {
-				try { els[i].dispatchEvent(new Event('change', {bubbles: true})); } catch(e){}
-				try { els[i].dispatchEvent(new Event('input', {bubbles: true})); } catch(e){}
-				return 'files=' + els[i].files.length;
-			}
+			var inp = els[i];
+			if (!inp.files || inp.files.length === 0) continue;
+			var names = [];
+			try { for (var j = 0; j < inp.files.length; j++) names.push(inp.files[j].name); } catch(eN){}
+			var d1 = false, d2 = false;
+			try { d1 = inp.dispatchEvent(new inp.ownerDocument.defaultView.Event('change', {bubbles: true})); } catch(e){}
+			try { d2 = inp.dispatchEvent(new inp.ownerDocument.defaultView.Event('input', {bubbles: true})); } catch(e2){}
+			return 'files=' + inp.files.length + ' name=' + names.join('|').slice(0, 60) + ' changeDispatch=' + d1 + ' inputDispatch=' + d2;
 		}
+		// 无信号返回空串：跨框架包装器返回第一个非空结果，非空默认值会在主框架短路
 		return '';
 	})()`, 5*time.Second)
-	if hasFiles != "" {
-		logger.Print("WX3", "注入确认("+hasFiles+")，change 事件已派发，等待上传启动")
-		return true
+	logger.Print("WX3", "注入后复查: "+diag)
+	return strings.HasPrefix(diag, "files=")
+}
+
+// resolveSandboxInputInfo 在主框架 JS 中定位同源沙箱 iframe 内的 file input，强制 iframe 与 input 可见，
+// 返回诊断信息（含 input 中心点坐标，供 CDP 可信点击使用）。iframe 被强制铺满视口左上角，
+// 故 iframe 内坐标可直接作为主视口坐标使用。
+func resolveSandboxInputInfo(fs frameScope) string {
+	var info string
+	_ = fs.evaluate(&info, `(function(){
+		var f = document.querySelector('iframe[name="content"]') || document.querySelector('iframe[data-wujie-flag]');
+		if (!f) return 'no-iframe';
+		f.style.setProperty('display', 'block', 'important');
+		f.style.setProperty('visibility', 'visible', 'important');
+		f.style.setProperty('opacity', '1', 'important');
+		f.style.setProperty('position', 'absolute', 'important');
+		f.style.setProperty('left', '0', 'important');
+		f.style.setProperty('top', '0', 'important');
+		f.style.setProperty('width', '100%', 'important');
+		f.style.setProperty('height', '100%', 'important');
+		f.style.setProperty('z-index', '-1', 'important');
+		var cd = f.contentDocument;
+		if (!cd) return 'iframe-no-doc';
+		var inp = cd.querySelector('input[type="file"]');
+		if (!inp) return 'iframe-no-input';
+		// antd 隐藏代理 input 常为 display:none/0尺寸，强制可见可点击（尺寸极小不影响界面）
+		inp.style.setProperty('display', 'block', 'important');
+		inp.style.setProperty('visibility', 'visible', 'important');
+		inp.style.setProperty('opacity', '1', 'important');
+		inp.style.setProperty('position', 'fixed', 'important');
+		inp.style.setProperty('left', '10px', 'important');
+		inp.style.setProperty('top', '10px', 'important');
+		inp.style.setProperty('width', '20px', 'important');
+		inp.style.setProperty('height', '20px', 'important');
+		inp.style.setProperty('z-index', '2147483647', 'important');
+		var r = inp.getBoundingClientRect();
+		return 'ok cx=' + Math.round(r.left + r.width / 2) + ' cy=' + Math.round(r.top + r.height / 2);
+	})()`, 5*time.Second)
+	return info
+}
+
+// trustedClickFileInput 强制沙箱 iframe 与隐藏 file input 可见后，用 CDP Input 派发真实鼠标事件点击 input：
+// 可信点击会触发浏览器原生文件选择框（被拦截器接管填入文件，浏览器随后派发真实 change 事件，
+// antd/rc-upload 必然响应）；合成 JS 点击/合成 change 事件实测均不被组件感知。
+func trustedClickFileInput(fs frameScope, logger *logx.Logger) {
+	info := resolveSandboxInputInfo(fs)
+	logger.Print("WX3", "沙箱input定位: "+info)
+	if !strings.HasPrefix(info, "ok") {
+		return
 	}
-	logger.Print("WX3", "警告: 注入后跨框架复查未确认到 files")
-	return true
+	var cx, cy float64
+	for _, p := range strings.Fields(info) {
+		if strings.HasPrefix(p, "cx=") {
+			cx, _ = strconv.ParseFloat(strings.TrimPrefix(p, "cx="), 64)
+		} else if strings.HasPrefix(p, "cy=") {
+			cy, _ = strconv.ParseFloat(strings.TrimPrefix(p, "cy="), 64)
+		}
+	}
+	if cx <= 0 || cy <= 0 {
+		logger.Print("WX3", "可信点击坐标解析失败: "+info)
+		return
+	}
+	clickCtx, cancel := context.WithTimeout(fs.ctx, 8*time.Second)
+	err := chromedp.Run(clickCtx, chromedp.ActionFunc(func(c context.Context) error {
+		if err := input.DispatchMouseEvent(input.MousePressed, cx, cy).WithButton(input.Left).WithClickCount(1).Do(c); err != nil {
+			return err
+		}
+		return input.DispatchMouseEvent(input.MouseReleased, cx, cy).WithButton(input.Left).WithClickCount(1).Do(c)
+	}))
+	cancel()
+	if err != nil {
+		logger.Print("WX3", "可信点击file input失败: "+err.Error())
+		return
+	}
+	logger.Print("WX3", fmt.Sprintf("已可信点击file input(cx=%.0f cy=%.0f)，等待原生文件选择框弹出", cx, cy))
+}
+
+// uploadStartedCrossFrame 跨框架检测上传是否已启动（页面出现上传进度/完成相关文案）
+func uploadStartedCrossFrame(fs frameScope) bool {
+	var started bool
+	_ = fs.evaluate(&started, `(function(){
+		// 上传中判定：仅依赖明确的上传进度文本（无信号返回空串，避免跨框架包装器在主框架短路）
+		var body = document.body ? (document.body.innerText || '') : '';
+		if (body.indexOf('正在上传') >= 0) return true;
+		if (body.indexOf('重新上传') >= 0) return true;
+		if (body.indexOf('更换封面') >= 0) return true;
+		if (/上传[^\n]*?\d{1,3}%/.test(body)) return true;
+		return false;
+	})()`, 5*time.Second)
+	return started
 }
 
 // queryOpts 返回元素查询选项：iframe 作用域下按 src 重新解析节点并追加 FromNode（仅限 ByQuery）；
@@ -1135,31 +1224,40 @@ func waitAndUploadFile(fs frameScope, iframeFS frameScope, logger *logx.Logger, 
 			}
 			logger.Print("WX3", "已拦截文件选择框，自动填入视频文件")
 			go func(backendNodeID cdp.BackendNodeID) {
-				fileCtx, cancelFile := context.WithTimeout(fs.ctx, 10*time.Second)
+				fileCtx, cancelFile := context.WithTimeout(fs.ctx, 15*time.Second)
 				defer cancelFile()
+				// 新版 Chrome（151）已移除 Page.handleFileChooser：对 FileChooserOpened 事件的 backendNode 调
+				// DOM.setFileInputFiles 即为接受选择框（Puppeteer FileChooser.accept 同机制），接受路径下浏览器会派发真实 change。
 				if err := chromedp.Run(fileCtx, dom.SetFileInputFiles([]string{absVideoPath}).WithBackendNodeID(backendNodeID)); err != nil {
 					logger.Print("WX3", "填入文件失败: "+err.Error())
 					return
 				}
-				logger.Print("WX3", "文件已填入，跨框架派发 change 事件")
-				// CDP 填入文件不会触发 change 事件，子应用组件靠它感知文件注入，必须手动派发（跨框架遍历找到该 input）
-				var dispatched bool
-				_ = fs.evaluate(&dispatched, `(function(){
+				logger.Print("WX3", "已对选择框的input填入文件(接受路径，浏览器将派发真实change)")
+				// 稍候复查：若组件已消费文件（真实change已触发）input 会被重置为空；未消费则手动补发 change。
+				time.Sleep(800 * time.Millisecond)
+				var postState string
+				_ = fs.evaluate(&postState, `(function(){
+					var out = [];
 					var els = document.querySelectorAll('input[type="file"]');
 					for (var i = 0; i < els.length; i++) {
-						if (els[i].files && els[i].files.length > 0) {
-							try { els[i].dispatchEvent(new Event('change', {bubbles: true})); } catch(e){}
-							try { els[i].dispatchEvent(new Event('input', {bubbles: true})); } catch(e){}
-							return true;
+						out.push('input' + i + '.files=' + (els[i].files ? els[i].files.length : -1));
+					}
+					if (els.length > 0) {
+						for (var k = 0; k < els.length; k++) {
+							if (els[k].files && els[k].files.length > 0) {
+								try { els[k].dispatchEvent(new els[k].ownerDocument.defaultView.Event('change', {bubbles: true})); } catch(e){}
+								try { els[k].dispatchEvent(new els[k].ownerDocument.defaultView.Event('input', {bubbles: true})); } catch(e2){}
+								out.push('manualChangeDispatched');
+							}
 						}
 					}
-					return false;
+					var body = document.body ? (document.body.innerText || '') : '';
+					if (body.indexOf('上传') >= 0 || body.indexOf('失败') >= 0 || body.indexOf('不支持') >= 0) {
+						out.push('body=' + JSON.stringify(body.slice(0, 120)));
+					}
+					return out.join(' ');
 				})()`, 5*time.Second)
-				if dispatched {
-					logger.Print("WX3", "change 事件已派发，上传应由页面启动")
-				} else {
-					logger.Print("WX3", "警告: 未找到已填文件的 input，change 未派发")
-				}
+				logger.Print("WX3", "填入后复查: "+postState)
 				select {
 				case chooserDone <- struct{}{}:
 				default:
@@ -1171,7 +1269,8 @@ func waitAndUploadFile(fs frameScope, iframeFS frameScope, logger *logx.Logger, 
 	var found string
 	var foundScope frameScope
 	directInjected := false
-	deadline := time.Now().Add(40 * time.Second) // 诊断期临时 40秒(常规 90秒)，30秒快照仍会触发
+	trustedClicked := false
+	deadline := time.Now().Add(90 * time.Second)
 	triggerTries := 0
 	loopCount := 0
 	diagDumped := false
@@ -1195,26 +1294,41 @@ func waitAndUploadFile(fs frameScope, iframeFS frameScope, logger *logx.Logger, 
 		}
 
 		// 跨框架探测（主文档+同源iframe+shadow roots）：wujie 子应用渲染在沙箱 iframe 内，
-		// 主框架 CDP 选择器查询够不到，必须同源 JS 穿透；命中入口容器时点击触发文件选择框（拦截器填入文件）
+		// 主框架 CDP 选择器查询够不到，必须同源 JS 穿透
 		if cf := findFileInputCrossFrame(fs, logger); cf != "" {
-			logger.Print("WX3", "跨框架探测命中: "+cf+"（已JS点击，等待文件选择框拦截或上传启动）")
-			// 无论命中 input 还是 box，都依赖点击触发的文件选择框被拦截器接管（跨框架唯一可靠的填文件途径）；
-			// 若页面无需选择框直接开始上传，后续 waitForUploadComplete 会检测到进度
-			time.Sleep(2 * time.Second)
+			logger.Print("WX3", "跨框架探测命中: "+cf)
+			// 路线1：强制可见 + CDP 可信点击隐藏 file input → 浏览器弹原生文件选择框（拦截器填入文件后，
+			// 浏览器会派发真实 change 事件，antd 组件必然响应——合成 change 事件实测不被组件感知）
+			if !trustedClicked {
+				trustedClicked = true
+				trustedClickFileInput(fs, logger)
+			}
+			// 阻塞等待拦截器处理完成（handleFileChooser 需要处理窗口，不能用 default 立即放行）
 			select {
 			case <-chooserDone:
 				logger.Print("WX3", "已通过文件选择框拦截完成文件填入")
 				return nil
-			default:
+			case <-time.After(6 * time.Second):
 			}
-			// JS 点击未弹出选择框（iframe 曾 display:none/激活窗口已过）：
-			// 改用 CDP 按 BackendNodeID 直接注入文件到沙箱 iframe 的 input，不依赖可见性/焦点（只试一次，避免重复注入）
+			// 路线2：选择框未弹出时，CDP 按 BackendNodeID 直接注入文件到沙箱 iframe 的 input（不依赖可见性/焦点）
 			if !directInjected {
 				directInjected = true
-				if injectFileCrossFrame(fs, logger, absVideoPath) {
-					// 注入并派发 change 后由 antd 组件启动上传，交给 WX4 等待上传进度确认
+				injectFileCrossFrame(fs, logger, absVideoPath)
+				time.Sleep(5 * time.Second)
+				if uploadStartedCrossFrame(fs) {
+					logger.Print("WX3", "上传已启动（注入路线生效）")
 					return nil
 				}
+				logger.Print("WX3", "注入后5秒未检测到上传启动，尝试可信点击打开文件选择框")
+				trustedClickFileInput(fs, logger)
+				select {
+				case <-chooserDone:
+					logger.Print("WX3", "已通过文件选择框拦截完成文件填入")
+					return nil
+				case <-time.After(6 * time.Second):
+				}
+				logger.Print("WX3", "两条注入路线均未确认上传启动，交给WX4继续等待并复查")
+				return nil
 			}
 		}
 
@@ -1430,27 +1544,30 @@ func waitForUploadComplete(fs frameScope, logger *logx.Logger) error {
 	for time.Now().Before(deadline) {
 		loopCount++
 
-		// 每轮先尝试关闭引导弹窗（如"知道了"按钮）
-		var popupClicked bool
-		_ = fs.evaluate(&popupClicked, `(function(){
-			var btns = document.querySelectorAll('button, div[role="button"]');
-			for(var i=0;i<btns.length;i++){
-				var t = (btns[i].innerText||"").trim();
-				if(btns[i].disabled || btns[i].getAttribute('aria-disabled')==='true') continue;
-				if(t==='知道了' || t==='我知道了' || t==='不再提示'){
-					try{btns[i].click();}catch(e){}
-					return true;
+		// 每 10 轮尝试关闭引导弹窗（如"知道了"按钮）；不 continue，弹窗点击后仍继续检查上传状态，
+		// 避免弹窗持续存在时循环被占满、上传状态永远得不到检查（实测曾因此卡满 5 分钟）
+		if loopCount%10 == 1 {
+			var popupClicked bool
+			_ = fs.evaluate(&popupClicked, `(function(){
+				var btns = document.querySelectorAll('button, div[role="button"]');
+				for(var i=0;i<btns.length;i++){
+					var t = (btns[i].innerText||"").trim();
+					if(btns[i].disabled || btns[i].getAttribute('aria-disabled')==='true') continue;
+					if(t==='知道了' || t==='我知道了' || t==='不再提示'){
+						try{btns[i].click();}catch(e){}
+						return true;
+					}
 				}
+				return false;
+			})()`, 3*time.Second)
+			if popupClicked {
+				logger.Print("WX4", "已尝试关闭引导弹窗")
 			}
-			return false;
-		})()`, 3*time.Second)
-		if popupClicked {
-			logger.Print("WX4", "已关闭引导弹窗")
-			time.Sleep(1 * time.Second)
-			continue
 		}
 
-		// 一次性获取页面状态：是否上传中 + 是否已完成（合并成一次调用，减少 CDP 往返）
+		// 一次性获取页面状态：是否上传中 + 是否已完成（合并成一次调用，减少 CDP 往返）。
+		// 注意：跨框架包装器返回第一个非空结果，无信号时必须返回空串（而非 "waiting"），
+		// 否则主框架的非空返回值会短路、永远轮不到沙箱 iframe（实测曾因此恒为 waiting）
 		var state string
 		_ = fs.evaluate(&state, `(function(){
 			var body = document.body ? (document.body.innerText || "") : "";
@@ -1463,18 +1580,22 @@ func waitForUploadComplete(fs frameScope, logger *logx.Logger) error {
 			if(body.indexOf("重新上传") >= 0) return "done";
 			if(body.indexOf("更换封面") >= 0) return "done";
 			if(body.indexOf("编辑封面") >= 0) return "done";
+			if(body.indexOf("已上传") >= 0) return "done";
 			// 发表按钮已存在且未禁用（上传完成且视频处理完毕）
 			var btns = document.querySelectorAll('button');
 			for(var i=0;i<btns.length;i++){
 				var t = (btns[i].innerText||"").trim();
 				if(t==='发表' && !btns[i].disabled){ return "done"; }
 			}
-			return "waiting";
+			return "";
 		})()`, 3*time.Second)
 
 		if state == "done" {
 			logger.Print("WX4", "视频上传完成，检测到封面编辑区/发表按钮已就绪")
 			return nil
+		}
+		if state == "" {
+			state = "waiting"
 		}
 
 		// 每 5 轮(~15秒)输出一次状态，方便排查卡住原因
@@ -1597,6 +1718,8 @@ func fillText(fs frameScope, logger *logx.Logger, text string) error {
 					return true;
 				}
 			}
+			// 次选：存在不可见的编辑器也算命中（沙箱 iframe 可能被隐藏，但内部布局正常）
+			if (els.length > 0 || ta.length > 0) return true;
 			return false;
 		})()`
 		if err := fs.evaluate(&jsFound, js, 5*time.Second); err == nil && jsFound {
@@ -1607,6 +1730,11 @@ func fillText(fs frameScope, logger *logx.Logger, text string) error {
 	}
 
 	logger.Print("WX5", "定位描述容器: "+foundSel)
+
+	// 跨框架作用域（wujie 沙箱 iframe）：CDP 选择器/WaitVisible 够不到，直接同源 JS 注入文本
+	if fs.iframeSrc != "" {
+		return fillTextViaJS(fs, logger, foundSel, text)
+	}
 
 	// Step1: 等待元素可见并点击获取焦点
 	opts := fs.queryOpts(chromedp.ByQuery)
@@ -1705,6 +1833,62 @@ func fillText(fs frameScope, logger *logx.Logger, text string) error {
 		return errors.New("WX5 page error detected after input")
 	}
 
+	logger.Print("WX5", "========== 填写视频文案完成 ==========")
+	return nil
+}
+
+// fillTextViaJS 纯 JS 填写描述文本（跨框架同源穿透）：逐根查找选择器命中的编辑器，
+// focus + selectAll 后 execCommand('insertText')（能触发框架的 input 事件）；
+// 微信编辑器为富文本编辑器，兜底时直接写 textContent 并派发 InputEvent（普通 Event 不被识别）。
+func fillTextViaJS(fs frameScope, logger *logx.Logger, sel, text string) error {
+	inputJs := fmt.Sprintf(`(function(T){
+		var el = document.querySelector(%q);
+		if (!el) return '';
+		el.focus();
+		try {
+			var doc = el.ownerDocument;
+			var win = doc.defaultView;
+			var selection = win.getSelection();
+			if (selection) {
+				selection.removeAllRanges();
+				var range = doc.createRange();
+				range.selectNodeContents(el);
+				selection.addRange(range);
+			}
+		} catch(eS){}
+		var ok = false;
+		try { ok = document.execCommand('insertText', false, T); } catch(e){}
+		var hasText = (el.textContent || '').indexOf(T.slice(0, 10)) >= 0;
+		if (!hasText) {
+			// 兜底：直接写入 + 派发 InputEvent（富文本编辑器需 inputType 识别）
+			try { el.textContent = T; } catch(e2){}
+			try {
+				var IE = el.ownerDocument.defaultView.InputEvent;
+				el.dispatchEvent(new IE('input', {bubbles: true, inputType: 'insertText', data: T}));
+			} catch(e3){
+				try { el.dispatchEvent(new el.ownerDocument.defaultView.Event('input', {bubbles: true})); } catch(e4){}
+			}
+			hasText = (el.textContent || '').indexOf(T.slice(0, 10)) >= 0;
+		}
+		return (ok || hasText) ? 'ok execCommand=' + ok + ' textLen=' + (el.textContent || '').length : '';
+	})(%q)`, sel, text)
+	var result string
+	if err := fs.evaluate(&result, inputJs, 8*time.Second); err != nil {
+		logger.Print("WX5", "JS填写描述失败: "+err.Error())
+		return errors.New("WX5 cannot input text via JavaScript (cross-frame)")
+	}
+	if !strings.HasPrefix(result, "ok") {
+		logger.Print("WX5", "JS填写返回: "+result)
+		return errors.New("WX5 JavaScript input returned false (cross-frame)")
+	}
+	logger.Print("WX5", "JS填写结果: "+result)
+	// 验证最终文本（跨框架）
+	var finalText string
+	_ = fs.evaluate(&finalText, fmt.Sprintf(`(function(){
+		var el = document.querySelector(%q);
+		return el ? el.textContent : '';
+	})()`, sel), 3*time.Second)
+	logger.Print("WX5", "JS填写完成，最终文本(前100字符): "+finalText[:min(len(finalText), 100)])
 	logger.Print("WX5", "========== 填写视频文案完成 ==========")
 	return nil
 }
