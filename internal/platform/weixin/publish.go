@@ -1688,8 +1688,12 @@ func fillText(fs frameScope, logger *logx.Logger, text string) error {
 
 	var foundSel string
 
-	// 查找可用的描述输入框（CSS 选择器，支持 FromNode 进入 iframe）
+	// 查找可用的描述输入框（CSS 选择器，支持 FromNode 进入 iframe）；
+	// 跨框架作用域下 CDP 选择器够不到沙箱 iframe，跳过逐个试探直接走 JS 检测（省 ~30秒）
 	for _, sel := range titleSelectors {
+		if fs.iframeSrc != "" {
+			break
+		}
 		checkCtx, cancel := context.WithTimeout(fs.ctx, 3*time.Second)
 		var nodes []*cdp.Node
 		_ = chromedp.Run(checkCtx, chromedp.Nodes(sel, &nodes, fs.queryOpts(chromedp.ByQuery)...))
@@ -1703,27 +1707,31 @@ func fillText(fs frameScope, logger *logx.Logger, text string) error {
 	if foundSel == "" {
 		// 兜底：使用 JS 查找（在作用域框架内）
 		logger.Print("WX5", "未通过选择器找到描述输入框，尝试JS兜底")
-		var jsFound bool
+		var jsKind string
 		js := `(function(){
 			var els = document.querySelectorAll('[contenteditable="true"]');
 			for(var i=0;i<els.length;i++){
 				var el = els[i];
 				if(el.offsetHeight > 0 && el.offsetWidth > 0){
-					return true;
+					return 'ce';
 				}
 			}
 			var ta = document.querySelectorAll('textarea');
 			for(var i=0;i<ta.length;i++){
 				if(ta[i].offsetHeight > 0 && ta[i].offsetWidth > 0){
-					return true;
+					return 'ta';
 				}
 			}
 			// 次选：存在不可见的编辑器也算命中（沙箱 iframe 可能被隐藏，但内部布局正常）
-			if (els.length > 0 || ta.length > 0) return true;
-			return false;
+			if (els.length > 0) return 'ce';
+			if (ta.length > 0) return 'ta';
+			return '';
 		})()`
-		if err := fs.evaluate(&jsFound, js, 5*time.Second); err == nil && jsFound {
-			foundSel = `div[contenteditable='true']`
+		if err := fs.evaluate(&jsKind, js, 5*time.Second); err == nil && jsKind == "ce" {
+			// 不限定标签名：编辑器可能不是 div（如自定义元素），用通用属性选择器避免查不到
+			foundSel = `[contenteditable='true']`
+		} else if err == nil && jsKind == "ta" {
+			foundSel = `textarea`
 		} else {
 			return errors.New("WX5 cannot find weixin channels description input")
 		}
@@ -1844,33 +1852,47 @@ func fillTextViaJS(fs frameScope, logger *logx.Logger, sel, text string) error {
 	inputJs := fmt.Sprintf(`(function(T){
 		var el = document.querySelector(%q);
 		if (!el) return '';
-		el.focus();
 		try {
-			var doc = el.ownerDocument;
-			var win = doc.defaultView;
-			var selection = win.getSelection();
-			if (selection) {
-				selection.removeAllRanges();
-				var range = doc.createRange();
-				range.selectNodeContents(el);
-				selection.addRange(range);
+			// textarea 分支：直接写 value + 派发 input（React 受控组件需原生 setter 才能感知）
+			if (el.tagName === 'TEXTAREA') {
+				var proto = el.ownerDocument.defaultView.HTMLTextAreaElement.prototype;
+				var setter = Object.getOwnPropertyDescriptor(proto, 'value');
+				if (setter && setter.set) { setter.set.call(el, T); } else { el.value = T; }
+				el.dispatchEvent(new el.ownerDocument.defaultView.Event('input', {bubbles: true}));
+				el.dispatchEvent(new el.ownerDocument.defaultView.Event('change', {bubbles: true}));
+				return (el.value || '').indexOf(T.slice(0, 10)) >= 0 ? ('ok textarea len=' + el.value.length) : 'ta-insert-failed';
 			}
-		} catch(eS){}
-		var ok = false;
-		try { ok = document.execCommand('insertText', false, T); } catch(e){}
-		var hasText = (el.textContent || '').indexOf(T.slice(0, 10)) >= 0;
-		if (!hasText) {
-			// 兜底：直接写入 + 派发 InputEvent（富文本编辑器需 inputType 识别）
-			try { el.textContent = T; } catch(e2){}
+			el.focus();
 			try {
-				var IE = el.ownerDocument.defaultView.InputEvent;
-				el.dispatchEvent(new IE('input', {bubbles: true, inputType: 'insertText', data: T}));
-			} catch(e3){
-				try { el.dispatchEvent(new el.ownerDocument.defaultView.Event('input', {bubbles: true})); } catch(e4){}
+				var doc = el.ownerDocument;
+				var win = doc.defaultView;
+				var selection = win.getSelection();
+				if (selection) {
+					selection.removeAllRanges();
+					var range = doc.createRange();
+					range.selectNodeContents(el);
+					selection.addRange(range);
+				}
+			} catch(eS){}
+			var ok = false;
+			try { ok = document.execCommand('insertText', false, T); } catch(e){}
+			var hasText = (el.textContent || '').indexOf(T.slice(0, 10)) >= 0;
+			if (!hasText) {
+				// 兜底：直接写入 + 派发 InputEvent（富文本编辑器需 inputType 识别）
+				try { el.textContent = T; } catch(e2){}
+				try {
+					var IE = el.ownerDocument.defaultView.InputEvent;
+					el.dispatchEvent(new IE('input', {bubbles: true, inputType: 'insertText', data: T}));
+				} catch(e3){
+					try { el.dispatchEvent(new el.ownerDocument.defaultView.Event('input', {bubbles: true})); } catch(e4){}
+				}
+				hasText = (el.textContent || '').indexOf(T.slice(0, 10)) >= 0;
 			}
-			hasText = (el.textContent || '').indexOf(T.slice(0, 10)) >= 0;
+			if (ok || hasText) return 'ok execCommand=' + ok + ' textLen=' + (el.textContent || '').length;
+			return 'inserted-failed textLen=' + (el.textContent || '').length;
+		} catch(eAll) {
+			return 'err:' + eAll.message;
 		}
-		return (ok || hasText) ? 'ok execCommand=' + ok + ' textLen=' + (el.textContent || '').length : '';
 	})(%q)`, sel, text)
 	var result string
 	if err := fs.evaluate(&result, inputJs, 8*time.Second); err != nil {
@@ -1878,15 +1900,16 @@ func fillTextViaJS(fs frameScope, logger *logx.Logger, sel, text string) error {
 		return errors.New("WX5 cannot input text via JavaScript (cross-frame)")
 	}
 	if !strings.HasPrefix(result, "ok") {
-		logger.Print("WX5", "JS填写返回: "+result)
-		return errors.New("WX5 JavaScript input returned false (cross-frame)")
+		logger.Print("WX5", "JS填写未成功，返回: "+result)
+		return errors.New("WX5 JavaScript input failed (cross-frame): " + result)
 	}
 	logger.Print("WX5", "JS填写结果: "+result)
-	// 验证最终文本（跨框架）
+	// 验证最终文本（跨框架，兼容 textarea）
 	var finalText string
 	_ = fs.evaluate(&finalText, fmt.Sprintf(`(function(){
 		var el = document.querySelector(%q);
-		return el ? el.textContent : '';
+		if (!el) return '';
+		return el.tagName === 'TEXTAREA' ? el.value : el.textContent;
 	})()`, sel), 3*time.Second)
 	logger.Print("WX5", "JS填写完成，最终文本(前100字符): "+finalText[:min(len(finalText), 100)])
 	logger.Print("WX5", "========== 填写视频文案完成 ==========")
