@@ -1036,60 +1036,33 @@ func injectFileCrossFrame(fs frameScope, logger *logx.Logger, absVideoPath strin
 	injectCtx, cancel := context.WithTimeout(fs.ctx, 15*time.Second)
 	defer cancel()
 	err := chromedp.Run(injectCtx, chromedp.ActionFunc(func(c context.Context) error {
-		// 1. 解析 iframe 元素节点（兼容 src 属性与 wujie document.write 后不一致：按 name/属性找）
-		doc, err := dom.GetDocument().Do(c)
+		// 1. 在主框架中直接引用同源沙箱 iframe 内的 input 元素，取 RemoteObject 句柄（不按 returnByValue）
+		var ro *runtime.RemoteObject
+		expr := `(function(){
+			var f = document.querySelector('iframe[name="content"]') || document.querySelector('iframe[data-wujie-flag]') || document.querySelector('iframe');
+			if (!f || !f.contentDocument) return null;
+			return f.contentDocument.querySelector('input[type="file"]');
+		})()`
+		if err := chromedp.Evaluate(expr, &ro).Do(c); err != nil {
+			return err
+		}
+		if ro == nil || ro.ObjectID == "" {
+			return errors.New("未能在沙箱iframe内引用到input[type=file]")
+		}
+		// 2. 句柄转节点，取 BackendNodeID
+		nodeID, err := dom.RequestNode(ro.ObjectID).Do(c)
 		if err != nil {
 			return err
 		}
-		var iframeNodeID cdp.NodeID
-		for _, sel := range []string{`iframe[name="content"]`, `iframe[data-wujie-flag]`, `iframe`} {
-			nodeID, err := dom.QuerySelector(doc.NodeID, sel).Do(c)
-			if err == nil && nodeID != 0 {
-				iframeNodeID = nodeID
-				break
-			}
-		}
-		if iframeNodeID == 0 {
-			return errors.New("iframe节点未找到")
-		}
-		// 2. 取 iframe 的内容文档与其中的 input[type=file]
-		contentDoc, err := dom.DescribeNode().WithNodeID(iframeNodeID).WithDepth(-1).WithPierce(true).Do(c)
-		if err != nil || contentDoc == nil || contentDoc.ContentDocument == nil {
-			return errors.New("iframe内容文档不可达")
-		}
-		var inputBackendID cdp.BackendNodeID
-		var findInput func(n *cdp.Node)
-		findInput = func(n *cdp.Node) {
-			if inputBackendID != 0 || n == nil {
-				return
-			}
-			if n.NodeName == "INPUT" {
-				for i := 0; i+1 < len(n.Attributes); i += 2 {
-					if n.Attributes[i] == "type" && n.Attributes[i+1] == "file" {
-						inputBackendID = n.BackendNodeID
-						return
-					}
-				}
-			}
-			for _, ch := range n.Children {
-				findInput(ch)
-			}
-			if n.ContentDocument != nil {
-				findInput(n.ContentDocument)
-			}
-			if n.TemplateContent != nil {
-				findInput(n.TemplateContent)
-			}
-		}
-		findInput(contentDoc.ContentDocument)
-		if inputBackendID == 0 {
-			return errors.New("iframe内未找到input[type=file]")
+		node, err := dom.DescribeNode().WithNodeID(nodeID).Do(c)
+		if err != nil || node == nil || node.BackendNodeID == 0 {
+			return errors.New("解析input的BackendNodeID失败")
 		}
 		// 3. 直接注入文件（不依赖可见性/焦点/用户激活）
-		if err := dom.SetFileInputFiles([]string{absVideoPath}).WithBackendNodeID(inputBackendID).Do(c); err != nil {
+		if err := dom.SetFileInputFiles([]string{absVideoPath}).WithBackendNodeID(node.BackendNodeID).Do(c); err != nil {
 			return err
 		}
-		logger.Print("WX3", fmt.Sprintf("已通过CDP直接注入文件到沙箱iframe的input(backend=%d)", inputBackendID))
+		logger.Print("WX3", fmt.Sprintf("已通过CDP直接注入文件到沙箱iframe的input(backend=%d)", node.BackendNodeID))
 		return nil
 	}))
 	if err != nil {
