@@ -43,6 +43,14 @@ func isUploadNetURL(u string) bool {
 	return strings.Contains(u, "applyuploaddfs") || strings.Contains(u, "uploadpartdfs") || strings.Contains(u, "completepartuploaddfs")
 }
 
+// publishNetSignal 发布成功网络信号：post_create 请求发出即置 1（服务端受理发表）。
+// 比页面跳转/文案更可靠：指纹浏览器下 wujie 子应用 URL 可能不变，仅凭 URL 判转会漏判（实测曾发布成功却傻等重试）。
+var publishNetSignal int32
+
+func isPublishNetURL(u string) bool {
+	return strings.Contains(u, "/post/post_create")
+}
+
 func (l *filterLogger) Printf(format string, v ...interface{}) {
 	msg := ""
 	if len(v) > 0 {
@@ -74,6 +82,7 @@ type PublishRequest struct {
 func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) error {
 	// 包级信号跨请求会残留（服务常驻），每次发布开始必须重置，否则第二次请求会误判"上传已启动"
 	atomic.StoreInt32(&uploadNetSignal, 0)
+	atomic.StoreInt32(&publishNetSignal, 0)
 	if req.WebsocketURL == "" {
 		return errors.New("WX0 websocket_url is required")
 	}
@@ -350,28 +359,34 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		redirectDeadline := time.Now().Add(120 * time.Second)
 		redirectOK = false
 		for time.Now().Before(redirectDeadline) {
-			// 检测是否出现验证码弹窗（安全验证/手机验证）
+			// 网络层 post_create 已受理 = 发布成功（指纹浏览器下 wujie 子应用 URL 可能不变，不能仅凭 URL 判转）
+			if atomic.LoadInt32(&publishNetSignal) == 1 {
+				logger.Print("WX6", "网络层检测到 post_create 成功请求，判定发布成功")
+				redirectOK = true
+				break
+			}
+			// 检测是否出现验证码弹窗（限定弹窗容器内，避免误匹配页面普通文案）
 			if !verificationHandled {
-				verifyCtx, cancelVerify := context.WithTimeout(tabCtx, 2*time.Second)
-				var verifyNodes []*cdp.Node
-				_ = chromedp.Run(verifyCtx, chromedp.Nodes(`//*[contains(text(), '验证码') or contains(text(), '短信验证') or contains(text(), '手机验证') or contains(text(), '安全验证')]`, &verifyNodes, chromedp.BySearch))
-				cancelVerify()
-				if len(verifyNodes) > 0 {
+				if verifyModalVisible(tabCtx) {
 					logger.Print("WX6", "⚠️ 检测到验证码弹窗，请在浏览器中手动输入验证码并完成验证")
 					logger.Print("WX6", "等待人工处理验证码... (最长等待3分钟)")
 					verificationHandled = true
-					// 等待验证码弹窗消失(用户手动处理)
+					// 等待验证码弹窗消失(用户手动处理)；发布信号出现则立即退出等待（验证已自动通过）
 					verifyDeadline := time.Now().Add(3 * time.Minute)
 					for time.Now().Before(verifyDeadline) {
 						time.Sleep(3 * time.Second)
-						checkCtx, cancelCheck := context.WithTimeout(tabCtx, 2*time.Second)
-						var stillNodes []*cdp.Node
-						_ = chromedp.Run(checkCtx, chromedp.Nodes(`//*[contains(text(), '验证码') or contains(text(), '短信验证') or contains(text(), '手机验证') or contains(text(), '安全验证')]`, &stillNodes, chromedp.BySearch))
-						cancelCheck()
-						if len(stillNodes) == 0 {
+						if atomic.LoadInt32(&publishNetSignal) == 1 {
+							logger.Print("WX6", "验证期间检测到 post_create 成功请求，判定发布成功")
+							break
+						}
+						if !verifyModalVisible(tabCtx) {
 							logger.Print("WX6", "验证码弹窗已消失，继续等待页面跳转")
 							break
 						}
+					}
+					if atomic.LoadInt32(&publishNetSignal) == 1 {
+						redirectOK = true
+						break
 					}
 				}
 			}
@@ -424,6 +439,34 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		logger.Print("WX8", "已删除本地视频: "+absVideoPath)
 	}
 	return nil
+}
+
+// verifyModalVisible 检测页面是否出现验证码类弹窗：含验证文案的可见元素且位于 modal/dialog 容器内。
+// 旧版全文档 XPath 搜"验证码"会误匹配页面普通文案，导致发布成功后仍傻等人工验证。
+func verifyModalVisible(tabCtx context.Context) bool {
+	var visible bool
+	js := `(function(){
+		var all = document.querySelectorAll('div, section, p, span, h1, h2, h3, h4, label');
+		for (var i = 0; i < all.length; i++) {
+			var el = all[i];
+			var t = ((el.innerText || '') + '').trim();
+			if (t.length > 60) continue;
+			if (t.indexOf('验证码') < 0 && t.indexOf('安全验证') < 0 && t.indexOf('手机验证') < 0) continue;
+			var r = el.getBoundingClientRect();
+			if (r.width <= 0 || r.height <= 0) continue;
+			var p = el;
+			for (var k = 0; k < 10 && p; k++) {
+				var cls = ((p.className || '') + '').toLowerCase();
+				if (cls.indexOf('modal') >= 0 || cls.indexOf('dialog') >= 0 || cls.indexOf('popup') >= 0 || cls.indexOf('mask') >= 0) return true;
+				p = p.parentElement;
+			}
+		}
+		return false;
+	})()`
+	vCtx, cancel := context.WithTimeout(tabCtx, 3*time.Second)
+	defer cancel()
+	_ = chromedp.Run(vCtx, chromedp.Evaluate(js, &visible))
+	return visible
 }
 
 // httpBaseFromWS 从 WebSocket 调试地址推导 HTTP 调试接口地址：
@@ -682,6 +725,10 @@ func enableNetworkDiagnostics(tabCtx context.Context, logger *logx.Logger) {
 			}
 			if isUploadNetURL(u) {
 				atomic.StoreInt32(&uploadNetSignal, 1)
+			}
+			// post_create 请求发出 = 服务端已受理发表（比页面跳转更早更可靠）
+			if isPublishNetURL(u) && e.Response.Status >= 200 && e.Response.Status < 400 {
+				atomic.StoreInt32(&publishNetSignal, 1)
 			}
 			if len(u) > 140 {
 				u = u[:140]
