@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"minimax_pro/internal/logx"
@@ -31,6 +32,15 @@ import (
 
 type filterLogger struct {
 	logger *logx.Logger
+}
+
+// uploadNetSignal 网络层上传启动信号：出现腾讯上传分片请求（applyuploaddfs/uploadpartdfs 等）后置 1。
+// 页面文案信号（"正在上传"/进度）在指纹浏览器内核下可能永远不渲染，网络信号是唯一可靠判据；
+// 避免仅凭文案误判"未启动"而重复注入文件（曾触发"切换"弹窗并卡死上传状态机，发表按钮永远灰色）。
+var uploadNetSignal int32
+
+func isUploadNetURL(u string) bool {
+	return strings.Contains(u, "applyuploaddfs") || strings.Contains(u, "uploadpartdfs") || strings.Contains(u, "completepartuploaddfs")
 }
 
 func (l *filterLogger) Printf(format string, v ...interface{}) {
@@ -62,6 +72,8 @@ type PublishRequest struct {
 // PublishVideo 连接远程浏览器，打开微信视频号助手发表页，上传视频、填写描述，点击发表，
 // 然后等待并关闭浏览器，最终删除本地视频文件
 func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) error {
+	// 包级信号跨请求会残留（服务常驻），每次发布开始必须重置，否则第二次请求会误判"上传已启动"
+	atomic.StoreInt32(&uploadNetSignal, 0)
 	if req.WebsocketURL == "" {
 		return errors.New("WX0 websocket_url is required")
 	}
@@ -652,6 +664,10 @@ func enableNetworkDiagnostics(tabCtx context.Context, logger *logx.Logger) {
 		switch e := ev.(type) {
 		case *network.EventRequestWillBeSent:
 			if e.Request.URL != "" {
+				// 上传分片请求出现 = 前端已消费文件并启动上传（比页面文案更早更可靠）
+				if isUploadNetURL(e.Request.URL) {
+					atomic.StoreInt32(&uploadNetSignal, 1)
+				}
 				netMu.Lock()
 				reqURLs[e.RequestID] = e.Request.URL
 				netMu.Unlock()
@@ -663,6 +679,9 @@ func enableNetworkDiagnostics(tabCtx context.Context, logger *logx.Logger) {
 			netMu.Unlock()
 			if u == "" {
 				u = e.Response.URL
+			}
+			if isUploadNetURL(u) {
+				atomic.StoreInt32(&uploadNetSignal, 1)
 			}
 			if len(u) > 140 {
 				u = u[:140]
@@ -1638,10 +1657,10 @@ func uploadDiagnostics(fs frameScope) string {
 	return info
 }
 
-// confirmUploadStarted 轮询检测上传启动信号（正在上传/进度/重新上传等）。
+// confirmUploadStarted 轮询检测上传启动信号：页面文案（正在上传/进度）或网络层分片请求任一命中即算启动。
 func confirmUploadStarted(fs frameScope, tries int) bool {
 	for i := 0; i < tries; i++ {
-		if uploadStartedCrossFrame(fs) {
+		if uploadStartedCrossFrame(fs) || atomic.LoadInt32(&uploadNetSignal) == 1 {
 			return true
 		}
 		time.Sleep(2 * time.Second)
@@ -1670,33 +1689,24 @@ func dispatchChangeCrossFrame(fs frameScope, logger *logx.Logger) {
 	}
 }
 
-// finishAfterChooser 选择框拦截填入完成后的统一收尾：先验证上传启动，未启动则依次兜底：
-// 补发change → 重新注入 → 再可信点击。均未确认则告警并交 WX4（附诊断，便于指纹浏览器环境定位）。
+// finishAfterChooser 选择框拦截填入完成后的统一收尾：验证上传启动（页面文案或网络层分片请求）。
+// 未确认时仅补发 change（幂等）；不再重复注入文件/再次点击——重复给文件会触发前端"切换"弹窗并卡死上传状态机。
 func finishAfterChooser(fs frameScope, logger *logx.Logger, absVideoPath string) error {
+	if atomic.LoadInt32(&uploadNetSignal) == 1 {
+		logger.Print("WX3", "上传已启动（网络层检测到上传分片请求，选择框路线生效）")
+		return nil
+	}
 	if confirmUploadStarted(fs, 6) {
 		logger.Print("WX3", "上传已启动（选择框路线生效）")
 		return nil
 	}
-	logger.Print("WX3", "填入后12秒未检测到上传启动（前端可能未消费文件），开始兜底")
+	logger.Print("WX3", "填入后12秒未检测到上传启动（页面文案与网络层均无信号），补发change兜底")
 	dispatchChangeCrossFrame(fs, logger)
 	if confirmUploadStarted(fs, 4) {
 		logger.Print("WX3", "上传已启动（补发change生效）")
 		return nil
 	}
-	injectFileCrossFrame(fs, logger, absVideoPath)
-	if confirmUploadStarted(fs, 4) {
-		logger.Print("WX3", "上传已启动（重新注入生效）")
-		return nil
-	}
-	trustedClickFileInput(fs, logger)
-	select {
-	case <-time.After(8 * time.Second):
-	}
-	if uploadStartedCrossFrame(fs) {
-		logger.Print("WX3", "上传已启动（再次可信点击生效）")
-		return nil
-	}
-	logger.Print("WX3", "【警告】所有填入路线均未确认上传启动，交WX4继续等待 诊断: "+uploadDiagnostics(fs))
+	logger.Print("WX3", "【警告】未确认上传启动，但不再重复注入文件（重复给文件会触发\"切换\"弹窗并卡死前端上传状态机），交WX4继续等待 诊断: "+uploadDiagnostics(fs))
 	return nil
 }
 
@@ -2060,29 +2070,34 @@ func fillTextViaJS(fs frameScope, logger *logx.Logger, sel, text string) error {
 	return nil
 }
 
-// findPublishButtonJS 在作用域内查找未禁用的"发表"按钮（精确匹配文案，排除"定时发表"/"发表预览"），
-// 滚入视口中心并打上唯一标记。返回 'found'（沙箱已铺满视口左上角，按钮视口坐标可直接作为主视口坐标）。
+// findPublishButtonJS 在作用域内查找"发表"按钮（去空白后精确匹配文案，排除"定时发表"/"发表预览"）。
+// 返回 'found'（可点击，已滚入视口中心并打唯一标记）或 'disabled'（按钮存在但禁用，通常是视频还在上传/转码）；
+// 无任何候选返回 ''（跨框架包装器会继续遍历后续根）。
 const findPublishButtonJS = `(function(){
-	var els = document.querySelectorAll('button, div[role="button"], span[role="button"]');
+	var els = document.querySelectorAll('button, div[role="button"], span[role="button"], a');
+	var hasDisabled = false;
 	for (var i = 0; i < els.length; i++) {
 		var el = els[i];
-		if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
-		var cls = ((el.className || '') + '');
-		if (cls.indexOf('disabled') >= 0) continue;
-		var t = ((el.innerText || '') + '').trim();
+		var t = (((el.innerText || '') + '').replace(/\s+/g, '')).trim();
 		if (t !== '发表') continue;
+		var cls = ((el.className || '') + '');
+		var dis = el.disabled || el.getAttribute('aria-disabled') === 'true' || cls.indexOf('disabled') >= 0;
+		if (dis) { hasDisabled = true; continue; }
 		try { el.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
 		try { el.setAttribute('__wx_pub_target', '1'); } catch (e2) {}
 		return 'found';
 	}
-	return '';
+	return hasDisabled ? 'disabled' : '';
 })()`
 
 // clickPublish 查找并点击"发表"按钮。优先 CDP 可信点击（真实鼠标事件，指纹浏览器内核下合成
 // el.click() 实测会被页面静默忽略）；找不到坐标时兜底合成点击。按钮在页面右侧需先滚入视口。
+// 按钮存在但禁用（视频仍在上传/转码）时持续等待其可点击，最长 5 分钟。
 func clickPublish(fs frameScope, logger *logx.Logger) error {
 	logger.Print("WX6", "查找发表按钮")
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(5 * time.Minute)
+	disabledNoticed := false
+	lastDiag := time.Time{}
 	for time.Now().Before(deadline) {
 		var found string
 		_ = fs.evaluate(&found, findPublishButtonJS, 3*time.Second)
@@ -2106,9 +2121,43 @@ func clickPublish(fs frameScope, logger *logx.Logger) error {
 				return nil
 			}
 		}
+		// 按钮存在但禁用：视频上传/转码未完成，等待其可点击（首次提示一次，避免刷屏）
+		if found == "disabled" && !disabledNoticed {
+			logger.Print("WX6", "发表按钮当前为禁用态（视频可能仍在上传/转码），等待其可点击")
+			disabledNoticed = true
+		}
+		// 长时间找不到可点击按钮：定期输出候选诊断，便于从日志定位（文案不匹配/按钮未渲染等）
+		if time.Since(lastDiag) >= 30*time.Second {
+			logger.Print("WX6", "按钮候选诊断: "+publishBtnDiagnostics(fs))
+			lastDiag = time.Now()
+		}
 		time.Sleep(800 * time.Millisecond)
 	}
+	logger.Print("WX6", "超时未找到可点击的发表按钮，最终诊断: "+publishBtnDiagnostics(fs))
 	return errors.New("WX6 cannot find publish button on weixin channels page")
+}
+
+// publishBtnDiagnostics 枚举作用域内含"发表/发布"文案的按钮候选（标签|文案|禁用|可见），供找不到按钮时定位原因。
+func publishBtnDiagnostics(fs frameScope) string {
+	var info string
+	_ = fs.evaluate(&info, `(function(){
+		var els = document.querySelectorAll('button, div[role="button"], span[role="button"], a');
+		var out = [];
+		for (var i = 0; i < els.length; i++) {
+			var el = els[i];
+			var t = ((el.innerText || '') + '').replace(/\s+/g, ' ').trim();
+			if (!t || t.length > 12 || t.indexOf('发表') < 0) continue;
+			var r = el.getBoundingClientRect();
+			var dis = el.disabled || el.getAttribute('aria-disabled') === 'true' || (((el.className || '') + '').indexOf('disabled') >= 0);
+			out.push(el.tagName + '|' + t + '|dis=' + dis + '|vis=' + (r.width > 0 && r.height > 0));
+			if (out.length >= 8) break;
+		}
+		return out.join(' ;; ');
+	})()`, 5*time.Second)
+	if info == "" {
+		return "未找到任何含发表文案的按钮候选(子应用可能未渲染或文案不匹配)"
+	}
+	return info
 }
 
 // trustedClickPublishButton 对已标记的发表按钮做 CDP 真实鼠标事件点击（滚入视口后取中心坐标，
