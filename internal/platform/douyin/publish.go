@@ -140,12 +140,16 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		return fmt.Errorf("DY3 %v", err)
 	}
 
-	// 关闭上传后的提示弹窗
+	// 关闭上传后的提示弹窗（缩短超时，快速退出）
 	_ = dismissPopups(tabCtx, logger)
 
-	// 等待视频处理上传
-	logger.Print("DY4", "等待视频上传处理")
-	time.Sleep(30 * time.Second)
+	// 智能等待视频上传完成（进度条消失 + 封面出现）
+	if err := waitForUploadComplete(tabCtx, logger); err != nil {
+		return fmt.Errorf("DY4 %v", err)
+	}
+
+	// 上传完成后会弹出"视频预览功能"等引导弹窗，需再次关闭（否则遮挡文案输入框和发布按钮）
+	_ = dismissPopups(tabCtx, logger)
 
 	// 填写视频描述/文案
 	if req.Text != "" {
@@ -155,8 +159,8 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	}
 	logger.Print("DY6", "已填写标题，等待点击发布")
 
-	// 等待视频处理完成后再点击发布
-	time.Sleep(30 * time.Second)
+	// 短暂等待确保视频处理完成后再点击发布（封面已出现时无需长等待）
+	time.Sleep(5 * time.Second)
 
 	if err := clickPublish(tabCtx, logger); err != nil {
 		return fmt.Errorf("DY6 %v", err)
@@ -299,17 +303,96 @@ func waitAndUploadFile(ctx context.Context, logger *logx.Logger, absVideoPath st
 	return nil
 }
 
+// waitForUploadComplete 智能等待视频上传完成。
+// 检测条件：上传进度文本消失 + 封面选择区/发布按钮出现。
+// 轮询期间主动关闭"视频预览功能"等引导弹窗，防止弹窗遮挡导致流程卡住。
+// 最长等待 5 分钟。
+func waitForUploadComplete(ctx context.Context, logger *logx.Logger) error {
+	logger.Print("DY4", "智能等待视频上传完成...")
+	deadline := time.Now().Add(5 * time.Minute)
+	loopCount := 0
+
+	for time.Now().Before(deadline) {
+		loopCount++
+
+		// 每轮先尝试关闭引导弹窗（如"视频预览功能"的"知道了"按钮）
+		var popupClicked bool
+		popupCtx, cancelPopup := context.WithTimeout(ctx, 3*time.Second)
+		_ = chromedp.Run(popupCtx, chromedp.Evaluate(`(function(){
+			var btns = document.querySelectorAll('button, div[role="button"]');
+			for(var i=0;i<btns.length;i++){
+				var t = (btns[i].innerText||"").trim();
+				if(btns[i].disabled || btns[i].getAttribute('aria-disabled')==='true') continue;
+				if(t==='知道了' || t==='我知道了' || t==='不再提示' || t==='知道了，进入预览'){
+					try{btns[i].click();}catch(e){}
+					return true;
+				}
+			}
+			return false;
+		})()`, &popupClicked))
+		cancelPopup()
+		if popupClicked {
+			logger.Print("DY4", "已关闭引导弹窗（如'视频预览功能'提示框）")
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		// 一次性获取页面状态：是否上传中 + 是否已完成（合并成一次调用，减少 CDP 往返）
+		var state string
+		checkCtx, cancelCheck := context.WithTimeout(ctx, 3*time.Second)
+		_ = chromedp.Run(checkCtx, chromedp.Evaluate(`(function(){
+			var body = document.body ? (document.body.innerText || "") : "";
+			// 上传中判定：仅依赖明确的上传进度文本（注意：不要用 class*="progress"，会误中视频播放器进度条）
+			if(body.indexOf("上传过程中请不要删除") >= 0) return "uploading";
+			if(body.indexOf("正在上传") >= 0) return "uploading";
+			var m = body.match(/\u4e0a\u4f20[^\n]*?(\d{1,3})%/);
+			if(m && m[1] !== "100") return "uploading";
+			// 完成判定：上传完成后才会出现的页面元素（实测抖音创作者中心）
+			if(body.indexOf("设置封面") >= 0) return "done";
+			if(body.indexOf("选择封面") >= 0) return "done";
+			if(body.indexOf("重新上传") >= 0) return "done";
+			if(body.indexOf("更换封面") >= 0) return "done";
+			if(body.indexOf("作品描述") >= 0 && body.indexOf("发布时间") >= 0) return "done";
+			// 发布按钮已存在（上传完成且视频处理完毕）
+			var publishBtn = document.querySelector('#popover-tip-container > button, button[class*="publish"]');
+			if(publishBtn) return "done";
+			return "waiting";
+		})()`, &state))
+		cancelCheck()
+
+		if state == "done" {
+			logger.Print("DY4", "视频上传完成，检测到封面选择区/发布按钮已就绪")
+			return nil
+		}
+
+		// 每 5 轮(~15秒)输出一次状态，方便排查卡住原因
+		if loopCount%5 == 0 {
+			logger.Print("DY4", fmt.Sprintf("上传状态轮询中: state=%s (已等待%ds)", state, loopCount*3))
+		}
+
+		time.Sleep(3 * time.Second)
+	}
+
+	// 超时后不报错，继续流程（可能是小视频已上传完成但检测未命中）
+	logger.Print("DY4", "等待上传超时(5分钟)，继续执行后续流程")
+	return nil
+}
+
 // dismissPopups 关闭上传过程中的提示弹窗
 func dismissPopups(ctx context.Context, logger *logx.Logger) error {
 	logger.Print("DY9", "尝试关闭提示窗口")
 	candidates := []string{
+		// "视频预览功能"引导弹窗（上传完成后弹出），优先点击其"知道了"按钮
+		`//div[contains(@class,'popover') or contains(@class,'popup') or contains(@class,'tip') or contains(@class,'guide')]//button[contains(.,'知道了') or contains(.,'我知道了') or contains(.,'不再提示')]`,
 		`//div[contains(@class,'modal')]//button[contains(.,'确定') or contains(.,'知道了') or contains(.,'关闭') or contains(.,'取消') or contains(.,'跳过') or contains(.,'我知道了')]`,
 		`//div[contains(@class,'dialog')]//button[contains(.,'确定') or contains(.,'知道了') or contains(.,'关闭') or contains(.,'取消') or contains(.,'跳过') or contains(.,'我知道了')]`,
-		`//button[contains(.,'确定') or contains(.,'知道了') or contains(.,'关闭') or contains(.,'我知道了')]`,
+		`//button[contains(.,'知道了') or contains(.,'我知道了') or contains(.,'不再提示')]`,
+		`//button[contains(.,'确定') or contains(.,'关闭') or contains(.,'取消') or contains(.,'跳过')]`,
+		`//div[@role='button'][contains(.,'知道了') or contains(.,'我知道了') or contains(.,'确定') or contains(.,'关闭')]`,
 		`//div[contains(@class,'close')]`,
 		`//div[contains(@class,'mask')]//div[contains(@class,'close')]`,
 	}
-	deadline := time.Now().Add(25 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		clicked := false
 		for _, xp := range candidates {
