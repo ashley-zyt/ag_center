@@ -383,6 +383,9 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 				logger.Print("WX6", "重试点击发表失败: "+err.Error())
 				break
 			}
+		} else {
+			// 第二轮仍未跳转：输出页面诊断，定位发表卡点（弹窗遮挡/报错/按钮未响应）
+			logger.Print("WX6", "两轮点击后仍未跳转，页面诊断: "+uploadDiagnostics(iframeFS))
 		}
 	}
 	if !redirectOK {
@@ -2057,34 +2060,102 @@ func fillTextViaJS(fs frameScope, logger *logx.Logger, sel, text string) error {
 	return nil
 }
 
-// clickPublish 查找并点击"发表"按钮（在作用域框架内用 JS 精确匹配文案为"发表"的按钮，
-// 天然排除"定时发表"、"发表预览"等）
+// findPublishButtonJS 在作用域内查找未禁用的"发表"按钮（精确匹配文案，排除"定时发表"/"发表预览"），
+// 滚入视口中心并打上唯一标记。返回 'found'（沙箱已铺满视口左上角，按钮视口坐标可直接作为主视口坐标）。
+const findPublishButtonJS = `(function(){
+	var els = document.querySelectorAll('button, div[role="button"], span[role="button"]');
+	for (var i = 0; i < els.length; i++) {
+		var el = els[i];
+		if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+		var cls = ((el.className || '') + '');
+		if (cls.indexOf('disabled') >= 0) continue;
+		var t = ((el.innerText || '') + '').trim();
+		if (t !== '发表') continue;
+		try { el.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
+		try { el.setAttribute('__wx_pub_target', '1'); } catch (e2) {}
+		return 'found';
+	}
+	return '';
+})()`
+
+// clickPublish 查找并点击"发表"按钮。优先 CDP 可信点击（真实鼠标事件，指纹浏览器内核下合成
+// el.click() 实测会被页面静默忽略）；找不到坐标时兜底合成点击。按钮在页面右侧需先滚入视口。
 func clickPublish(fs frameScope, logger *logx.Logger) error {
 	logger.Print("WX6", "查找发表按钮")
-	js := `(function(){
-		var els = document.querySelectorAll('button, div[role="button"], span[role="button"]');
-		for (var i = 0; i < els.length; i++) {
-			var el = els[i];
-			if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
-			var cls = ((el.className || '') + '');
-			if (cls.indexOf('disabled') >= 0) continue;
-			var t = ((el.innerText || '') + '').trim();
-			if (t !== '发表') continue;
-			try { el.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
-			try { el.click(); return true; } catch (e) { return false; }
-		}
-		return false;
-	})()`
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
-		var ok bool
-		if err := fs.evaluate(&ok, js, 3*time.Second); err == nil && ok {
-			logger.Print("WX6", "已点击发表按钮")
-			return nil
+		var found string
+		_ = fs.evaluate(&found, findPublishButtonJS, 3*time.Second)
+		if found == "found" {
+			if trustedClickPublishButton(fs, logger) {
+				return nil
+			}
+			// 可信点击不可用（取不到坐标等）：兜底合成点击（本地真 Chrome 环境验证过可用）
+			var ok bool
+			_ = fs.evaluate(&ok, `(function(){
+				var el = document.querySelector('[__wx_pub_target]') || document.querySelector('button');
+				var els = document.querySelectorAll('button, div[role="button"], span[role="button"]');
+				for (var i = 0; i < els.length; i++) {
+					var t = ((els[i].innerText || '') + '').trim();
+					if (t === '发表' && !els[i].disabled) { try { els[i].click(); return true; } catch(e) { return false; } }
+				}
+				return false;
+			})()`, 3*time.Second)
+			if ok {
+				logger.Print("WX6", "已合成点击发表按钮(兜底路线)")
+				return nil
+			}
 		}
 		time.Sleep(800 * time.Millisecond)
 	}
 	return errors.New("WX6 cannot find publish button on weixin channels page")
+}
+
+// trustedClickPublishButton 对已标记的发表按钮做 CDP 真实鼠标事件点击（滚入视口后取中心坐标，
+// 沙箱 iframe 已铺满视口左上角，内部坐标≈主视口坐标）。成功派发返回 true。
+func trustedClickPublishButton(fs frameScope, logger *logx.Logger) bool {
+	var coord string
+	_ = fs.evaluate(&coord, `(function(){
+		var el = document.querySelector('[__wx_pub_target]');
+		if (!el) return '';
+		try { el.scrollIntoView({block:'center', inline:'center'}); } catch(e){}
+		var r = el.getBoundingClientRect();
+		if (r.width <= 0 || r.height <= 0) return '';
+		return (r.left + r.width / 2) + ' ' + (r.top + r.height / 2);
+	})()`, 3*time.Second)
+	parts := strings.Fields(coord)
+	if len(parts) != 2 {
+		return false
+	}
+	var cx, cy float64
+	if _, err := fmt.Sscanf(parts[0]+" "+parts[1], "%f %f", &cx, &cy); err != nil || (cx <= 0 && cy <= 0) {
+		return false
+	}
+	// 滚动完成后短暂等待布局稳定再取最终坐标（滚入视口后位置可能变化）
+	time.Sleep(400 * time.Millisecond)
+	_ = fs.evaluate(&coord, `(function(){
+		var el = document.querySelector('[__wx_pub_target]');
+		if (!el) return '';
+		var r = el.getBoundingClientRect();
+		if (r.width <= 0 || r.height <= 0) return '';
+		return (r.left + r.width / 2) + ' ' + (r.top + r.height / 2);
+	})()`, 3*time.Second)
+	parts = strings.Fields(coord)
+	if len(parts) == 2 {
+		_, _ = fmt.Sscanf(parts[0]+" "+parts[1], "%f %f", &cx, &cy)
+	}
+	clickCtx, cancel := context.WithTimeout(fs.ctx, 5*time.Second)
+	err := chromedp.Run(clickCtx,
+		input.DispatchMouseEvent(input.MousePressed, cx, cy).WithButton(input.Left).WithClickCount(1),
+		input.DispatchMouseEvent(input.MouseReleased, cx, cy).WithButton(input.Left).WithClickCount(1),
+	)
+	cancel()
+	if err != nil {
+		logger.Print("WX6", "可信点击发表按钮失败: "+err.Error())
+		return false
+	}
+	logger.Print("WX6", fmt.Sprintf("已可信点击发表按钮 (坐标 %.0f,%.0f)", cx, cy))
+	return true
 }
 
 func checkAnomalyContext(fs frameScope, originalErr error) error {
