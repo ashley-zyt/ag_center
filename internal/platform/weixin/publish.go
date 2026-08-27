@@ -1705,36 +1705,70 @@ func fillText(fs frameScope, logger *logx.Logger, text string) error {
 	}
 
 	if foundSel == "" {
-		// 兜底：使用 JS 查找（在作用域框架内）
-		logger.Print("WX5", "未通过选择器找到描述输入框，尝试JS兜底")
-		var jsKind string
+		// 兜底：JS 枚举所有可编辑候选（contenteditable/textarea），挑选可见且面积最大的并打上唯一标记。
+		// 不能直接 querySelector('textarea')：返回 document 顺序第一个，可能命中隐藏的代理 textarea，
+		// 写入后页面真实编辑器无任何反应（曾导致空描述发布）。
+		logger.Print("WX5", "未通过选择器找到描述输入框，尝试JS兜底枚举候选")
+		var pickInfo string
 		js := `(function(){
-			var els = document.querySelectorAll('[contenteditable="true"]');
-			for(var i=0;i<els.length;i++){
-				var el = els[i];
-				if(el.offsetHeight > 0 && el.offsetWidth > 0){
-					return 'ce';
-				}
+			// [contenteditable] 不限定属性值：plaintext-only/空串也是可编辑（[contenteditable="true"] 会漏判）
+			var list = document.querySelectorAll('[contenteditable], textarea');
+			if (!list.length) return '';
+			var info = [];
+			var base = (document.URL || '').slice(0, 70);
+			var best = null; var bestArea = -1;
+			var bestInvisible = null; var bestInvArea = -1;
+			for (var i = 0; i < list.length; i++) {
+				var el = list[i];
+				// isContentEditable 对 contenteditable="true"/"plaintext-only"/"" 均为 true，属性判定不可靠时以它为准
+				var editable = el.isContentEditable || el.tagName === 'TEXTAREA';
+				if (!editable) continue;
+				var r = el.getBoundingClientRect();
+				var cs = el.ownerDocument.defaultView.getComputedStyle(el);
+				var area = (r.width || 0) * (r.height || 0);
+				var visible = el.offsetWidth > 0 && el.offsetHeight > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+				info.push(el.tagName + '|' + (((el.className || '') + '').slice(0, 60)) + '|ce=' + el.getAttribute('contenteditable') + '|area=' + Math.round(area) + '|vis=' + visible);
+				if (visible && area > bestArea) { best = el; bestArea = area; }
+				if (area > bestInvArea) { bestInvisible = el; bestInvArea = area; }
 			}
-			var ta = document.querySelectorAll('textarea');
-			for(var i=0;i<ta.length;i++){
-				if(ta[i].offsetHeight > 0 && ta[i].offsetWidth > 0){
-					return 'ta';
-				}
-			}
-			// 次选：存在不可见的编辑器也算命中（沙箱 iframe 可能被隐藏，但内部布局正常）
-			if (els.length > 0) return 'ce';
-			if (ta.length > 0) return 'ta';
-			return '';
+			var picked = best; // 仅从可见候选中挑：本根只有隐藏候选时返回空串，让包装器继续遍历后续根（避免主文档隐藏 textarea-body 短路）
+			if (!picked) return '';
+			try { picked.setAttribute('__wx_desc_target', '1'); } catch(e) { return ''; }
+			return 'picked=' + picked.tagName + '|area=' + Math.round(bestArea) + '|vis=true|base=' + base + ' || 候选: ' + info.join(' ;; ');
 		})()`
-		if err := fs.evaluate(&jsKind, js, 5*time.Second); err == nil && jsKind == "ce" {
-			// 不限定标签名：编辑器可能不是 div（如自定义元素），用通用属性选择器避免查不到
-			foundSel = `[contenteditable='true']`
-		} else if err == nil && jsKind == "ta" {
-			foundSel = `textarea`
-		} else {
-			return errors.New("WX5 cannot find weixin channels description input")
+		if err := fs.evaluate(&pickInfo, js, 5*time.Second); err != nil || pickInfo == "" {
+			// 放宽：无可见候选时直接进沙箱 iframe 的 contentDocument 枚举（同源可穿透），按面积最大挑，不限可见性。
+			// 不用跨框架包装器：主文档的隐藏候选会先短路，轮不到 iframe。
+			logger.Print("WX5", "无可见编辑器候选，尝试直接穿透沙箱iframe枚举")
+			looseJs := `(function(){
+				var f = document.querySelector('iframe[name="content"]') || document.querySelector('iframe[data-wujie-flag]');
+				var cd = null;
+				try { cd = f && f.contentDocument; } catch(e) {}
+				if (!cd) return '';
+				var list = cd.querySelectorAll('[contenteditable], textarea');
+				if (!list.length) return '';
+				var info = []; var best = null; var bestArea = -1;
+				for (var i = 0; i < list.length; i++) {
+					var el = list[i];
+					if (!(el.isContentEditable || el.tagName === 'TEXTAREA')) continue;
+					var r = el.getBoundingClientRect();
+					var area = (r.width || 0) * (r.height || 0);
+					info.push(el.tagName + '|' + (((el.className || '') + '').slice(0, 60)) + '|area=' + Math.round(area));
+					if (area > bestArea) { best = el; bestArea = area; }
+				}
+				if (!best) return '';
+				try { best.setAttribute('__wx_desc_target', '1'); } catch(e2) { return ''; }
+				return 'picked=' + best.tagName + '|area=' + Math.round(bestArea) + '|via=sandbox || 候选: ' + info.join(' ;; ');
+			})()`
+			mainCtx, cancelLoose := context.WithTimeout(fs.ctx, 5*time.Second)
+			looseErr := chromedp.Run(mainCtx, chromedp.Evaluate(looseJs, &pickInfo))
+			cancelLoose()
+			if looseErr != nil || pickInfo == "" {
+				return errors.New("WX5 cannot find weixin channels description input")
+			}
 		}
+		logger.Print("WX5", "JS候选枚举: "+pickInfo)
+		foundSel = `[__wx_desc_target='1']`
 	}
 
 	logger.Print("WX5", "定位描述容器: "+foundSel)
@@ -1853,14 +1887,29 @@ func fillTextViaJS(fs frameScope, logger *logx.Logger, sel, text string) error {
 		var el = document.querySelector(%q);
 		if (!el) return '';
 		try {
-			// textarea 分支：直接写 value + 派发 input（React 受控组件需原生 setter 才能感知）
-			if (el.tagName === 'TEXTAREA') {
-				var proto = el.ownerDocument.defaultView.HTMLTextAreaElement.prototype;
-				var setter = Object.getOwnPropertyDescriptor(proto, 'value');
-				if (setter && setter.set) { setter.set.call(el, T); } else { el.value = T; }
-				el.dispatchEvent(new el.ownerDocument.defaultView.Event('input', {bubbles: true}));
-				el.dispatchEvent(new el.ownerDocument.defaultView.Event('change', {bubbles: true}));
-				return (el.value || '').indexOf(T.slice(0, 10)) >= 0 ? ('ok textarea len=' + el.value.length) : 'ta-insert-failed';
+			// textarea/input 分支：execCommand('insertText') 是原生编辑命令，会触发真实
+			// InputEvent(inputType=insertText)，React/受控组件必然感知（原生 setter+合成 Event 实测不被微信编辑器识别）
+			if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+				var docTa = el.ownerDocument;
+				el.focus();
+				try { el.setSelectionRange(0, (el.value || '').length); } catch(eSel){}
+				var okTa = false;
+				try { okTa = docTa.execCommand('insertText', false, T); } catch(eCmd){}
+				var v = el.value || '';
+				if (v.indexOf(T.slice(0, 10)) < 0) {
+					// 兜底：原生 setter + InputEvent(inputType=insertText)
+					var proto = docTa.defaultView.HTMLTextAreaElement.prototype;
+					var setter = Object.getOwnPropertyDescriptor(proto, 'value');
+					if (setter && setter.set) { setter.set.call(el, T); } else { el.value = T; }
+					try {
+						var IEta = docTa.defaultView.InputEvent;
+						el.dispatchEvent(new IEta('input', {bubbles: true, inputType: 'insertText', data: T}));
+					} catch(eIE) {
+						try { el.dispatchEvent(new docTa.defaultView.Event('input', {bubbles: true})); } catch(eIE2){}
+					}
+					v = el.value || '';
+				}
+				return v.indexOf(T.slice(0, 10)) >= 0 ? ('ok textarea execCommand=' + okTa + ' len=' + v.length) : 'ta-insert-failed';
 			}
 			el.focus();
 			try {
@@ -1912,6 +1961,12 @@ func fillTextViaJS(fs frameScope, logger *logx.Logger, sel, text string) error {
 		return el.tagName === 'TEXTAREA' ? el.value : el.textContent;
 	})()`, sel), 3*time.Second)
 	logger.Print("WX5", "JS填写完成，最终文本(前100字符): "+finalText[:min(len(finalText), 100)])
+	if strings.TrimSpace(finalText) == "" {
+		logger.Print("WX5", "【错误】填写后编辑器内容为空，中止流程（避免发布空描述视频）")
+		return errors.New("WX5 description editor still empty after fill")
+	}
+	// 给框架一点时间消化 input 事件、更新状态（受控组件渲染有延迟），再进入发表步骤
+	time.Sleep(2 * time.Second)
 	logger.Print("WX5", "========== 填写视频文案完成 ==========")
 	return nil
 }
