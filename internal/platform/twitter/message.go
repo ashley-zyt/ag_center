@@ -37,18 +37,9 @@ const (
 	selNewChatBtn      = `[data-testid="dm-new-chat-button"]`             // New message 按钮(dump6 唯一)
 	selSearchInput     = `input[data-testid="new-dm-search-input"]`       // 联系人搜索框(dump8 唯一)
 	selSuggestList     = `[data-testid="new-dm-suggestions-list"]`        // 搜索结果列表容器(dump10 唯一)
-	selEmptyInbox      = `[data-testid="dm-empty-inbox"]`                 // 空收件箱占位(dump6 唯一)
 	selComposer        = `textarea[data-testid="dm-composer-textarea"]`   // 消息输入框(dump12 唯一)
 	selMessageScroller = `[data-testid="dm-message-scroller"]`            // 聊天记录容器(dump12 唯一)
 )
-
-// twConversationItemSelectors 收件箱会话列表项候选: 全部级联限定在唯一收件箱面板内,
-// 避免命中导航等页面上其他区域的元素(收件箱为空时无法从 dump 确认结构, 待实测校准)。
-var twConversationItemSelectors = []string{
-	`div[data-testid="dm-inbox-panel"] [role="listitem"]`,
-	`div[data-testid="dm-inbox-panel"] div[data-testid^="conversation"]`,
-	`div[data-testid="dm-inbox-panel"] a[href*="/messages/"]`,
-}
 
 // twMessageContainerSelectors 会话消息区容器候选
 var twMessageContainerSelectors = []string{
@@ -73,12 +64,6 @@ func SendTwitterMessage(ctx context.Context, logger *logx.Logger, tasks []messag
 	return message.RunSend(ctx, logger, m, tasks), nil
 }
 
-// FetchTwitterConversations 会话列表拉取入口
-func FetchTwitterConversations(ctx context.Context, logger *logx.Logger, opts message.FetchOptions) (message.FetchConversationsResult, error) {
-	m := &twitterMessenger{logger: logger}
-	return message.RunFetchConversations(ctx, logger, m, opts), nil
-}
-
 // CheckTwitterReply 判断对方是否回复的入口:
 // 私信主页(/i/chat) -> Passcode验证 -> New message -> 搜索账号 -> 进入会话 -> 解析对方回复
 func CheckTwitterReply(ctx context.Context, logger *logx.Logger, opts message.CheckReplyOptions) (message.CheckReplyResult, error) {
@@ -92,7 +77,6 @@ type twitterMessenger struct {
 }
 
 func (m *twitterMessenger) Tag() string      { return "TW_MSG" }
-func (m *twitterMessenger) InboxURL() string { return twChatURL }
 
 // CheckLogin 登录态检测: 未登录时访问私信页会被重定向到 /login 或渲染登录表单
 func (m *twitterMessenger) CheckLogin(ctx context.Context) (string, error) {
@@ -310,9 +294,14 @@ func (m *twitterMessenger) waitPinGone(ctx context.Context, timeout time.Duratio
 // OpenConversationFromProfile 发起新会话并搜索目标账号:
 // New message -> 搜索框输入 account_name -> 点击结果第一项 -> 等待聊天窗口就绪
 func (m *twitterMessenger) OpenConversationFromProfile(ctx context.Context, task message.SendTask) error {
+	// 统一参数名为 target_url; 调用端对 X 平台会直接放入 username(账号名)。
+	// account_name 为空时, 直接把 target_url 当作 username 使用。
 	accountName := strings.TrimSpace(task.AccountName)
 	if accountName == "" {
-		return errors.New("缺少目标账号名 account_name")
+		accountName = strings.TrimSpace(task.TargetURL)
+	}
+	if accountName == "" {
+		return errors.New("缺少目标账号名(target_url 未传入)")
 	}
 
 	// 点击 New message 按钮
@@ -447,8 +436,7 @@ type lastMsg struct {
 // 相比旧的"任意 outgoing 消息包含内容即成功", 本实现避免了"返回成功但实际没有发出"的误判。
 func (m *twitterMessenger) verifySent(ctx context.Context, content string) error {
 	needle := firstNChars(strings.TrimSpace(content), 5)
-	scrollerJS := `document.querySelector('` + selMessageScroller + `') || document.querySelector(` +
-		`'div[data-testid="dm-message-list-container"]'` + `')`
+	scrollerJS := `document.querySelector('` + selMessageScroller + `') || document.querySelector('div[data-testid="dm-message-list-container"]')`
 	deadline := time.Now().Add(20 * time.Second)
 
 	for time.Now().Before(deadline) {
@@ -526,117 +514,6 @@ func firstNChars(s string, n int) string {
 		return string(r)
 	}
 	return string(r[:n])
-}
-
-// FetchConversationList 解析收件箱会话列表(先处理可能出现的 Passcode 拦截)。
-// conversation_id 优先取会话链接; 无链接时记录收件箱内序号(inbox-idx:N), 供 OpenConversation 结构化定位。
-func (m *twitterMessenger) FetchConversationList(ctx context.Context, opts message.FetchOptions) ([]message.Conversation, error) {
-	if err := m.handlePasscode(ctx, opts.Passcode); err != nil {
-		return nil, err
-	}
-
-	// 空收件箱: 页面渲染唯一占位标识, 直接返回空列表而不是等待超时
-	var empty bool
-	emptyCtx, cancelEmpty := context.WithTimeout(ctx, 5*time.Second)
-	_ = chromedp.Run(emptyCtx, chromedp.Evaluate(`!!document.querySelector(`+selEmptyInbox+`)`, &empty))
-	cancelEmpty()
-	if empty {
-		m.logger.Print("TW_MSG3", "收件箱为空")
-		return []message.Conversation{}, nil
-	}
-
-	sels, _ := json.Marshal(twConversationItemSelectors)
-	js := fmt.Sprintf(`(function(){
-		var sels = %s;
-		var items = [];
-		for (var i = 0; i < sels.length; i++) {
-			try {
-				var found = document.querySelectorAll(sels[i]);
-				if (found && found.length) { items = Array.prototype.slice.call(found); break; }
-			} catch (e) {}
-		}
-		if (!items.length) return "[]";
-		var out = items.map(function(it, idx){
-			var lines = (it.innerText || '').split('\n').map(function(x){ return x.trim(); }).filter(Boolean);
-			var name = lines[0] || '';
-			var a = it.querySelector('a[href]') || (it.tagName === 'A' ? it : null);
-			var href = a ? a.href : '';
-			return {
-				conversation_id: href || ('inbox-idx:' + idx),
-				partner_name: name,
-				last_message: lines.length > 2 ? lines[lines.length - 2] || '' : '',
-				last_message_at: lines[lines.length - 1] || '',
-				partner_url: '',
-				unread: false
-			};
-		});
-		return JSON.stringify(out);
-	})()`, string(sels))
-
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		var raw string
-		evalCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := chromedp.Run(evalCtx, chromedp.Evaluate(js, &raw))
-		cancel()
-		if err == nil && raw != "" && raw != "[]" {
-			var convs []message.Conversation
-			if err := json.Unmarshal([]byte(raw), &convs); err != nil {
-				return nil, fmt.Errorf("解析会话列表JSON失败: %v", err)
-			}
-			return convs, nil
-		}
-		select {
-		case <-time.After(2 * time.Second):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	return nil, errors.New("30秒内未在收件箱解析到会话列表(选择器可能需校准)")
-}
-
-// OpenConversation 从收件箱打开指定会话(纯结构化定位, 不按显示名文本匹配):
-// 优先按会话链接直接导航; 无链接时按拉取时记录的收件箱序号(inbox-idx:N)点击对应项。
-func (m *twitterMessenger) OpenConversation(ctx context.Context, conv message.Conversation) error {
-	if strings.HasPrefix(conv.ConversationID, "http") {
-		if err := chromedp.Run(ctx, chromedp.Navigate(conv.ConversationID), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
-			return err
-		}
-	} else {
-		var idx int
-		if _, err := fmt.Sscanf(conv.ConversationID, "inbox-idx:%d", &idx); err != nil {
-			return fmt.Errorf("会话缺少可定位的链接或序号(conversation_id=%s)", conv.ConversationID)
-		}
-		sels, _ := json.Marshal(twConversationItemSelectors)
-		js := fmt.Sprintf(`(function(sels, idx){
-			for (var i = 0; i < sels.length; i++) {
-				var items;
-				try { items = document.querySelectorAll(sels[i]); } catch (e) { continue; }
-				if (items.length && idx >= 0 && idx < items.length) {
-					items[idx].click();
-					return true;
-				}
-			}
-			return false;
-		})(%s, %d)`, string(sels), idx)
-		var clicked bool
-		clickCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := chromedp.Run(clickCtx, chromedp.Evaluate(js, &clicked))
-		cancel()
-		if err != nil {
-			return err
-		}
-		if !clicked {
-			return fmt.Errorf("收件箱内未找到第%d个会话项", idx+1)
-		}
-	}
-
-	// 等待聊天窗口就绪
-	chatCtx, cancelChat := context.WithTimeout(ctx, 20*time.Second)
-	defer cancelChat()
-	_ = chromedp.Run(chatCtx, chromedp.WaitVisible(selComposer, chromedp.ByQuery))
-	time.Sleep(2 * time.Second)
-	return nil
 }
 
 // FetchConversationMessages 解析当前会话的消息(时间正序)。

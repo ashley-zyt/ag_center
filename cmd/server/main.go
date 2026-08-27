@@ -20,15 +20,15 @@ import (
 	"minimax_pro/internal/chromedputil"
 	chrome "minimax_pro/internal/clock"
 	"minimax_pro/internal/logx"
+	"minimax_pro/internal/platform/douyin"
 	"minimax_pro/internal/platform/facebook"
 	"minimax_pro/internal/platform/instagram"
 	"minimax_pro/internal/platform/message"
 	"minimax_pro/internal/platform/nurture"
 	"minimax_pro/internal/platform/scraper"
-	"minimax_pro/internal/platform/douyin"
-	"minimax_pro/internal/platform/weixin"
 	"minimax_pro/internal/platform/tiktok"
 	"minimax_pro/internal/platform/twitter"
+	"minimax_pro/internal/platform/weixin" // [合并] 加入 git 上的 weixin 模块
 	"minimax_pro/internal/platform/youtube"
 	"minimax_pro/internal/undetectable"
 
@@ -296,9 +296,6 @@ func updateAccountStatus(ctx context.Context, id int, statusDesp string) error {
 	return nil
 }
 
-// postsUpdatePayload is the JSON body sent to the per-account posts update
-// endpoint after a successful scrape. Field names are chosen to be flexible;
-// the real backend contract will be provided later.
 type postsUpdatePayload struct {
 	AccountID   int            `json:"account_id"`
 	ProfileName string         `json:"profile_name"`
@@ -307,8 +304,6 @@ type postsUpdatePayload struct {
 	Posts       []scraper.Post `json:"posts"`
 }
 
-// resolvePostsUpdateURL returns the URL used to push scraped posts for a
-// single account. Priority: explicit override > env var > compile-time const.
 func resolvePostsUpdateURL(override string) string {
 	if v := strings.TrimSpace(override); v != "" {
 		return v
@@ -319,8 +314,6 @@ func resolvePostsUpdateURL(override string) string {
 	return accountPostsUpdateURL
 }
 
-// resolveAccountStatsUpdateURL returns the URL used to batch-update account
-// statistics (followers, total posts). Priority: env var > compile-time const.
 func resolveAccountStatsUpdateURL() string {
 	if v := strings.TrimSpace(os.Getenv("ACCOUNT_STATS_UPDATE_API_URL")); v != "" {
 		return v
@@ -328,19 +321,16 @@ func resolveAccountStatsUpdateURL() string {
 	return accountStatsUpdateURL
 }
 
-// AccountStatParam is a single account's stats payload sent to the batch API.
 type AccountStatParam struct {
 	AccountID      int64 `json:"account_id"`
 	TotalFollowers int   `json:"total_followers"`
 	TotalPosts     int   `json:"total_posts"`
 }
 
-// accountStatsBatchPayload is the request body for the batch account stats API.
 type accountStatsBatchPayload struct {
 	Results []AccountStatParam `json:"results"`
 }
 
-// callBatchAccountStatsUpdateAPI POSTs batch account stats to the configured endpoint.
 func callBatchAccountStatsUpdateAPI(ctx context.Context, logger *logx.Logger, endpoint string, stats []AccountStatParam) error {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" || len(stats) == 0 {
@@ -372,9 +362,6 @@ func callBatchAccountStatsUpdateAPI(ctx context.Context, logger *logx.Logger, en
 	return nil
 }
 
-// callPostsUpdateAPI POSTs the scraped posts for a single account to the
-// configured update endpoint. When the URL is empty, the call is skipped and
-// only a log line is emitted, so the rest of the flow can still be tested.
 func callPostsUpdateAPI(ctx context.Context, logger *logx.Logger, endpoint string, payload postsUpdatePayload) error {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
@@ -415,7 +402,7 @@ func platformRule(platform string) (string, []string, error) {
 		return "https://www.tiktok.com/tiktokstudio/upload", []string{"log in to tiktok", "sign up", "don't have an account", "don’t have an account"}, nil
 	case "douyin":
 		return "https://creator.douyin.com/creator-micro/content/upload", []string{"登录", "扫码登录", "手机号登录", "请登录"}, nil
-	case "weixin":
+	case "weixin": // [合并] 加入 git 上的微信平台规则
 		return "https://channels.weixin.qq.com/platform/post/create", []string{"登录", "扫码登录", "微信扫一扫", "请登录"}, nil
 	case "facebook":
 		return "https://www.facebook.com/", []string{"confirm your identity", "confirm you're human to use your account", "log in", "sign up"}, nil
@@ -574,9 +561,9 @@ func startProfileByName(ctx context.Context, logger *logx.Logger, profileName st
 	logger.Print("4", "启动profile")
 	startErr := client.StartProfileBestEffort(localCtx, profileID)
 
-	// 💡 新增：捕获锁被占用错误并尝试释放重试
-	if startErr != nil && strings.Contains(startErr.Error(), "Profile is locked") {
-		logger.Print("4", "检测到指纹浏览器已被占用 (Profile is locked)，尝试强制释放并重试...")
+	// [合并保留本地优化] 💡 捕获锁被占用错误(Profile is locked / Unable to lock profile)并尝试释放重试
+	if startErr != nil && isProfileLocked(startErr.Error()) {
+		logger.Print("4", "检测到指纹浏览器已被占用/锁定，尝试强制释放并重试...")
 
 		// 1. 调用停止接口尝试解锁
 		_ = client.StopProfileBestEffort(localCtx, profileID)
@@ -593,8 +580,8 @@ func startProfileByName(ctx context.Context, logger *logx.Logger, profileName st
 		logger.Print("4", "启动请求成功")
 	} else {
 		// 如果重试后依然失败，返回明确的错误提示
-		if strings.Contains(startErr.Error(), "Profile is locked") {
-			return startByNameResult{}, fmt.Errorf("指纹浏览器已被占用 (Profile is locked)，自动释放后重试依然失败")
+		if isProfileLocked(startErr.Error()) {
+			return startByNameResult{}, fmt.Errorf("指纹浏览器已被占用/锁定，自动释放后重试依然失败")
 		}
 		logger.Print("4", "启动请求异常，尝试继续检测状态")
 	}
@@ -621,6 +608,15 @@ func stopProfileWithCleanup(ctx context.Context, logger *logx.Logger, browserCtx
 	stopCtx, cancelStop := context.WithTimeout(ctx, 6*time.Second)
 	_ = undetectable.NewClient(host, port).StopProfileBestEffort(stopCtx, profileID)
 	cancelStop()
+}
+
+// [合并保留本地优化] isProfileLocked 判断启动/停止 profile 的错误是否为"锁被占用"类错误。
+func isProfileLocked(errMsg string) bool {
+	lower := strings.ToLower(errMsg)
+	return strings.Contains(lower, "profile is locked") ||
+		strings.Contains(lower, "unable to lock profile") ||
+		strings.Contains(lower, "failed to lock profile") ||
+		strings.Contains(lower, "cannot lock profile")
 }
 
 func resolveUndetectablePath(explicit string) string {
@@ -685,9 +681,6 @@ func (l *cdpFilterLogger) Printf(format string, v ...interface{}) {
 
 // ---------- /accounts/fetch_posts ----------
 
-// fetchPostsByPlatform dispatches a fetch request to the platform-specific
-// scraper. It lives in main (not in package scraper) to avoid an import
-// cycle between scraper and the per-platform packages.
 func fetchPostsByPlatform(ctx context.Context, logger *logx.Logger, platform string, req scraper.FetchRequest) (scraper.FetchResult, error) {
 	switch strings.ToLower(strings.TrimSpace(platform)) {
 	case "twitter", "x":
@@ -741,29 +734,16 @@ func sendMessageByPlatform(ctx context.Context, logger *logx.Logger, platform st
 	}
 }
 
-// fetchMessagesByPlatform 分发会话列表拉取任务到平台实现
-func fetchMessagesByPlatform(ctx context.Context, logger *logx.Logger, platform string, opts message.FetchOptions) (message.FetchConversationsResult, error) {
-	switch strings.ToLower(strings.TrimSpace(platform)) {
-	case "tiktok", "tt":
-		return tiktok.FetchTikTokConversations(ctx, logger, opts)
-	case "instagram", "ig":
-		return instagram.FetchInstagramConversations(ctx, logger, opts)
-	case "twitter", "x":
-		return twitter.FetchTwitterConversations(ctx, logger, opts)
-	case "facebook", "fb":
-		return facebook.FetchFacebookConversations(ctx, logger, opts)
-	case "youtube", "yt":
-		return message.FetchConversationsResult{Status: "failed", ErrorInfo: "youtube 平台无站内私信功能(YouTube 已下线 Direct Messages)"}, fmt.Errorf("message fetch: youtube does not support direct messages")
-	default:
-		return message.FetchConversationsResult{Status: "failed", ErrorInfo: "unsupported platform: " + platform}, fmt.Errorf("message fetch: unsupported platform %q", platform)
-	}
-}
-
 // checkReplyByPlatform 分发"判断对方是否回复"任务到平台实现
+// [合并保留本地优化] 保留了 Tiktok 和 Instagram 的调用
 func checkReplyByPlatform(ctx context.Context, logger *logx.Logger, platform string, opts message.CheckReplyOptions) (message.CheckReplyResult, error) {
 	switch strings.ToLower(strings.TrimSpace(platform)) {
+	case "tiktok", "tt":
+		return tiktok.CheckTikTokReply(ctx, logger, opts)
 	case "twitter", "x":
 		return twitter.CheckTwitterReply(ctx, logger, opts)
+	case "instagram", "ig":
+		return instagram.CheckInstagramReply(ctx, logger, opts)
 	default:
 		return message.CheckReplyResult{Status: "failed", ErrorInfo: "unsupported platform: " + platform}, fmt.Errorf("message check_reply: unsupported platform %q", platform)
 	}
@@ -771,40 +751,12 @@ func checkReplyByPlatform(ctx context.Context, logger *logx.Logger, platform str
 
 // ─────────────────────────── 私信模块请求/响应结构 ───────────────────────────
 
-// SendMessageItem 单条主动发送任务
-type SendMessageItem struct {
-	TargetURL      string `json:"target_url"`             // 对方账号主页链接(主页型平台: TikTok/Instagram/Facebook)
-	AccountName    string `json:"account_name,omitempty"` // 对方账号名(搜索型平台: X/Twitter, 如 @Widino)
-	MessageContent string `json:"message_content"`        // 消息内容
-	Passcode       string `json:"passcode,omitempty"`     // 平台密码验证(如 X 私信 Passcode, 默认1472)
-}
-
-// SendMessageRequest POST /accounts/send_message 请求体
-type SendMessageRequest struct {
-	ProfileName      string            `json:"profile_name"`
-	Platform         string            `json:"platform"`
-	Messages         []SendMessageItem `json:"messages"`
-	Host             string            `json:"host"`
-	Port             int               `json:"port"`
-	WaitSeconds      int               `json:"wait_seconds"`
-	UndetectablePath string            `json:"undetectable_path"`
-}
-
-// SendMessageResponse POST /accounts/send_message 响应
-type SendMessageResponse struct {
-	Type      string                `json:"type"`
-	ProfileID string                `json:"profile_id"`
-	Status    string                `json:"status"` // completed / partial_failed / failed / not_logged_in / error
-	Results   []message.SendOutcome `json:"results"`
-	ErrorInfo string                `json:"error_info,omitempty"`
-}
-
 // SendSingleMessageRequest POST /accounts/send_single_message 请求体(单条私信, 非批量)
 type SendSingleMessageRequest struct {
 	ProfileName      string `json:"profile_name"`           // 浏览器名称
 	Platform         string `json:"platform"`               // 平台名
-	TargetURL        string `json:"target_url"`             // 对方账号URL(主页型平台: TikTok/Instagram/Facebook)
-	AccountName      string `json:"account_name,omitempty"` // 对方账号名(搜索型平台: X/Twitter, 如 @Widino)
+	TargetURL        string `json:"target_url"`             // 对方账号URL(统一参数, 所有平台均通过该链接定位对方)
+	AccountName      string `json:"account_name,omitempty"` // 对方账号名(可选; 为空时各平台从 target_url 自行解析)
 	MessageContent   string `json:"message_content"`        // 发消息的内容
 	Passcode         string `json:"passcode,omitempty"`     // 平台密码验证(如 X 私信 Passcode, 默认1472)
 	AccountID        int64  `json:"account_id"`             // 账号ID(由调用方传入, 用于追踪)
@@ -824,34 +776,11 @@ type SendSingleMessageResponse struct {
 	ErrorInfo string               `json:"error_info,omitempty"`
 }
 
-// FetchMessagesRequest POST /accounts/fetch_messages 请求体
-type FetchMessagesRequest struct {
-	ProfileName                string `json:"profile_name"`
-	Platform                   string `json:"platform"`
-	MaxConversations           int    `json:"max_conversations"`             // 默认10
-	MaxMessagesPerConversation int    `json:"max_messages_per_conversation"` // 默认20
-	Passcode                   string `json:"passcode,omitempty"`            // 平台密码验证(如 X 私信 Passcode, 默认1472)
-	Host                       string `json:"host"`
-	Port                       int    `json:"port"`
-	WaitSeconds                int    `json:"wait_seconds"`
-	UndetectablePath           string `json:"undetectable_path"`
-}
-
-// FetchMessagesResponse POST /accounts/fetch_messages 响应
-type FetchMessagesResponse struct {
-	Type          string                 `json:"type"`
-	ProfileID     string                 `json:"profile_id"`
-	Status        string                 `json:"status"` // completed / failed / not_logged_in / error
-	Conversations []message.Conversation `json:"conversations"`
-	ErrorInfo     string                 `json:"error_info,omitempty"`
-}
-
-// CheckReplyRequest POST /accounts/check_reply 请求体(判断对方是否回复)
 type CheckReplyRequest struct {
-	ProfileName        string `json:"profile_name"` // 浏览器名称
-	Platform           string `json:"platform"`     // 平台名
-	TargetURL          string `json:"target_url"`   // 对方账号URL(主页型平台)
-	AccountName        string `json:"account_name,omitempty"` // 对方账号名(搜索型平台: X/Twitter, 如 @ashly35856)
+	ProfileName        string `json:"profile_name"`           // 浏览器名称
+	Platform           string `json:"platform"`               // 平台名
+	TargetURL          string `json:"target_url"`             // 对方账号URL(统一参数, 所有平台均通过该链接定位对方)
+	AccountName        string `json:"account_name,omitempty"` // 对方账号名(可选; 为空时各平台从 target_url 自行解析)
 	Passcode           string `json:"passcode,omitempty"`     // 平台密码验证(如 X 私信 Passcode, 默认1472)
 	AccountID          int64  `json:"account_id"`             // 账号ID(由调用方传入, 用于追踪)
 	SinceIncomingCount int    `json:"since_incoming_count"`   // 上次已看到的对方消息数(增量基线)
@@ -866,11 +795,11 @@ type CheckReplyResponse struct {
 	Type        string            `json:"type"`
 	ProfileID   string            `json:"profile_id"`
 	AccountID   int64             `json:"account_id"`
-	Status      string            `json:"status"`       // completed / failed / not_logged_in / error
-	ReplyStatus string            `json:"reply_status"` // replied=对方已回复 / awaiting_reply=等待对方回复
-	HasReply    bool              `json:"has_reply"`    // 对方是否已回复
-	ReplyCount  int               `json:"reply_count"`  // 本次返回的对方新回复条数
-	Replies     []message.Message `json:"replies"`      // 对方发来的新回复(时间正序)
+	Status      string            `json:"status"`               // completed / failed / not_logged_in / error
+	ReplyStatus string            `json:"reply_status"`         // replied=对方已回复 / awaiting_reply=等待对方回复
+	HasReply    bool              `json:"has_reply"`            // 对方是否已回复
+	ReplyCount  int               `json:"reply_count"`          // 本次返回的对方新回复条数
+	Replies     []message.Message `json:"replies"`              // 对方发来的新回复(时间正序)
 	CheckedAt   string            `json:"checked_at,omitempty"` // 本次查询的服务端时间(RFC3339)
 	ErrorInfo   string            `json:"error_info,omitempty"`
 }
@@ -1154,114 +1083,7 @@ func callSinglePostUpdateAPI(ctx context.Context, logger *logx.Logger, endpoint 
 	return nil
 }
 
-// handleSendMessage POST /accounts/send_message 主动给对方账号批量发私信
-func handleSendMessage(logger *logx.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
-			return
-		}
-
-		var req SendMessageRequest
-		_, err := decodeJSONBody(r, &req, 1<<20)
-		if err != nil {
-			logger.Print("MSG", "send_message JSON解析失败: "+err.Error())
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
-			return
-		}
-
-		if req.ProfileName == "" || req.Platform == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name and platform are required"})
-			return
-		}
-		if len(req.Messages) == 0 {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "messages is required"})
-			return
-		}
-		if len(req.Messages) > 20 {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "messages exceeds limit 20"})
-			return
-		}
-		if req.Host == "" {
-			req.Host = accountDefaultHost
-		}
-		if req.Port == 0 {
-			req.Port = accountDefaultPort
-		}
-		if req.WaitSeconds <= 0 {
-			req.WaitSeconds = accountDefaultWaitS
-		}
-
-		tasks := make([]message.SendTask, 0, len(req.Messages))
-		for _, m := range req.Messages {
-			tasks = append(tasks, message.SendTask{
-				TargetURL:      m.TargetURL,
-				AccountName:    m.AccountName,
-				MessageContent: m.MessageContent,
-				Passcode:       m.Passcode,
-			})
-		}
-
-		logger.Print("MSG", fmt.Sprintf("收到私信请求: profile=%s, platform=%s, 任务数=%d", req.ProfileName, req.Platform, len(tasks)))
-
-		// 获取Profile操作锁(防止同一Profile的fetch/nurture/message并发执行导致浏览器混乱)
-		releaseLock := acquireProfileLock(req.ProfileName, logger)
-		defer releaseLock()
-
-		startRes, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-		if err != nil {
-			logger.Print("MSG", "启动Profile失败: "+err.Error())
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
-
-		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(r.Context(), startRes.Info.WebsocketLink, chromedp.NoModifyURL)
-		defer cancelAlloc()
-
-		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
-			chromedp.WithLogf(func(string, ...interface{}) {}),
-			chromedp.WithErrorf(func(string, ...interface{}) {}),
-		)
-		defer cancelBrowser()
-
-		chromedputil.CleanExtraTabs(browserCtx, logger, "MSG")
-
-		// 批量发送整体超时: 每任务最长约5分钟
-		msgCtx, cancelMsg := context.WithTimeout(browserCtx, time.Duration(len(tasks))*5*time.Minute)
-		defer cancelMsg()
-
-		sendRes, sendErr := sendMessageByPlatform(msgCtx, logger, req.Platform, tasks)
-
-		for i := range sendRes.Results {
-			sendRes.Results[i].ErrorInfo = scraper.SanitizeString(sendRes.Results[i].ErrorInfo)
-			sendRes.Results[i].TargetURL = scraper.SanitizeString(sendRes.Results[i].TargetURL)
-		}
-		sendRes.ErrorInfo = scraper.SanitizeString(sendRes.ErrorInfo)
-
-		stopProfileWithCleanup(context.Background(), logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
-
-		if sendErr != nil {
-			logger.Print("MSG", "私信流程失败: "+sendErr.Error())
-			writeJSON(w, http.StatusOK, SendMessageResponse{
-				Type:      "error",
-				ProfileID: startRes.ProfileID,
-				Status:    sendRes.Status,
-				Results:   sendRes.Results,
-				ErrorInfo: sendRes.ErrorInfo + " | " + sanitizeErr(sendErr),
-			})
-			return
-		}
-
-		logger.Print("MSG", fmt.Sprintf("私信流程完成: profile=%s, platform=%s, 状态=%s", req.ProfileName, req.Platform, sendRes.Status))
-		writeJSON(w, http.StatusOK, SendMessageResponse{
-			Type:      "success",
-			ProfileID: startRes.ProfileID,
-			Status:    sendRes.Status,
-			Results:   sendRes.Results,
-			ErrorInfo: sendRes.ErrorInfo,
-		})
-	}
-}
+// handleSendMessage POST /accounts/send_message 已移除(批量发送不再需要, 只保留单条发送)
 
 // handleSendSingleMessage POST /accounts/send_single_message 主动给单个对方账号发私信(非批量)
 func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
@@ -1283,8 +1105,8 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name and platform are required"})
 			return
 		}
-		if req.TargetURL == "" && req.AccountName == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "target_url or account_name is required"})
+		if req.TargetURL == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "target_url is required"})
 			return
 		}
 		if req.MessageContent == "" {
@@ -1386,94 +1208,7 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 	}
 }
 
-// handleFetchMessages POST /accounts/fetch_messages 获取会话列表与每个会话的最新消息
-func handleFetchMessages(logger *logx.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
-			return
-		}
-
-		var req FetchMessagesRequest
-		_, err := decodeJSONBody(r, &req, 1<<20)
-		if err != nil {
-			logger.Print("MSG", "fetch_messages JSON解析失败: "+err.Error())
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
-			return
-		}
-
-		if req.ProfileName == "" || req.Platform == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name and platform are required"})
-			return
-		}
-		if req.Host == "" {
-			req.Host = accountDefaultHost
-		}
-		if req.Port == 0 {
-			req.Port = accountDefaultPort
-		}
-		if req.WaitSeconds <= 0 {
-			req.WaitSeconds = accountDefaultWaitS
-		}
-
-		logger.Print("MSG", fmt.Sprintf("收到会话拉取请求: profile=%s, platform=%s, max_conversations=%d, max_messages=%d",
-			req.ProfileName, req.Platform, req.MaxConversations, req.MaxMessagesPerConversation))
-
-		releaseLock := acquireProfileLock(req.ProfileName, logger)
-		defer releaseLock()
-
-		startRes, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-		if err != nil {
-			logger.Print("MSG", "启动Profile失败: "+err.Error())
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
-
-		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(r.Context(), startRes.Info.WebsocketLink, chromedp.NoModifyURL)
-		defer cancelAlloc()
-
-		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
-			chromedp.WithLogf(func(string, ...interface{}) {}),
-			chromedp.WithErrorf(func(string, ...interface{}) {}),
-		)
-		defer cancelBrowser()
-
-		chromedputil.CleanExtraTabs(browserCtx, logger, "MSG")
-
-		fetchCtx, cancelFetch := context.WithTimeout(browserCtx, 20*time.Minute)
-		defer cancelFetch()
-
-		fetchRes, fetchErr := fetchMessagesByPlatform(fetchCtx, logger, req.Platform, message.FetchOptions{
-			MaxConversations:           req.MaxConversations,
-			MaxMessagesPerConversation: req.MaxMessagesPerConversation,
-			Passcode:                   req.Passcode,
-		})
-
-		stopProfileWithCleanup(context.Background(), logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
-
-		if fetchErr != nil {
-			logger.Print("MSG", "会话拉取失败: "+fetchErr.Error())
-			writeJSON(w, http.StatusOK, FetchMessagesResponse{
-				Type:          "error",
-				ProfileID:     startRes.ProfileID,
-				Status:        fetchRes.Status,
-				Conversations: fetchRes.Conversations,
-				ErrorInfo:     fetchRes.ErrorInfo + " | " + sanitizeErr(fetchErr),
-			})
-			return
-		}
-
-		logger.Print("MSG", fmt.Sprintf("会话拉取完成: profile=%s, platform=%s, 会话数=%d, 状态=%s",
-			req.ProfileName, req.Platform, len(fetchRes.Conversations), fetchRes.Status))
-		writeJSON(w, http.StatusOK, FetchMessagesResponse{
-			Type:          "success",
-			ProfileID:     startRes.ProfileID,
-			Status:        fetchRes.Status,
-			Conversations: fetchRes.Conversations,
-			ErrorInfo:     fetchRes.ErrorInfo,
-		})
-	}
-}
+// handleFetchMessages POST /accounts/fetch_messages 已移除(不再需要拉取会话列表)
 
 // handleCheckReply POST /accounts/check_reply 判断对方是否回复(单个对方账号)
 func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
@@ -1495,8 +1230,8 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name and platform are required"})
 			return
 		}
-		if req.TargetURL == "" && req.AccountName == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "target_url or account_name is required"})
+		if req.TargetURL == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "target_url is required"})
 			return
 		}
 		if req.Host == "" {
@@ -1510,9 +1245,6 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 		}
 
 		target := req.TargetURL
-		if target == "" {
-			target = req.AccountName
-		}
 		logger.Print("MSG", fmt.Sprintf("收到判断回复请求: profile=%s, platform=%s, account_id=%d, target=%s, since=%d",
 			req.ProfileName, req.Platform, req.AccountID, target, req.SinceIncomingCount))
 
@@ -2380,6 +2112,7 @@ func main() {
 		})
 	})
 
+	// [合并] 新增: 从 Git 合并过来的微信视频号发布功能
 	mux.HandleFunc("/weixin/publish", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
@@ -2601,10 +2334,9 @@ func main() {
 			UndetectablePort: res.Port,
 		})
 	})
-	// 私信模块: 主动发消息(批量/单条) + 会话最新消息拉取 + 判断回复
-	mux.HandleFunc("/accounts/send_message", handleSendMessage(logger))
+
+	// 私信模块: 主动发消息(单条) + 判断回复 [保留本地精简逻辑，移除批量发送]
 	mux.HandleFunc("/accounts/send_single_message", handleSendSingleMessage(logger))
-	mux.HandleFunc("/accounts/fetch_messages", handleFetchMessages(logger))
 	mux.HandleFunc("/accounts/check_reply", handleCheckReply(logger))
 
 	mux.HandleFunc("/api/browser/locked", chrome.GetLockedProfilesHandler(logger, "127.0.0.1", 25325))

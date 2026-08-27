@@ -16,31 +16,8 @@ import (
 )
 
 // ─────────────────────────── 选择器配置 ───────────────────────────
-// TODO(校准): 以下收件箱相关选择器为初始候选, 需在真实 TikTok 收件箱页面实测后校准。
-// 校准时只需修改这些数组, 无需改动流程代码。
+// 会话列表拉取已移除, 此处仅保留发送/回复流程用到的选择器(在下方各函数内联定义)。
 
-// ttConversationItemSelectors 收件箱左侧会话列表项候选选择器(按优先级)
-var ttConversationItemSelectors = []string{
-	`div[data-e2e="dm-link"]`,
-	`div[data-e2e="chat-list-item"]`,
-	`div[class*="DivItemContainer"] a[href*="/messages"]`,
-	`div[data-e2e="dm-inbox-list"] div[role="listitem"]`,
-}
-
-// ttMessageItemSelectors 会话内单条消息气泡候选选择器(按优先级)
-var ttMessageItemSelectors = []string{
-	`div[data-e2e="dm-chat-item"]`,
-	`div[class*="DivMessageCard"]`,
-	`div[class*="MessageItem"]`,
-	`div[class*="message-list"] > div`,
-}
-
-// ttMessageContainerSelectors 会话消息区容器候选选择器(用于判定会话已打开)
-var ttMessageContainerSelectors = []string{
-	`div[data-e2e="dm-chat"]`,
-	`div[class*="ChatList"]`,
-	`div[class*="message-list"]`,
-}
 
 // ─────────────────────────── 入口函数 ───────────────────────────
 
@@ -50,34 +27,82 @@ func SendTikTokMessage(ctx context.Context, logger *logx.Logger, tasks []message
 	return message.RunSend(ctx, logger, m, tasks), nil
 }
 
-// FetchTikTokConversations 会话列表拉取入口: 收件箱列表 + 每个会话的最新消息
-func FetchTikTokConversations(ctx context.Context, logger *logx.Logger, opts message.FetchOptions) (message.FetchConversationsResult, error) {
+// CheckTikTokReply 判断对方是否回复的入口:
+// 打开对方主页 -> 点击 Message 进入会话 -> 解析最新消息判断回复状态与回复内容。
+// 复用 message.RunCheckReply 统一流程, 具体页面元素与操作步骤待确认后校准选择器。
+func CheckTikTokReply(ctx context.Context, logger *logx.Logger, opts message.CheckReplyOptions) (message.CheckReplyResult, error) {
 	m := &tiktokMessenger{logger: logger}
-	return message.RunFetchConversations(ctx, logger, m, opts), nil
+	return message.RunCheckReply(ctx, logger, m, opts), nil
 }
 
 // tiktokMessenger 实现 message.MessengerActions
 type tiktokMessenger struct {
 	logger *logx.Logger
+	// partnerHandle 当前会话对方账号(不带@，小写)。用于判断消息方向/发送验证。
+	partnerHandle string
 }
 
 func (t *tiktokMessenger) Tag() string      { return "TT_MSG" }
-func (t *tiktokMessenger) InboxURL() string { return "https://www.tiktok.com/messages" }
 
-// CheckLogin 检测当前页面登录态: DOM探针找登录按钮 / 风控文案
-// 探针使用完整文案'Log in to TikTok'而非泛化的'Log in', 避免页面上"Log in to comment"等链接造成误判
+func normalizeTikTokHandle(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "@")
+	s = strings.ToLower(s)
+	return s
+}
+
+func extractTikTokHandleFromURL(u string) string {
+	u = strings.TrimSpace(u)
+	if u == "" {
+		return ""
+	}
+	// 常见主页: https://www.tiktok.com/@username 或 https://www.tiktok.com/@username?lang=en
+	if i := strings.Index(u, "/@"); i >= 0 {
+		rest := u[i+2:]
+		if j := strings.IndexAny(rest, "/?&"); j >= 0 {
+			rest = rest[:j]
+		}
+		return normalizeTikTokHandle(rest)
+	}
+	return ""
+}
+
+func (t *tiktokMessenger) setPartnerHandle(task message.SendTask) {
+	if task.AccountName != "" {
+		t.partnerHandle = normalizeTikTokHandle(task.AccountName)
+		return
+	}
+	t.partnerHandle = extractTikTokHandleFromURL(task.TargetURL)
+}
+
+func prefixRunes(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if s == "" || n <= 0 {
+		return ""
+	}
+	rs := []rune(s)
+	if len(rs) <= n {
+		return string(rs)
+	}
+	return string(rs[:n])
+}
+
+// CheckLogin 检测当前页面登录态: DOM探针找登录按钮 / 风控文案。
+// 探针使用完整文案'Log in to TikTok'并排除 script/style:
+// 页面内嵌的 JSON 翻译串(如 common_login_panel_title:"Log in to TikTok")位于 <script type="application/json"> 中,
+// 若不排除会把正常登录态误判为未登录。
 func (t *tiktokMessenger) CheckLogin(ctx context.Context) (string, error) {
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	var loginNodes []*cdp.Node
-	_ = chromedp.Run(checkCtx, chromedp.Nodes(`//*[contains(text(), 'Log in to TikTok')]`, &loginNodes, chromedp.BySearch))
+	_ = chromedp.Run(checkCtx, chromedp.Nodes(`//*[not(self::script) and not(self::style)][contains(text(), 'Log in to TikTok')]`, &loginNodes, chromedp.BySearch))
 	if len(loginNodes) > 0 {
 		return message.StatusNotLoggedIn, nil
 	}
 
 	var riskNodes []*cdp.Node
-	_ = chromedp.Run(checkCtx, chromedp.Nodes(`//*[contains(text(), 'Something went wrong') or contains(text(), '出现了一点问题') or contains(text(), 'We regret to inform you that we have discontinued operating TikTok in Hong Kong.')]`, &riskNodes, chromedp.BySearch))
+	_ = chromedp.Run(checkCtx, chromedp.Nodes(`//*[not(self::script) and not(self::style)][contains(text(), 'Something went wrong') or contains(text(), '出现了一点问题') or contains(text(), 'We regret to inform you that we have discontinued operating TikTok in Hong Kong.')]`, &riskNodes, chromedp.BySearch))
 	if len(riskNodes) > 0 {
 		return message.StatusAbnormal, nil
 	}
@@ -86,6 +111,7 @@ func (t *tiktokMessenger) CheckLogin(ctx context.Context) (string, error) {
 
 // OpenTargetProfile 导航到对方主页
 func (t *tiktokMessenger) OpenTargetProfile(ctx context.Context, task message.SendTask) error {
+	t.setPartnerHandle(task)
 	if err := chromedp.Run(ctx, chromedp.Navigate(task.TargetURL), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
 		return err
 	}
@@ -96,150 +122,88 @@ func (t *tiktokMessenger) OpenTargetProfile(ctx context.Context, task message.Se
 
 // OpenConversationFromProfile 在对方主页点击"Message/发消息"按钮进入会话
 func (t *tiktokMessenger) OpenConversationFromProfile(ctx context.Context, task message.SendTask) error {
+	// 仅发送流程需要“先关注再私信”；判断回复/拉取消息不应主动触发关注。
+	if strings.TrimSpace(task.MessageContent) != "" {
+		if err := ensureFollowing(ctx, t.logger); err != nil {
+			return err
+		}
+	}
 	return clickMessageButton(ctx, t.logger)
 }
 
-// SendInConversation 在已打开的会话中输入内容并点击发送
+// SendInConversation 在已打开的会话中输入内容并回车发送, 并确认消息出现在聊天记录中。
+// TikTok 私信输入框为 Draft.js(contenteditable), Enter 即发送。
 func (t *tiktokMessenger) SendInConversation(ctx context.Context, content string) error {
 	if err := waitAndFillMessage(ctx, t.logger, content); err != nil {
 		return err
 	}
-	if err := clickSendButton(ctx, t.logger); err != nil {
-		return err
-	}
-	// TODO(校准): 发送后可回读输入框是否清空/消息列表是否新增最后一条, 进一步确认发送成功
-	time.Sleep(2 * time.Second)
-	return nil
-}
 
-// FetchConversationList 解析收件箱会话列表(带30秒轮询等待列表渲染)
-func (t *tiktokMessenger) FetchConversationList(ctx context.Context, opts message.FetchOptions) ([]message.Conversation, error) {
-	sels, _ := json.Marshal(ttConversationItemSelectors)
-	js := fmt.Sprintf(`(function(){
-		var sels = %s;
-		var items = [];
-		for (var i = 0; i < sels.length; i++) {
-			try {
-				var found = document.querySelectorAll(sels[i]);
-				if (found && found.length) { items = Array.prototype.slice.call(found); break; }
-			} catch (e) {}
-		}
-		if (!items.length) return "[]";
-		var out = items.map(function(it, idx){
-			var txt = (it.innerText || '').split('\n').map(function(x){ return x.trim(); }).filter(Boolean);
-			var a = it.querySelector('a[href]') || (it.tagName === 'A' ? it : null);
-			var href = a ? a.href : '';
-			var unread = false;
-			try { unread = /unread|未读/i.test(it.innerHTML.slice(0, 2000)); } catch (e) {}
-			return {
-				conversation_id: href || ('idx:' + idx),
-				partner_name: txt[0] || '',
-				last_message: txt.length > 2 ? txt[1] || '' : '',
-				last_message_at: txt[txt.length - 1] || '',
-				partner_url: href,
-				unread: unread
-			};
-		});
-		return JSON.stringify(out);
-	})()`, string(sels))
-
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		var raw string
-		evalCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := chromedp.Run(evalCtx, chromedp.Evaluate(js, &raw))
-		cancel()
-		if err == nil && raw != "" && raw != "[]" {
-			var convs []message.Conversation
-			if err := json.Unmarshal([]byte(raw), &convs); err != nil {
-				return nil, fmt.Errorf("解析会话列表JSON失败: %v", err)
-			}
-			return convs, nil
-		}
-		select {
-		case <-time.After(2 * time.Second):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	return nil, errors.New("30秒内未在收件箱解析到会话列表(选择器可能需校准)")
-}
-
-// OpenConversation 从收件箱打开指定会话: 优先按会话链接导航, 否则按对方名称点击列表项
-func (t *tiktokMessenger) OpenConversation(ctx context.Context, conv message.Conversation) error {
-	if strings.HasPrefix(conv.ConversationID, "http") {
-		if err := chromedp.Run(ctx, chromedp.Navigate(conv.ConversationID), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
-			return err
-		}
-	} else {
-		sels, _ := json.Marshal(ttConversationItemSelectors)
-		js := fmt.Sprintf(`(function(sels, name){
-			for (var i = 0; i < sels.length; i++) {
-				var items;
-				try { items = document.querySelectorAll(sels[i]); } catch (e) { continue; }
-				for (var j = 0; j < items.length; j++) {
-					var txt = (items[j].innerText || '').trim();
-					if (name && txt.indexOf(name) !== -1) {
-						items[j].click();
-						return true;
-					}
-				}
-			}
-			return false;
-		})(%s, %q)`, string(sels), conv.PartnerName)
-		var clicked bool
-		clickCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := chromedp.Run(clickCtx, chromedp.Evaluate(js, &clicked))
-		cancel()
-		if err != nil {
-			return err
-		}
-		if !clicked {
-			return fmt.Errorf("未找到会话列表项: %s", conv.PartnerName)
-		}
+	t.logger.Print("TT_MSG4", "回车发送消息")
+	enterCtx, cancelEnter := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelEnter()
+	if err := chromedp.Run(enterCtx, chromedp.KeyEvent("\r")); err != nil {
+		return fmt.Errorf("回车发送失败: %v", err)
 	}
 
-	// 等待消息区渲染
-	containerSel := strings.Join(ttMessageContainerSelectors, ", ")
-	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	_ = chromedp.Run(waitCtx, chromedp.WaitVisible(containerSel, chromedp.ByQuery))
-	time.Sleep(2 * time.Second)
-	return nil
+	return verifySent(ctx, t.logger, t.partnerHandle, content)
 }
 
 // FetchConversationMessages 解析当前会话的最新消息(时间正序: 旧->新)
 func (t *tiktokMessenger) FetchConversationMessages(ctx context.Context) ([]message.Message, error) {
-	msgSels, _ := json.Marshal(ttMessageItemSelectors)
-	containerSel := strings.Join(ttMessageContainerSelectors, ", ")
-	js := fmt.Sprintf(`(function(contSel, msgSels){
+	partner := t.partnerHandle
+	containerSel := `div[data-e2e="dm-new-message-list"]`
+	js := fmt.Sprintf(`(function(contSel, partner){
 		var cont = document.querySelector(contSel);
 		if (!cont) return "[]";
-		var items = [];
-		for (var i = 0; i < msgSels.length; i++) {
-			try {
-				var found = cont.querySelectorAll(msgSels[i]);
-				if (found && found.length) { items = Array.prototype.slice.call(found); break; }
-			} catch (e) {}
-		}
+		var items = Array.prototype.slice.call(cont.querySelectorAll('[data-e2e="dm-new-chat-item"]'));
 		if (!items.length) return "[]";
-		var out = items.map(function(it){
-			var cls = '';
-			try { cls = it.className + ' ' + (it.parentElement ? it.parentElement.className : ''); } catch (e) {}
-			var outgoing = /self|right|mine|outgoing/i.test(cls);
-			var lines = (it.innerText || '').split('\n').map(function(x){ return x.trim(); }).filter(Boolean);
-			var content = lines.join(' ');
-			var sentAt = '';
-			var timeMatch = (it.getAttribute('aria-label') || '').match(/\d{1,2}:\d{2}/);
-			if (timeMatch) sentAt = timeMatch[0];
-			return {
+
+		function normHandle(h){
+			h = (h || '').trim();
+			h = h.replace(/^@+/, '');
+			h = h.toLowerCase();
+			return h;
+		}
+		partner = normHandle(partner);
+
+		var out = [];
+		for (var i = 0; i < items.length; i++) {
+			var it = items[i];
+			// 跳过提示类项（比如 "Message request accepted..."），它没有 dm-new-message-text
+			var p = it.querySelector('[data-e2e="dm-new-message-text"] p');
+			if (!p) continue;
+			var content = (p.innerText || p.textContent || '').trim();
+			if (!content) continue;
+
+			// 通过消息内头像链接判断发送方: a[href^="/@xxx"]
+			var a = it.querySelector('a[href^="/@"]');
+			var sender = '';
+			if (a && a.getAttribute('href')) {
+				sender = a.getAttribute('href');
+				if (sender.indexOf('/@') >= 0) sender = sender.split('/@')[1];
+				sender = sender.split('?')[0].split('/')[0];
+			}
+			sender = normHandle(sender);
+
+			var outgoing = false;
+			if (partner) {
+				// 单人私信场景: sender==partner 视为对方(incoming)，否则为我方(outgoing)
+				outgoing = sender !== partner;
+			} else {
+				// 兜底: 使用 class 关键字猜测方向
+				var cls = '';
+				try { cls = (it.className || '') + ' ' + (it.parentElement ? it.parentElement.className : ''); } catch(e) {}
+				outgoing = /self|right|mine|outgoing/i.test(cls);
+			}
+
+			out.push({
 				direction: outgoing ? 'outgoing' : 'incoming',
 				content: content,
-				sent_at: sentAt
-			};
-		});
+				sent_at: ''
+			});
+		}
 		return JSON.stringify(out);
-	})(%q, %s)`, containerSel, string(msgSels))
+	})(%q, %q)`, containerSel, partner)
 
 	var raw string
 	evalCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -256,15 +220,94 @@ func (t *tiktokMessenger) FetchConversationMessages(ctx context.Context) ([]mess
 
 // ─────────────────────────── 主页发消息辅助 ───────────────────────────
 
+// ensureFollowing 尽力确保已关注对方(未关注则点击 Follow)。
+// 关注按钮:
+// - 未关注: button[data-e2e="follow-button"] aria-label="Follow xxx", 文案 Follow
+// - 已关注: button[data-e2e="follow-button"] aria-label="Following xxx", 文案 Following
+// 注意: 部分账号点击 Follow 后按钮不会变为 Following(关注请求挂起/未生效), 但页面上的 Message 按钮仍可点击进入会话,
+// 因此这里采用"尽力而为"策略: 点击后短暂等待即返回, 不因"未变 Following"而阻断; 能否发消息由 clickMessageButton 兜底判定。
+func ensureFollowing(ctx context.Context, logger *logx.Logger) error {
+	logger.Print("TT_MSG2", "检查并关注对方账号")
+	btnSel := `button[data-e2e="follow-button"]`
+	jsState := fmt.Sprintf(`(function(){
+		var btn = document.querySelector(%q);
+		if (!btn) return "missing";
+		var label = (btn.getAttribute('aria-label') || '').trim();
+		var text = (btn.innerText || btn.textContent || '').trim();
+		if (/^Following\\b/i.test(label) || /^Following\\b/i.test(text)) return "following";
+		if (/^Follow\\b/i.test(label) || /^Follow\\b/i.test(text)) return "follow";
+		return "unknown:" + label + ":" + text;
+	})()`, btnSel)
+
+	// 先检测一次当前状态
+	var st string
+	detectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	_ = chromedp.Run(detectCtx, chromedp.Evaluate(jsState, &st))
+	cancel()
+
+	switch {
+	case st == "following":
+		logger.Print("TT_MSG2", "已关注对方账号")
+		return nil
+	case st == "missing":
+		// 无关注按钮(可能为本人主页等), 不阻断, 交给后续 Message 判定
+		logger.Print("TT_MSG2", "未找到关注按钮, 跳过关注直接尝试发消息")
+		return nil
+	case st == "follow":
+		// 未关注, 点击 Follow(尽力而为)
+		logger.Print("TT_MSG2", "点击关注按钮")
+		clickCtx, cancelClick := context.WithTimeout(ctx, 10*time.Second)
+		err := chromedp.Run(clickCtx,
+			chromedp.ScrollIntoView(btnSel, chromedp.ByQuery),
+			chromedp.WaitVisible(btnSel, chromedp.ByQuery),
+			chromedp.Click(btnSel, chromedp.ByQuery),
+		)
+		cancelClick()
+		if err != nil {
+			// 点击失败不阻断, 后续 clickMessageButton 会兜底判定能否发消息
+			logger.Print("TT_MSG2", "点击关注按钮失败(不阻断): "+err.Error())
+			return nil
+		}
+		logger.Print("TT_MSG2", "已点击关注按钮")
+		time.Sleep(3 * time.Second)
+
+		// 回读一次状态(仅日志): 未变 Following 也继续往下走
+		var st2 string
+		readCtx, cancelRead := context.WithTimeout(ctx, 5*time.Second)
+		_ = chromedp.Run(readCtx, chromedp.Evaluate(jsState, &st2))
+		cancelRead()
+		if st2 == "following" {
+			logger.Print("TT_MSG2", "已关注对方账号")
+		} else {
+			logger.Print("TT_MSG2", "关注后按钮未变为 Following(可能挂起/未生效), 继续尝试发消息")
+		}
+		return nil
+	default:
+		// 未知状态(如 unknown:xxx), 不阻断, 交给后续 Message 判定
+		logger.Print("TT_MSG2", "关注按钮状态未知("+st+"), 继续尝试发消息")
+		return nil
+	}
+}
+
 // clickMessageButton 查找并点击"Message"或"发消息"按钮
 func clickMessageButton(ctx context.Context, logger *logx.Logger) error {
 	logger.Print("TT_MSG3", "查找Message按钮")
 	candidates := []string{
-		`//button[contains(., 'Message') or contains(., '发消息') or contains(., '私信')]`,
-		`//div[@role='button' and (contains(., 'Message') or contains(., '发消息') or contains(., '私信'))]`,
-		`//a[contains(@href, '/direct') or contains(@href, '/message')]`,
+		// 优先结构化定位(data-e2e), 不依赖英文/中文文案
+		`a[href^="/messages"] button[data-e2e="message-button"]`,
+		`a[href*="/messages"] button[data-e2e="message-button"]`,
+		`button[data-e2e="message-button"]`,
+		`div[data-e2e="message-button"]`,
+		`a[href^="/messages"]`,
+		`a[href*="/messages"]`,
 		`//button[@data-e2e='message-button']`,
 		`//div[@data-e2e='message-button']`,
+		`//a[contains(@href, '/messages')]//button[@data-e2e='message-button']`,
+		`//a[contains(@href, '/messages')]`,
+		// 文案兜底(兼容多语言: Message / 发消息 / 私信 / Direct message)
+		`//button[contains(., 'Message') or contains(., '发消息') or contains(., '私信') or contains(., 'Direct message')]`,
+		`//div[@role='button' and (contains(., 'Message') or contains(., '发消息') or contains(., '私信'))]`,
+		`//a[contains(@href, '/direct') or contains(@href, '/message') or contains(@href, '/messages')]`,
 	}
 
 	deadline := time.Now().Add(60 * time.Second)
@@ -282,11 +325,20 @@ func clickMessageButton(ctx context.Context, logger *logx.Logger) error {
 			if len(nodes) > 0 {
 				logger.Print("TT_MSG3", "找到Message按钮: "+sel)
 				clickCtx, cancelClick := context.WithTimeout(ctx, 10*time.Second)
-				err := chromedp.Run(clickCtx,
-					chromedp.ScrollIntoView(sel, chromedp.BySearch),
-					chromedp.WaitVisible(sel, chromedp.BySearch),
-					chromedp.Click(sel, chromedp.BySearch),
-				)
+				var err error
+				if strings.HasPrefix(sel, "//") {
+					err = chromedp.Run(clickCtx,
+						chromedp.ScrollIntoView(sel, chromedp.BySearch),
+						chromedp.WaitVisible(sel, chromedp.BySearch),
+						chromedp.Click(sel, chromedp.BySearch),
+					)
+				} else {
+					err = chromedp.Run(clickCtx,
+						chromedp.ScrollIntoView(sel, chromedp.ByQuery),
+						chromedp.WaitVisible(sel, chromedp.ByQuery),
+						chromedp.Click(sel, chromedp.ByQuery),
+					)
+				}
 				cancelClick()
 				if err == nil {
 					logger.Print("TT_MSG3", "已点击Message按钮")
@@ -304,10 +356,15 @@ func clickMessageButton(ctx context.Context, logger *logx.Logger) error {
 func waitAndFillMessage(ctx context.Context, logger *logx.Logger, messageText string) error {
 	logger.Print("TT_MSG4", "等待消息输入框")
 	inputSelectors := []string{
-		`//textarea[@placeholder='Message' or @placeholder='发消息' or @placeholder='私信']`,
+		// 结构化定位(不依赖占位文案, 兼容多语言): Draft.js contenteditable 输入框
+		`div[data-e2e="dm-new-input-editor"] div[contenteditable="true"]`,
+		`div[data-e2e="message-input-area"] div[contenteditable="true"]`,
+		`div[aria-label="Send a message..."][contenteditable="true"]`,
 		`//div[@role='textbox' and @contenteditable='true']`,
-		`//input[@type='text' and (@placeholder='Message' or @placeholder='发消息')]`,
+		`//div[data-e2e='dm-new-input-editor']`,
 		`//div[data-e2e='message-input']`,
+		`//textarea[@placeholder='Message' or @placeholder='发消息' or @placeholder='私信']`,
+		`//input[@type='text' and (@placeholder='Message' or @placeholder='发消息')]`,
 	}
 
 	var foundSelector string
@@ -339,24 +396,33 @@ func waitAndFillMessage(ctx context.Context, logger *logx.Logger, messageText st
 	}
 
 	logger.Print("TT_MSG4", "找到消息输入框: "+foundSelector)
+
+	// 物理点击聚焦输入框(失败不阻断, JS 内仍有 el.focus() 兜底)
+	clickCtx, cancelClick := context.WithTimeout(ctx, 8*time.Second)
+	if strings.HasPrefix(foundSelector, "//") {
+		_ = chromedp.Run(clickCtx, chromedp.Click(foundSelector, chromedp.BySearch))
+	} else {
+		_ = chromedp.Run(clickCtx, chromedp.Click(foundSelector, chromedp.ByQuery))
+	}
+	cancelClick()
+
 	logger.Print("TT_MSG4", "填写消息内容")
 
-	// 使用JavaScript插入文本，兼容contenteditable元素
+	// 使用JavaScript插入文本，兼容contenteditable/Draft.js
 	var ok bool
-	js := fmt.Sprintf(`(function(msg){
-		var el = document.evaluate(%q, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-		if(!el) {
-			el = document.querySelector(%q);
-		}
+	js := fmt.Sprintf(`(function(sel, msg){
+		var el = null;
+		try { el = document.evaluate(sel, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; } catch(e) { el = null; }
+		if(!el) { try { el = document.querySelector(sel); } catch(e2) { el = null; } }
 		if(!el) return false;
 		el.focus();
 		try{
-			var sel = window.getSelection();
-			if(sel) {
-				sel.removeAllRanges();
+			var s = window.getSelection();
+			if(s) {
+				s.removeAllRanges();
 				var r = document.createRange();
 				r.selectNodeContents(el);
-				sel.addRange(r);
+				s.addRange(r);
 			}
 		}catch(e){}
 		try{
@@ -369,7 +435,7 @@ func waitAndFillMessage(ctx context.Context, logger *logx.Logger, messageText st
 			el.dispatchEvent(new Event('input', {bubbles:true}));
 		}
 		return true;
-	})(%q)`, foundSelector, strings.TrimPrefix(foundSelector, "//"), messageText)
+	})(%q, %q)`, foundSelector, messageText)
 
 	evalCtx, cancelEval := context.WithTimeout(ctx, 10*time.Second)
 	if err := chromedp.Run(evalCtx, chromedp.Evaluate(js, &ok)); err != nil {
@@ -445,4 +511,103 @@ func clickSendButton(ctx context.Context, logger *logx.Logger) error {
 		time.Sleep(1 * time.Second)
 	}
 	return errors.New("TT_MSG5 60秒内未找到发送按钮")
+}
+
+// verifySent 校验发送成功:
+// 轮询读取会话最后一条消息，要求：
+// 1) 最后一条为我方(outgoing)：通过“消息内头像链接 a[href^='/@'] 与 partnerHandle”比对判定；
+// 2) 最后一条文本与本次发送内容的前 N(默认5)个字符一致。
+//
+// 注意：若发送后对方立刻回复，最后一条可能变为对方消息，会按“未确认发送成功”处理（符合你给的 3/4/5.txt 用例）。
+func verifySent(ctx context.Context, logger *logx.Logger, partnerHandle string, content string) error {
+	needle := strings.TrimSpace(content)
+	if needle == "" {
+		return nil
+	}
+	wantPrefix := prefixRunes(needle, 5)
+	partnerHandle = normalizeTikTokHandle(partnerHandle)
+	containerSel := `div[data-e2e="dm-new-message-list"]`
+
+	js := fmt.Sprintf(`(function(contSel, partner){
+		function normHandle(h){
+			h = (h || '').trim();
+			h = h.replace(/^@+/, '');
+			h = h.toLowerCase();
+			return h;
+		}
+		partner = normHandle(partner);
+
+		var cont = document.querySelector(contSel);
+		if(!cont) return JSON.stringify({ok:false, reason:"no_container"});
+
+		var items = Array.prototype.slice.call(cont.querySelectorAll('[data-e2e="dm-new-chat-item"]'));
+		// 从后往前找最后一条真正的消息(带 dm-new-message-text)
+		for (var i = items.length - 1; i >= 0; i--) {
+			var it = items[i];
+			var p = it.querySelector('[data-e2e="dm-new-message-text"] p');
+			if (!p) continue;
+			var text = (p.innerText || p.textContent || '').trim();
+			if (!text) continue;
+
+			var a = it.querySelector('a[href^=\"/@\"]');
+			var sender = '';
+			if (a && a.getAttribute('href')) {
+				sender = a.getAttribute('href');
+				if (sender.indexOf('/@') >= 0) sender = sender.split('/@')[1];
+				sender = sender.split('?')[0].split('/')[0];
+			}
+			sender = normHandle(sender);
+			var outgoing = partner ? (sender !== partner) : false;
+
+			return JSON.stringify({ok:true, outgoing:outgoing, text:text, sender:sender});
+		}
+		return JSON.stringify({ok:false, reason:\"no_message\"});
+	})(%q, %q)`, containerSel, partnerHandle)
+
+	deadline := time.Now().Add(20 * time.Second)
+	lastReason := ""
+	lastTextPrefix := ""
+	for time.Now().Before(deadline) {
+		var raw string
+		evalCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_ = chromedp.Run(evalCtx, chromedp.Evaluate(js, &raw))
+		cancel()
+
+		var v struct {
+			OK       bool   `json:"ok"`
+			Reason   string `json:"reason"`
+			Outgoing bool   `json:"outgoing"`
+			Text     string `json:"text"`
+			Sender   string `json:"sender"`
+		}
+		if raw != "" {
+			_ = json.Unmarshal([]byte(raw), &v)
+		}
+
+		if v.OK {
+			lastReason = ""
+			lastTextPrefix = prefixRunes(v.Text, 5)
+			if v.Outgoing {
+				if lastTextPrefix == wantPrefix {
+					logger.Print("TT_MSG5", "消息已发送成功(最后一条为我方且前5字符匹配)")
+					return nil
+				}
+				lastReason = fmt.Sprintf("最后一条为我方消息但内容不匹配(期望前5=%q, 实际前5=%q)", wantPrefix, lastTextPrefix)
+			} else {
+				lastReason = fmt.Sprintf("会话最后一条仍是对方消息(sender=%q)", v.Sender)
+			}
+		} else {
+			lastReason = v.Reason
+		}
+
+		select {
+		case <-time.After(1 * time.Second):
+		case <-ctx.Done():
+			return fmt.Errorf("验证发送结果时上下文超时: %v", ctx.Err())
+		}
+	}
+	if lastReason != "" {
+		return fmt.Errorf("20秒内未确认消息发送成功: %s", lastReason)
+	}
+	return errors.New("20秒内未确认消息发送成功")
 }

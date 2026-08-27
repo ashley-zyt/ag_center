@@ -16,62 +16,49 @@ import (
 )
 
 // ─────────────────────────── 选择器配置 ───────────────────────────
-// TODO(校准): 以下选择器为初始候选, 需在真实页面实测后校准。校准时只改这些数组。
+// 依据真实页面 DOM(1/3/5/7/9/11.txt)校准。Instagram 采用 CSS-in-JS 的哈希类名,
+// 稳定性有限, 但以下是当前真实页面可用的定位方式; 若页面改版需重新校准这里。
 
-// igMessageButtonSelectors 对方主页"发消息"按钮候选(按优先级)
+// igFollowButtonSelector 主页关注按钮: 未关注/已关注均为 <button> 且类名含 "_aswp"。
+// 状态区分: 类名含 "_aswu" = 未关注(文案 Follow), 含 "_aswv" = 已关注(文案 Following)。
+const igFollowButtonSelector = `button[class*="_aswp"]`
+
+// igMessageButtonSelectors 对方主页"Message"按钮候选(仅已关注时出现)。
+// 注意区分导航栏的 "Messages"(复数) 与按钮的 "Message"。
 var igMessageButtonSelectors = []string{
-	`//button[normalize-space(.)='Message' or normalize-space(.)='发消息']`,
-	`//div[@role='button'][normalize-space(.)='Message' or normalize-space(.)='发消息']`,
-	`//a[contains(@href, '/direct/t/')]`,
-	`//button[contains(., 'Message') or contains(., '发消息')]`,
+	`//div[@role='button'][normalize-space(.)='Message']`,
+	`//div[@role='button'][contains(., 'Message') and not(contains(., 'Messages'))]`,
 }
 
-// igMessageInputSelectors 消息输入框候选
+// igMessageInputSelectors 消息输入框候选(Instagram 使用 Lexical contenteditable)。
 var igMessageInputSelectors = []string{
-	`//textarea[contains(@placeholder, 'Message') or contains(@placeholder, '发消息') or contains(@placeholder, '消息')]`,
-	`//div[@role='textbox' and @contenteditable='true']`,
-	`//textarea[@placeholder='Aa']`,
+	`div[data-lexical-editor="true"]`,
+	`div[contenteditable="true"][role="textbox"][aria-placeholder*="Message"]`,
+	`div[contenteditable="true"][role="textbox"]`,
 }
 
-// igSendButtonSelectors 发送按钮候选
-var igSendButtonSelectors = []string{
-	`//button[@type='submit']`,
-	`//div[@role='button'][@aria-label='发送' or @aria-label='Send']`,
-	`//button[contains(., 'Send') or contains(., '发送')]`,
-}
-
-// igConversationItemSelectors 收件箱会话列表项候选
-var igConversationItemSelectors = []string{
-	`a[href*="/direct/t/"]`,
-	`div[role="listitem"]`,
-	`div[aria-label="Chats"] a[href*="/direct/t/"]`,
-}
-
-// igMessageContainerSelectors 会话消息区容器候选(判定会话已打开)
-var igMessageContainerSelectors = []string{
-	`div[role="grid"]`,
-	`div[data-scope="messages_tab"]`,
-	`div[aria-label="消息"], div[aria-label="Messages"]`,
-}
-
-// igMessageItemSelectors 会话内单条消息气泡候选
-var igMessageItemSelectors = []string{
-	`div[role="row"]`,
-	`div[role="gridcell"]`,
-}
+// 消息方向标记(位于消息文本 div[dir="auto"] 的 class 后缀上):
+//   - xyk4ms5: 我方发出(outgoing, 白字)
+//   - x18lvrbx: 对方发来(incoming, 深色字)
+// 说明: 气泡 role="presentation" 上的 x1lu5o8o/x1t39747 是"气泡圆角/分组位置"类, 并非方向,
+// 不能用于判定方向(实测两者都会在 outgoing/incoming 中出现)。方向应看文本 div 的 class 后缀。
+const igOutgoingClass = "xyk4ms5"
+const igIncomingClass = "x18lvrbx"
+const igMessageTextClass = "x1yc453h"
 
 // ─────────────────────────── 入口函数 ───────────────────────────
 
-// SendInstagramMessage 批量主动私信入口
+// SendInstagramMessage 主动私信入口: 打开对方主页 -> 关注(如需) -> 点击Message -> 输入并发送
 func SendInstagramMessage(ctx context.Context, logger *logx.Logger, tasks []message.SendTask) (message.SendResult, error) {
 	m := &instagramMessenger{logger: logger}
 	return message.RunSend(ctx, logger, m, tasks), nil
 }
 
-// FetchInstagramConversations 会话列表拉取入口
-func FetchInstagramConversations(ctx context.Context, logger *logx.Logger, opts message.FetchOptions) (message.FetchConversationsResult, error) {
+// CheckInstagramReply 判断对方是否回复的入口:
+// 打开对方主页 -> 点击 Message 进入会话 -> 解析消息判断回复状态与回复内容。
+func CheckInstagramReply(ctx context.Context, logger *logx.Logger, opts message.CheckReplyOptions) (message.CheckReplyResult, error) {
 	m := &instagramMessenger{logger: logger}
-	return message.RunFetchConversations(ctx, logger, m, opts), nil
+	return message.RunCheckReply(ctx, logger, m, opts), nil
 }
 
 // instagramMessenger 实现 message.MessengerActions
@@ -80,10 +67,6 @@ type instagramMessenger struct {
 }
 
 func (m *instagramMessenger) Tag() string { return "IG_MSG" }
-
-// InboxURL 返回主页而非直接收件箱地址: IG 直接访问功能子页面(如 /reels/)曾触发
-// "Something went wrong", 经验上从主页入口进入更稳, 收件箱入口点击在 ensureInbox 中处理
-func (m *instagramMessenger) InboxURL() string { return "https://www.instagram.com/" }
 
 // CheckLogin 登录态检测: URL 被重定向到 /accounts/ 即未登录; 页面报错文案视为异常
 func (m *instagramMessenger) CheckLogin(ctx context.Context) (string, error) {
@@ -115,151 +98,53 @@ func (m *instagramMessenger) OpenTargetProfile(ctx context.Context, task message
 	return nil
 }
 
-// OpenConversationFromProfile 在对方主页点击"Message"按钮进入会话
+// OpenConversationFromProfile 在对方主页点击"Message"按钮进入会话。
+// 仅发送流程(MessageContent 非空)需要"先关注再私信"; 判断回复流程不主动关注。
 func (m *instagramMessenger) OpenConversationFromProfile(ctx context.Context, task message.SendTask) error {
+	if strings.TrimSpace(task.MessageContent) != "" {
+		if err := m.ensureFollowing(ctx); err != nil {
+			return err
+		}
+	}
 	return m.clickMessageButton(ctx)
 }
 
-// SendInConversation 输入内容并点击发送
+// SendInConversation 输入内容并回车发送, 并校验消息已出现在会话记录中。
 func (m *instagramMessenger) SendInConversation(ctx context.Context, content string) error {
 	if err := m.waitAndFillMessage(ctx, content); err != nil {
 		return err
 	}
-	if err := m.clickSendButton(ctx); err != nil {
-		return err
+
+	m.logger.Print("IG_MSG5", "回车发送消息")
+	enterCtx, cancelEnter := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelEnter()
+	if err := chromedp.Run(enterCtx, chromedp.KeyEvent("\r")); err != nil {
+		return fmt.Errorf("回车发送失败: %v", err)
 	}
-	// TODO(校准): 发送后可回读输入框是否清空进一步确认
-	time.Sleep(2 * time.Second)
-	return nil
+
+	return m.verifySent(ctx, content)
 }
 
-// FetchConversationList 解析收件箱会话列表(先经主页入口进入收件箱)
-func (m *instagramMessenger) FetchConversationList(ctx context.Context, opts message.FetchOptions) ([]message.Conversation, error) {
-	if err := m.ensureInbox(ctx); err != nil {
-		return nil, err
-	}
-
-	sels, _ := json.Marshal(igConversationItemSelectors)
-	js := fmt.Sprintf(`(function(){
-		var sels = %s;
-		var items = [];
-		for (var i = 0; i < sels.length; i++) {
-			try {
-				var found = document.querySelectorAll(sels[i]);
-				if (found && found.length) { items = Array.prototype.slice.call(found); break; }
-			} catch (e) {}
-		}
-		if (!items.length) return "[]";
-		var out = items.map(function(it, idx){
-			var lines = (it.innerText || '').split('\n').map(function(x){ return x.trim(); }).filter(Boolean);
-			var a = it.querySelector('a[href]') || (it.tagName === 'A' ? it : null);
-			var href = a ? a.href : '';
-			return {
-				conversation_id: href || ('idx:' + idx),
-				partner_name: lines[0] || '',
-				last_message: lines[1] || '',
-				last_message_at: lines[lines.length - 1] || '',
-				partner_url: href,
-				unread: false
-			};
-		});
-		return JSON.stringify(out);
-	})()`, string(sels))
-
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		var raw string
-		evalCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := chromedp.Run(evalCtx, chromedp.Evaluate(js, &raw))
-		cancel()
-		if err == nil && raw != "" && raw != "[]" {
-			var convs []message.Conversation
-			if err := json.Unmarshal([]byte(raw), &convs); err != nil {
-				return nil, fmt.Errorf("解析会话列表JSON失败: %v", err)
-			}
-			return convs, nil
-		}
-		select {
-		case <-time.After(2 * time.Second):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	return nil, errors.New("30秒内未在收件箱解析到会话列表(选择器可能需校准)")
-}
-
-// OpenConversation 从收件箱打开指定会话: 优先按会话链接导航, 否则按对方名称点击
-func (m *instagramMessenger) OpenConversation(ctx context.Context, conv message.Conversation) error {
-	if strings.HasPrefix(conv.ConversationID, "http") {
-		if err := chromedp.Run(ctx, chromedp.Navigate(conv.ConversationID), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
-			return err
-		}
-	} else {
-		sels, _ := json.Marshal(igConversationItemSelectors)
-		js := fmt.Sprintf(`(function(sels, name){
-			for (var i = 0; i < sels.length; i++) {
-				var items;
-				try { items = document.querySelectorAll(sels[i]); } catch (e) { continue; }
-				for (var j = 0; j < items.length; j++) {
-					var txt = (items[j].innerText || '').trim();
-					if (name && txt.indexOf(name) !== -1) {
-						items[j].click();
-						return true;
-					}
-				}
-			}
-			return false;
-		})(%s, %q)`, string(sels), conv.PartnerName)
-		var clicked bool
-		clickCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := chromedp.Run(clickCtx, chromedp.Evaluate(js, &clicked))
-		cancel()
-		if err != nil {
-			return err
-		}
-		if !clicked {
-			return fmt.Errorf("未找到会话列表项: %s", conv.PartnerName)
-		}
-	}
-
-	containerSel := strings.Join(igMessageContainerSelectors, ", ")
-	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	_ = chromedp.Run(waitCtx, chromedp.WaitVisible(containerSel, chromedp.ByQuery))
-	time.Sleep(2 * time.Second)
-	return nil
-}
-
-// FetchConversationMessages 解析当前会话的最新消息(时间正序)
-// TODO(校准): outgoing 判定目前用"气泡内无头像即自己发出"的启发式, 群聊/图片消息场景需校准
+// FetchConversationMessages 解析当前会话的消息(时间正序: 旧->新)。
+// 方向判定基于消息文本 div[dir="auto"] 的 class 后缀: xyk4ms5=我方(outgoing), x18lvrbx=对方(incoming)。
 func (m *instagramMessenger) FetchConversationMessages(ctx context.Context) ([]message.Message, error) {
-	msgSels, _ := json.Marshal(igMessageItemSelectors)
-	containerSel := strings.Join(igMessageContainerSelectors, ", ")
-	js := fmt.Sprintf(`(function(contSel, msgSels){
-		var cont = document.querySelector(contSel);
-		if (!cont) return "[]";
-		var items = [];
-		for (var i = 0; i < msgSels.length; i++) {
-			try {
-				var found = cont.querySelectorAll(msgSels[i]);
-				if (found && found.length) { items = Array.prototype.slice.call(found); break; }
-			} catch (e) {}
+	js := fmt.Sprintf(`(function(outCls, inCls, textCls){
+		var textDivs = Array.prototype.slice.call(document.querySelectorAll('div[dir="auto"][class*="' + textCls + '"]'));
+		var out = [];
+		for (var i = 0; i < textDivs.length; i++) {
+			var el = textDivs[i];
+			var cls = (el.className || '');
+			var text = (el.innerText || el.textContent || '').trim();
+			if (!text) continue;
+			var isOut = cls.indexOf(outCls) >= 0;
+			out.push({
+				direction: isOut ? 'outgoing' : 'incoming',
+				content: text,
+				sent_at: ''
+			});
 		}
-		if (!items.length) return "[]";
-		var out = items.map(function(it){
-			var outgoing = !it.querySelector('img');
-			var content = (it.innerText || '').split('\n').map(function(x){ return x.trim(); }).filter(Boolean).join(' ');
-			var sentAt = '';
-			var timeMatch = (it.getAttribute('aria-label') || '').match(/\d{1,2}:\d{2}/);
-			if (timeMatch) sentAt = timeMatch[0];
-			return {
-				direction: outgoing ? 'outgoing' : 'incoming',
-				content: content,
-				sent_at: sentAt
-			};
-		});
 		return JSON.stringify(out);
-	})(%q, %s)`, containerSel, string(msgSels))
+	})(%q, %q, %q)`, igOutgoingClass, igIncomingClass, igMessageTextClass)
 
 	var raw string
 	evalCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -276,65 +161,74 @@ func (m *instagramMessenger) FetchConversationMessages(ctx context.Context) ([]m
 
 // ─────────────────────────── 辅助函数 ───────────────────────────
 
-// ensureInbox 确保当前位于 /direct/ 收件箱; 不在则从主页点击私信入口进入
-func (m *instagramMessenger) ensureInbox(ctx context.Context) error {
-	var loc string
-	if err := chromedp.Run(ctx, chromedp.Location(&loc)); err != nil {
-		return err
-	}
-	if strings.Contains(loc, "/direct/") {
+// ensureFollowing 尽力确保已关注对方(未关注则点击 Follow)。
+// 注意: 实测部分账号点击 Follow 后按钮并不会变为 Following(关注请求挂起/未生效, 刷新后仍是 Follow),
+// 但此时 Message 按钮仍可点击并正常发消息。因此这里采用"尽力而为"策略:
+// 点击后短暂等待即返回, 不因"未变 Following"而阻断; 能否发消息交由 clickMessageButton 兜底判定。
+func (m *instagramMessenger) ensureFollowing(ctx context.Context) error {
+	m.logger.Print("IG_MSG2", "检查并关注对方账号")
+
+	jsState := fmt.Sprintf(`(function(){
+		var btns = document.querySelectorAll(%q);
+		for (var i = 0; i < btns.length; i++) {
+			var b = btns[i];
+			var cls = (b.className || '');
+			var text = (b.innerText || b.textContent || '').trim();
+			if (cls.indexOf('_aswv') >= 0 || /^Following$/i.test(text)) return 'following';
+			if (cls.indexOf('_aswu') >= 0 || /^Follow$/i.test(text)) return 'follow';
+		}
+		return 'missing';
+	})()`, igFollowButtonSelector)
+
+	// 先检测一次当前状态
+	var st string
+	detectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	_ = chromedp.Run(detectCtx, chromedp.Evaluate(jsState, &st))
+	cancel()
+
+	switch st {
+	case "following":
+		m.logger.Print("IG_MSG2", "已关注对方账号")
 		return nil
-	}
-
-	m.logger.Print("IG_MSG3", "当前不在收件箱, 尝试从主页入口进入")
-	if !strings.HasPrefix(loc, "https://www.instagram.com/") {
-		if err := chromedp.Run(ctx, chromedp.Navigate("https://www.instagram.com/"), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
-			return err
-		}
-		time.Sleep(2 * time.Second)
-	}
-
-	// 点击私信图标: 优先找 /direct/inbox 链接, 否则从 svg[aria-label] 向上找可点击容器
-	// (经验: 直接 click svg 会报 'click is not a function', 需点击其外层容器)
-	var via string
-	clickCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	js := `(function(){
-		var link = document.querySelector('a[href="/direct/inbox/"]') || document.querySelector('a[href*="/direct/inbox"]');
-		if (link) { link.click(); return 'link'; }
-		var svgs = document.querySelectorAll('svg[aria-label="Direct"], svg[aria-label="私信"], svg[aria-label="Messenger"]');
-		for (var i = 0; i < svgs.length; i++) {
-			var t = svgs[i].parentElement;
-			while (t && t !== document.body) {
-				if (t.tagName === 'A' || t.getAttribute('role') === 'button' || t.getAttribute('role') === 'link') { t.click(); return 'svg'; }
-				t = t.parentElement;
-			}
-		}
-		return '';
-	})()`
-	if err := chromedp.Run(clickCtx, chromedp.Evaluate(js, &via)); err != nil {
-		return err
-	}
-	if via == "" {
-		return errors.New("IG_MSG3 未找到收件箱入口(选择器需校准)")
-	}
-
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := chromedp.Run(ctx, chromedp.Location(&loc)); err == nil && strings.Contains(loc, "/direct/") {
-			time.Sleep(3 * time.Second)
+	case "missing":
+		// 无关注按钮(可能为本人主页等), 不阻断, 交给后续 Message 判定
+		m.logger.Print("IG_MSG2", "未找到关注按钮, 跳过关注直接尝试发消息")
+		return nil
+	case "follow":
+		// 未关注, 点击 Follow
+		m.logger.Print("IG_MSG2", "点击关注按钮")
+		clickCtx, cancelClick := context.WithTimeout(ctx, 10*time.Second)
+		err := chromedp.Run(clickCtx,
+			chromedp.ScrollIntoView(igFollowButtonSelector, chromedp.ByQuery),
+			chromedp.WaitVisible(igFollowButtonSelector, chromedp.ByQuery),
+			chromedp.Click(igFollowButtonSelector, chromedp.ByQuery),
+		)
+		cancelClick()
+		if err != nil {
+			// 点击失败不阻断, 后续 clickMessageButton 会兜底判定能否发消息
+			m.logger.Print("IG_MSG2", "点击关注按钮失败(不阻断): "+err.Error())
 			return nil
 		}
-		select {
-		case <-time.After(1 * time.Second):
-		case <-ctx.Done():
-			return ctx.Err()
+		m.logger.Print("IG_MSG2", "已点击关注按钮")
+		time.Sleep(3 * time.Second)
+
+		// 回读一次状态(仅日志): 未变 Following 也继续往下走
+		var st2 string
+		readCtx, cancelRead := context.WithTimeout(ctx, 5*time.Second)
+		_ = chromedp.Run(readCtx, chromedp.Evaluate(jsState, &st2))
+		cancelRead()
+		if st2 == "following" {
+			m.logger.Print("IG_MSG2", "已关注对方账号")
+		} else {
+			m.logger.Print("IG_MSG2", "关注后按钮未变为 Following(可能挂起/未生效), 继续尝试发消息")
 		}
+		return nil
+	default:
+		return nil
 	}
-	return errors.New("IG_MSG3 点击收件箱入口后未跳转到 /direct/")
 }
 
-// clickMessageButton 查找并点击对方主页的"Message/发消息"按钮
+// clickMessageButton 查找并点击对方主页的"Message"按钮
 func (m *instagramMessenger) clickMessageButton(ctx context.Context) error {
 	m.logger.Print("IG_MSG3", "查找Message按钮")
 	deadline := time.Now().Add(60 * time.Second)
@@ -363,110 +257,195 @@ func (m *instagramMessenger) clickMessageButton(ctx context.Context) error {
 		}
 		time.Sleep(1 * time.Second)
 	}
-	return errors.New("IG_MSG3 60秒内未找到Message按钮(对方可能关闭了私信)")
+	return errors.New("IG_MSG3 60秒内未找到Message按钮(对方可能关闭了私信或未关注)")
 }
 
-// waitAndFillMessage 等待消息输入框并填写内容
+// waitAndFillMessage 等待消息输入框并填写消息内容(Lexical contenteditable)。
+// 参考 publish 的 fillReelTitle 注入方式: 点击聚焦 -> selectAll -> insertText -> 派发 input 事件 -> shake(空格+退格),
+// 并在每轮注入后回读输入框内容做强校验, 确保文本真正写入 Lexical 编辑器, 避免"没输入进去却误判已发送"。
 func (m *instagramMessenger) waitAndFillMessage(ctx context.Context, messageText string) error {
 	m.logger.Print("IG_MSG4", "等待消息输入框")
-	var foundSelector string
+	foundSelector := m.findMessageInput(ctx)
+	if foundSelector == "" {
+		return errors.New("IG_MSG4 60秒内未找到消息输入框")
+	}
+	m.logger.Print("IG_MSG4", "找到消息输入框: "+foundSelector)
+
+	// 注入后回读文本的 JS
+	readJS := fmt.Sprintf(`(function(){
+		var el = document.querySelector(%q);
+		if (!el) return '';
+		return (el.innerText || el.textContent || '').trim();
+	})()`, foundSelector)
+
+	// 内核级注入 JS(参考 fillReelTitle)
+	injectJS := fmt.Sprintf(`(function(){
+		var el = document.querySelector(%q);
+		if (!el) return false;
+		el.focus();
+		document.execCommand('selectAll', false, null);
+		var ok = document.execCommand('insertText', false, %q);
+		var ev = new InputEvent('input', { bubbles: true, cancelable: true });
+		el.dispatchEvent(ev);
+		return ok;
+	})()`, foundSelector, messageText)
+
+	// 先尝试 3 轮"内核注入 + shake + 回读校验"
+	for retry := 0; retry < 3; retry++ {
+		// 物理点击 + 强聚焦
+		clickCtx, cancelClick := context.WithTimeout(ctx, 8*time.Second)
+		_ = chromedp.Run(clickCtx,
+			chromedp.Click(foundSelector, chromedp.ByQuery),
+			chromedp.Focus(foundSelector, chromedp.ByQuery),
+		)
+		cancelClick()
+		time.Sleep(300 * time.Millisecond)
+
+		var injectOk bool
+		injectCtx, cancelInject := context.WithTimeout(ctx, 8*time.Second)
+		_ = chromedp.Run(injectCtx, chromedp.Evaluate(injectJS, &injectOk))
+		cancelInject()
+
+		// shake: 空格 + 退格, 触发编辑器状态刷新
+		shakeCtx, cancelShake := context.WithTimeout(ctx, 5*time.Second)
+		_ = chromedp.Run(shakeCtx,
+			chromedp.SendKeys(foundSelector, " ", chromedp.ByQuery),
+			chromedp.Sleep(100*time.Millisecond),
+			chromedp.KeyEvent("\u0008"),
+		)
+		cancelShake()
+
+		// 回读校验
+		var currentText string
+		checkCtx, cancelCheck := context.WithTimeout(ctx, 5*time.Second)
+		_ = chromedp.Run(checkCtx, chromedp.Evaluate(readJS, &currentText))
+		cancelCheck()
+
+		if currentText != "" {
+			m.logger.Print("IG_MSG4", "已填写消息内容: "+currentText)
+			return nil
+		}
+		m.logger.Print("IG_MSG4", fmt.Sprintf("注入后回读为空, 第 %d 次重试...", retry+1))
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// 兜底: 键盘逐字输入(真实按键事件, Lexical 能可靠捕获)
+	m.logger.Print("IG_MSG4", "改用键盘逐字输入")
+	sendCtx, cancelSend := context.WithTimeout(ctx, 15*time.Second)
+	err := chromedp.Run(sendCtx,
+		chromedp.Click(foundSelector, chromedp.ByQuery),
+		chromedp.SendKeys(foundSelector, messageText, chromedp.ByQuery),
+	)
+	cancelSend()
+	if err != nil {
+		return fmt.Errorf("IG_MSG4 键盘输入消息失败: %v", err)
+	}
+
+	// 再次回读校验, 若仍为空则直接报错, 不进入发送步骤(避免空发送/误判已发送)
+	var finalText string
+	finalCtx, cancelFinal := context.WithTimeout(ctx, 5*time.Second)
+	_ = chromedp.Run(finalCtx, chromedp.Evaluate(readJS, &finalText))
+	cancelFinal()
+	if finalText == "" {
+		return errors.New("IG_MSG4 消息内容未能写入输入框")
+	}
+	m.logger.Print("IG_MSG4", "已使用键盘输入消息: "+finalText)
+	return nil
+}
+
+// findMessageInput 轮询查找消息输入框并返回命中的选择器(优先 CSS, 全部按 ByQuery 处理)
+func (m *instagramMessenger) findMessageInput(ctx context.Context) string {
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, sel := range igMessageInputSelectors {
 			var nodes []*cdp.Node
 			stepCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			_ = chromedp.Run(stepCtx, chromedp.Nodes(sel, &nodes, chromedp.BySearch))
+			_ = chromedp.Run(stepCtx, chromedp.Nodes(sel, &nodes, chromedp.ByQuery))
 			cancel()
 			if len(nodes) > 0 {
-				foundSelector = sel
-				break
+				return sel
 			}
-		}
-		if foundSelector != "" {
-			break
 		}
 		time.Sleep(1 * time.Second)
 	}
-	if foundSelector == "" {
-		return errors.New("IG_MSG4 60秒内未找到消息输入框")
-	}
-
-	m.logger.Print("IG_MSG4", "找到消息输入框: "+foundSelector)
-	var ok bool
-	js := fmt.Sprintf(`(function(msg){
-		var el = document.evaluate(%q, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-		if(!el) return false;
-		el.focus();
-		try{
-			var sel = window.getSelection();
-			if(sel) {
-				sel.removeAllRanges();
-				var r = document.createRange();
-				r.selectNodeContents(el);
-				sel.addRange(r);
-			}
-		}catch(e){}
-		try{
-			if(document.execCommand('insertText', false, msg)) return true;
-		}catch(e){}
-		el.textContent = msg;
-		try{
-			el.dispatchEvent(new InputEvent('input', {bubbles:true}));
-		}catch(e){
-			el.dispatchEvent(new Event('input', {bubbles:true}));
-		}
-		return true;
-	})(%q)`, foundSelector, messageText)
-
-	evalCtx, cancelEval := context.WithTimeout(ctx, 10*time.Second)
-	if err := chromedp.Run(evalCtx, chromedp.Evaluate(js, &ok)); err != nil {
-		cancelEval()
-		return fmt.Errorf("IG_MSG4 注入消息文本失败: %v", err)
-	}
-	cancelEval()
-
-	if !ok {
-		sendCtx, cancelSend := context.WithTimeout(ctx, 10*time.Second)
-		err := chromedp.Run(sendCtx, chromedp.SendKeys(foundSelector, messageText, chromedp.BySearch))
-		cancelSend()
-		if err != nil {
-			return fmt.Errorf("IG_MSG4 键盘输入消息失败: %v", err)
-		}
-		m.logger.Print("IG_MSG4", "已使用键盘输入消息")
-	} else {
-		m.logger.Print("IG_MSG4", "已填写消息内容")
-	}
-	return nil
+	return ""
 }
 
-// clickSendButton 查找并点击发送按钮
-func (m *instagramMessenger) clickSendButton(ctx context.Context) error {
-	m.logger.Print("IG_MSG5", "查找发送按钮")
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		for _, sel := range igSendButtonSelectors {
-			var nodes []*cdp.Node
-			stepCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			_ = chromedp.Run(stepCtx, chromedp.Nodes(sel, &nodes, chromedp.BySearch))
-			cancel()
+// verifySent 校验发送成功: 轮询读取会话最后一条消息, 要求其为"我方发出"且文本前缀与本次发送内容一致。
+func (m *instagramMessenger) verifySent(ctx context.Context, content string) error {
+	needle := strings.TrimSpace(content)
+	if needle == "" {
+		return nil
+	}
+	wantPrefix := prefixRunes(needle, 5)
 
-			if len(nodes) > 0 {
-				m.logger.Print("IG_MSG5", "找到发送按钮: "+sel)
-				clickCtx, cancelClick := context.WithTimeout(ctx, 10*time.Second)
-				err := chromedp.Run(clickCtx,
-					chromedp.ScrollIntoView(sel, chromedp.BySearch),
-					chromedp.WaitVisible(sel, chromedp.BySearch),
-					chromedp.Click(sel, chromedp.BySearch),
-				)
-				cancelClick()
-				if err == nil {
-					m.logger.Print("IG_MSG5", "已点击发送按钮")
-					time.Sleep(2 * time.Second)
+	js := fmt.Sprintf(`(function(outCls, inCls, textCls){
+		var textDivs = Array.prototype.slice.call(document.querySelectorAll('div[dir="auto"][class*="' + textCls + '"]'));
+		for (var i = textDivs.length - 1; i >= 0; i--) {
+			var el = textDivs[i];
+			var cls = (el.className || '');
+			var text = (el.innerText || el.textContent || '').trim();
+			if (!text) continue;
+			var isOut = cls.indexOf(outCls) >= 0;
+			return JSON.stringify({ok:true, outgoing:isOut, text:text});
+		}
+		return JSON.stringify({ok:false, reason:'no_message'});
+	})(%q, %q, %q)`, igOutgoingClass, igIncomingClass, igMessageTextClass)
+
+	deadline := time.Now().Add(20 * time.Second)
+	lastReason := ""
+	for time.Now().Before(deadline) {
+		var raw string
+		evalCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_ = chromedp.Run(evalCtx, chromedp.Evaluate(js, &raw))
+		cancel()
+
+		var v struct {
+			OK       bool   `json:"ok"`
+			Reason   string `json:"reason"`
+			Outgoing bool   `json:"outgoing"`
+			Text     string `json:"text"`
+		}
+		if raw != "" {
+			_ = json.Unmarshal([]byte(raw), &v)
+		}
+
+		if v.OK {
+			lastReason = ""
+			if v.Outgoing {
+				if prefixRunes(v.Text, 5) == wantPrefix {
+					m.logger.Print("IG_MSG5", "消息已发送成功(最后一条为我方且前5字符匹配)")
 					return nil
 				}
+				lastReason = fmt.Sprintf("最后一条为我方消息但内容不匹配(期望前5=%q, 实际前5=%q)", wantPrefix, prefixRunes(v.Text, 5))
+			} else {
+				lastReason = "会话最后一条仍是对方消息"
 			}
+		} else {
+			lastReason = v.Reason
 		}
-		time.Sleep(1 * time.Second)
+
+		select {
+		case <-time.After(1 * time.Second):
+		case <-ctx.Done():
+			return fmt.Errorf("验证发送结果时上下文超时: %v", ctx.Err())
+		}
 	}
-	return errors.New("IG_MSG5 60秒内未找到发送按钮")
+	if lastReason != "" {
+		return fmt.Errorf("20秒内未确认消息发送成功: %s", lastReason)
+	}
+	return errors.New("20秒内未确认消息发送成功")
+}
+
+// prefixRunes 返回字符串前 n 个字符(按 rune 计数, 兼容多字节)。
+func prefixRunes(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if s == "" || n <= 0 {
+		return ""
+	}
+	rs := []rune(s)
+	if len(rs) <= n {
+		return string(rs)
+	}
+	return string(rs[:n])
 }

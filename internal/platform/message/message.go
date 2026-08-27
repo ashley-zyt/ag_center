@@ -12,9 +12,6 @@ import (
 	"time"
 
 	"minimax_pro/internal/logx"
-	"minimax_pro/internal/platform/scraper"
-
-	"github.com/chromedp/chromedp"
 )
 
 // Message 单条私信
@@ -26,21 +23,10 @@ type Message struct {
 	ObservedAt string `json:"observed_at,omitempty"` // 本次查询观察到该消息的服务端时间(RFC3339, 仅check_reply填充)
 }
 
-// Conversation 会话(对方+最新消息)
-type Conversation struct {
-	ConversationID string    `json:"conversation_id"`           // 平台会话标识(优先存可定位的链接/ID,回发消息时用于重新打开)
-	PartnerName    string    `json:"partner_name"`              // 对方账号名
-	PartnerURL     string    `json:"partner_url,omitempty"`     // 对方主页链接(若可从会话项解析)
-	LastMessage    string    `json:"last_message,omitempty"`    // 会话列表中的最新消息预览
-	LastMessageAt  string    `json:"last_message_at,omitempty"` // 列表展示时间原文
-	Unread         bool      `json:"unread,omitempty"`          // 是否有未读标记
-	Messages       []Message `json:"messages,omitempty"`        // 打开会话后填充的最新消息(时间正序: 旧->新)
-}
-
 // SendTask 单条主动发送任务
 type SendTask struct {
-	TargetURL      string `json:"target_url"`             // 对方账号主页链接(主页型平台: TikTok/Instagram/Facebook)
-	AccountName    string `json:"account_name,omitempty"` // 对方账号名(搜索型平台: X/Twitter, 如 @Widino)
+	TargetURL      string `json:"target_url"`             // 对方账号主页链接(统一参数, 所有平台均通过该链接定位对方)
+	AccountName    string `json:"account_name,omitempty"` // 对方账号名(可选; 为空时各平台从 TargetURL 自行解析)
 	MessageContent string `json:"message_content"`        // 消息内容
 	Passcode       string `json:"passcode,omitempty"`     // 平台密码验证(如 X 私信 Passcode)
 }
@@ -60,24 +46,10 @@ type SendResult struct {
 	ErrorInfo string        `json:"error_info,omitempty"`
 }
 
-// FetchOptions 会话拉取选项
-type FetchOptions struct {
-	MaxConversations           int    // 最多处理的会话数, 0=默认10
-	MaxMessagesPerConversation int    // 每个会话最多保留的最新消息数, 0=默认20
-	Passcode                   string // 平台密码验证(如 X 私信 Passcode)
-}
-
-// FetchConversationsResult 会话拉取结果
-type FetchConversationsResult struct {
-	Status        string         `json:"status"` // completed / failed / not_logged_in / error
-	Conversations []Conversation `json:"conversations"`
-	ErrorInfo     string         `json:"error_info,omitempty"`
-}
-
 // CheckReplyOptions 判断对方是否回复的选项
 type CheckReplyOptions struct {
-	TargetURL          string // 对方账号主页链接(主页型平台: TikTok/Instagram/Facebook)
-	AccountName        string // 对方账号名(搜索型平台: X/Twitter, 如 @ashly35856)
+	TargetURL          string // 对方账号主页链接(统一参数, 所有平台均通过该链接定位对方)
+	AccountName        string // 对方账号名(可选; 为空时各平台从 TargetURL 自行解析)
 	Passcode           string // 平台密码验证(如 X 私信 Passcode)
 	SinceIncomingCount int    // [已废弃] 保留字段, 当前逻辑改为按"最后一条消息方向"判断, 不再使用该基线
 }
@@ -97,17 +69,12 @@ const (
 	StatusLoggedIn    = "logged_in"
 	StatusNotLoggedIn = "not_logged_in"
 	StatusAbnormal    = "abnormal"
-
-	defaultMaxConversations = 10
-	defaultMaxMessages      = 20
 )
 
 // MessengerActions 各平台需实现的私信原子操作接口
 type MessengerActions interface {
 	// Tag 日志标签, 如 "TT_MSG"
 	Tag() string
-	// InboxURL 平台私信收件箱页面地址(用于会话列表拉取与登录检测)
-	InboxURL() string
 	// CheckLogin 检测当前页面登录态, 返回 logged_in / not_logged_in / abnormal
 	CheckLogin(ctx context.Context) (string, error)
 	// OpenTargetProfile 准备发送入口并导航到位:
@@ -119,11 +86,6 @@ type MessengerActions interface {
 	OpenConversationFromProfile(ctx context.Context, task SendTask) error
 	// SendInConversation 在已打开的会话中输入内容并点击发送
 	SendInConversation(ctx context.Context, content string) error
-	// FetchConversationList 从收件箱解析会话列表(按最新在前);
-	// 平台可在此处理进入收件箱后的拦截(如 X 的 Passcode 验证)
-	FetchConversationList(ctx context.Context, opts FetchOptions) ([]Conversation, error)
-	// OpenConversation 从收件箱打开指定会话(依据 FetchConversationList 返回的标识)
-	OpenConversation(ctx context.Context, conv Conversation) error
 	// FetchConversationMessages 解析当前已打开会话的消息(时间正序: 旧->新)
 	FetchConversationMessages(ctx context.Context) ([]Message, error)
 }
@@ -349,102 +311,4 @@ func summarizeSend(outcomes []SendOutcome) string {
 	default:
 		return "partial_failed"
 	}
-}
-
-// RunFetchConversations 会话列表拉取统一流程:
-// 打开收件箱 -> 登录检测 -> 解析会话列表 -> 逐个打开会话解析最新消息 -> 汇总清洗返回。
-func RunFetchConversations(ctx context.Context, logger *logx.Logger, m MessengerActions, opts FetchOptions) FetchConversationsResult {
-	tag := m.Tag()
-	result := FetchConversationsResult{Status: "completed", Conversations: []Conversation{}}
-	if opts.MaxConversations <= 0 {
-		opts.MaxConversations = defaultMaxConversations
-	}
-	if opts.MaxMessagesPerConversation <= 0 {
-		opts.MaxMessagesPerConversation = defaultMaxMessages
-	}
-
-	logger.Print(tag+"1", fmt.Sprintf("开始会话拉取流程, 最多 %d 个会话, 每会话最新 %d 条", opts.MaxConversations, opts.MaxMessagesPerConversation))
-	logger.Print(tag+"2", "打开收件箱: "+m.InboxURL())
-	if err := chromedp.Run(ctx, chromedp.Navigate(m.InboxURL()), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
-		result.Status = "error"
-		result.ErrorInfo = fmt.Sprintf("%s2 打开收件箱失败: %v", tag, err)
-		return result
-	}
-	time.Sleep(3 * time.Second)
-
-	loginStatus, err := m.CheckLogin(ctx)
-	if err != nil {
-		logger.Print(tag+"2", "登录检测异常: "+err.Error())
-	}
-	if loginStatus != StatusLoggedIn {
-		result.Status = StatusNotLoggedIn
-		if loginStatus == StatusAbnormal {
-			result.ErrorInfo = fmt.Sprintf("%s2 账号状态异常", tag)
-		} else {
-			result.ErrorInfo = fmt.Sprintf("%s2 账号未登录", tag)
-		}
-		return result
-	}
-
-	logger.Print(tag+"3", "解析会话列表")
-	convs, err := m.FetchConversationList(ctx, opts)
-	if err != nil {
-		result.Status = "error"
-		result.ErrorInfo = fmt.Sprintf("%s3 解析会话列表失败: %v", tag, err)
-		return result
-	}
-	if len(convs) > opts.MaxConversations {
-		convs = convs[:opts.MaxConversations]
-	}
-	logger.Print(tag+"3", fmt.Sprintf("解析到 %d 个会话(截取前 %d 个)", len(convs), opts.MaxConversations))
-
-	for i := range convs {
-		logger.Print(tag+"4", fmt.Sprintf("[%d/%d] 打开会话: %s", i+1, len(convs), convs[i].PartnerName))
-		if err := m.OpenConversation(ctx, convs[i]); err != nil {
-			logger.Print(tag+"4", fmt.Sprintf("打开会话失败, 跳过: %v", err))
-			continue
-		}
-		msgs, err := m.FetchConversationMessages(ctx)
-		if err != nil {
-			logger.Print(tag+"5", fmt.Sprintf("解析消息失败, 跳过: %v", err))
-			continue
-		}
-		if len(msgs) > opts.MaxMessagesPerConversation {
-			msgs = msgs[len(msgs)-opts.MaxMessagesPerConversation:]
-		}
-		convs[i].Messages = msgs
-		if i < len(convs)-1 {
-			wait := time.Duration(2+rand.Intn(4)) * time.Second
-			logger.Print(tag+"5", fmt.Sprintf("会话处理完成, 等待 %v 后继续", wait))
-			select {
-			case <-time.After(wait):
-			case <-ctx.Done():
-				result.Status = "error"
-				result.ErrorInfo = fmt.Sprintf("%s5 上下文超时/取消: %v", tag, ctx.Err())
-				result.Conversations = sanitizeConversations(convs)
-				return result
-			}
-		}
-	}
-
-	result.Conversations = sanitizeConversations(convs)
-	logger.Print(tag+"6", fmt.Sprintf("会话拉取流程结束, 返回 %d 个会话, 状态: %s", len(result.Conversations), result.Status))
-	return result
-}
-
-// sanitizeConversations 清洗会话数据中的非法UTF-8字符, 防止Rails端编码错误
-func sanitizeConversations(convs []Conversation) []Conversation {
-	for i := range convs {
-		convs[i].ConversationID = scraper.SanitizeString(convs[i].ConversationID)
-		convs[i].PartnerName = scraper.SanitizeString(convs[i].PartnerName)
-		convs[i].PartnerURL = scraper.SanitizeString(convs[i].PartnerURL)
-		convs[i].LastMessage = scraper.SanitizeString(convs[i].LastMessage)
-		convs[i].LastMessageAt = scraper.SanitizeString(convs[i].LastMessageAt)
-		for j := range convs[i].Messages {
-			convs[i].Messages[j].SenderName = scraper.SanitizeString(convs[i].Messages[j].SenderName)
-			convs[i].Messages[j].Content = scraper.SanitizeString(convs[i].Messages[j].Content)
-			convs[i].Messages[j].SentAt = scraper.SanitizeString(convs[i].Messages[j].SentAt)
-		}
-	}
-	return convs
 }

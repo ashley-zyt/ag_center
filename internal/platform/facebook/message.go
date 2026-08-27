@@ -40,13 +40,6 @@ var fbSendButtonSelectors = []string{
 	`//span[text()='发送' or text()='Send']/ancestor::div[@role='button'][1]`,
 }
 
-// fbConversationItemSelectors 收件箱会话列表项候选
-var fbConversationItemSelectors = []string{
-	`a[href*="/messages/t/"][role="link"]`,
-	`a[href*="/messages/t/"]`,
-	`div[role="row"][aria-label]`,
-}
-
 // fbMessageContainerSelectors 会话消息区容器候选(判定会话已打开)
 var fbMessageContainerSelectors = []string{
 	`div[role="main"]`,
@@ -67,19 +60,12 @@ func SendFacebookMessage(ctx context.Context, logger *logx.Logger, tasks []messa
 	return message.RunSend(ctx, logger, m, tasks), nil
 }
 
-// FetchFacebookConversations 会话列表拉取入口
-func FetchFacebookConversations(ctx context.Context, logger *logx.Logger, opts message.FetchOptions) (message.FetchConversationsResult, error) {
-	m := &facebookMessenger{logger: logger}
-	return message.RunFetchConversations(ctx, logger, m, opts), nil
-}
-
 // facebookMessenger 实现 message.MessengerActions
 type facebookMessenger struct {
 	logger *logx.Logger
 }
 
 func (m *facebookMessenger) Tag() string      { return "FB_MSG" }
-func (m *facebookMessenger) InboxURL() string { return "https://www.facebook.com/messages/" }
 
 // CheckLogin 登录态检测: 未登录会被重定向到 /login 或渲染登录表单; checkpoint 视为风控异常
 func (m *facebookMessenger) CheckLogin(ctx context.Context) (string, error) {
@@ -135,106 +121,6 @@ func (m *facebookMessenger) SendInConversation(ctx context.Context, content stri
 		return err
 	}
 	// TODO(校准): 发送后可回读输入框是否清空进一步确认
-	time.Sleep(2 * time.Second)
-	return nil
-}
-
-// FetchConversationList 解析收件箱会话列表(带30秒轮询等待列表渲染)
-func (m *facebookMessenger) FetchConversationList(ctx context.Context, opts message.FetchOptions) ([]message.Conversation, error) {
-	sels, _ := json.Marshal(fbConversationItemSelectors)
-	js := fmt.Sprintf(`(function(){
-		var sels = %s;
-		var items = [];
-		var seen = {};
-		for (var i = 0; i < sels.length; i++) {
-			try {
-				var found = document.querySelectorAll(sels[i]);
-				for (var k = 0; k < found.length; k++) {
-					var href = found[k].href || '';
-					if (href && seen[href]) continue;
-					if (href) seen[href] = true;
-					items.push(found[k]);
-				}
-				if (items.length) break;
-			} catch (e) {}
-		}
-		if (!items.length) return "[]";
-		var out = items.map(function(it, idx){
-			var lines = (it.innerText || (it.getAttribute('aria-label') || '')).split('\n').map(function(x){ return x.trim(); }).filter(Boolean);
-			var a = it.querySelector('a[href]') || (it.tagName === 'A' ? it : null);
-			var href = a ? a.href : (it.href || '');
-			return {
-				conversation_id: href || ('idx:' + idx),
-				partner_name: lines[0] || '',
-				last_message: lines.length > 2 ? lines[1] || '' : '',
-				last_message_at: lines[lines.length - 1] || '',
-				partner_url: '',
-				unread: false
-			};
-		});
-		return JSON.stringify(out);
-	})()`, string(sels))
-
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		var raw string
-		evalCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := chromedp.Run(evalCtx, chromedp.Evaluate(js, &raw))
-		cancel()
-		if err == nil && raw != "" && raw != "[]" {
-			var convs []message.Conversation
-			if err := json.Unmarshal([]byte(raw), &convs); err != nil {
-				return nil, fmt.Errorf("解析会话列表JSON失败: %v", err)
-			}
-			return convs, nil
-		}
-		select {
-		case <-time.After(2 * time.Second):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	return nil, errors.New("30秒内未在收件箱解析到会话列表(选择器可能需校准)")
-}
-
-// OpenConversation 从收件箱打开指定会话: 优先按会话链接导航, 否则按对方名称点击
-func (m *facebookMessenger) OpenConversation(ctx context.Context, conv message.Conversation) error {
-	if strings.HasPrefix(conv.ConversationID, "http") {
-		if err := chromedp.Run(ctx, chromedp.Navigate(conv.ConversationID), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
-			return err
-		}
-	} else {
-		sels, _ := json.Marshal(fbConversationItemSelectors)
-		js := fmt.Sprintf(`(function(sels, name){
-			for (var i = 0; i < sels.length; i++) {
-				var items;
-				try { items = document.querySelectorAll(sels[i]); } catch (e) { continue; }
-				for (var j = 0; j < items.length; j++) {
-					var txt = (items[j].innerText || '').trim();
-					if (name && txt.indexOf(name) !== -1) {
-						items[j].click();
-						return true;
-					}
-				}
-			}
-			return false;
-		})(%s, %q)`, string(sels), conv.PartnerName)
-		var clicked bool
-		clickCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := chromedp.Run(clickCtx, chromedp.Evaluate(js, &clicked))
-		cancel()
-		if err != nil {
-			return err
-		}
-		if !clicked {
-			return fmt.Errorf("未找到会话列表项: %s", conv.PartnerName)
-		}
-	}
-
-	containerSel := strings.Join(fbMessageContainerSelectors, ", ")
-	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	_ = chromedp.Run(waitCtx, chromedp.WaitVisible(containerSel, chromedp.ByQuery))
 	time.Sleep(2 * time.Second)
 	return nil
 }
