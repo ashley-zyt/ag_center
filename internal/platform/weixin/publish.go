@@ -1277,15 +1277,15 @@ func waitAndUploadFile(fs frameScope, iframeFS frameScope, logger *logx.Logger, 
 	snapshotDumped := false
 	waitStart := time.Now()
 	// 双重等待机制：
-	// 1. 通过 select 监听 chooserDone 通道，如果拦截器已经完成文件填入，直接返回成功。
+	// 1. 通过 select 监听 chooserDone 通道，拦截器填入文件后还需验证上传真正启动（指纹浏览器内核可能不派发 change）。
 	// 2. 否则，轮询查找 uploadSelectors 中定义的选择器，看文件上传控件是否出现在DOM中。
 	for time.Now().Before(deadline) {
 		loopCount++
-		// 已通过拦截文件选择框填入文件，直接返回（上传已由页面启动）
+		// 已通过拦截文件选择框填入文件：验证上传真正启动后返回（实测指纹浏览器下 setFileInputFiles 可能不触发前端响应）
 		select {
 		case <-chooserDone:
-			logger.Print("WX3", "已通过文件选择框拦截完成文件填入")
-			return nil
+			logger.Print("WX3", "已通过文件选择框拦截完成文件填入，验证上传启动...")
+			return finishAfterChooser(fs, logger, absVideoPath)
 		default:
 		}
 		// 动态监测页面是否突发账号异常（仅匹配账号受限类专属文案）
@@ -1306,8 +1306,8 @@ func waitAndUploadFile(fs frameScope, iframeFS frameScope, logger *logx.Logger, 
 			// 阻塞等待拦截器处理完成（handleFileChooser 需要处理窗口，不能用 default 立即放行）
 			select {
 			case <-chooserDone:
-				logger.Print("WX3", "已通过文件选择框拦截完成文件填入")
-				return nil
+				logger.Print("WX3", "已通过文件选择框拦截完成文件填入，验证上传启动...")
+				return finishAfterChooser(fs, logger, absVideoPath)
 			case <-time.After(6 * time.Second):
 			}
 			// 路线2：选择框未弹出时，CDP 按 BackendNodeID 直接注入文件到沙箱 iframe 的 input（不依赖可见性/焦点）
@@ -1323,8 +1323,8 @@ func waitAndUploadFile(fs frameScope, iframeFS frameScope, logger *logx.Logger, 
 				trustedClickFileInput(fs, logger)
 				select {
 				case <-chooserDone:
-					logger.Print("WX3", "已通过文件选择框拦截完成文件填入")
-					return nil
+					logger.Print("WX3", "已通过文件选择框拦截完成文件填入，验证上传启动...")
+					return finishAfterChooser(fs, logger, absVideoPath)
 				case <-time.After(6 * time.Second):
 				}
 				logger.Print("WX3", "两条注入路线均未确认上传启动，交给WX4继续等待并复查")
@@ -1598,9 +1598,12 @@ func waitForUploadComplete(fs frameScope, logger *logx.Logger) error {
 			state = "waiting"
 		}
 
-		// 每 5 轮(~15秒)输出一次状态，方便排查卡住原因
+		// 每 5 轮(~15秒)输出一次状态，方便排查卡住原因；持续 waiting 时附页面诊断（指纹浏览器环境定位关键）
 		if loopCount%5 == 0 {
 			logger.Print("WX4", fmt.Sprintf("上传状态轮询中: state=%s (已等待%ds)", state, loopCount*3))
+			if state == "waiting" && loopCount%10 == 0 {
+				logger.Print("WX4", "页面诊断: "+uploadDiagnostics(fs))
+			}
 		}
 
 		time.Sleep(3 * time.Second)
@@ -1608,6 +1611,89 @@ func waitForUploadComplete(fs frameScope, logger *logx.Logger) error {
 
 	// 超时后不报错，继续流程（可能是小视频已上传完成但检测未命中）
 	logger.Print("WX4", "等待上传超时(5分钟)，继续执行后续流程")
+	logger.Print("WX4", "超时诊断: "+uploadDiagnostics(fs))
+	return nil
+}
+
+// uploadDiagnostics 输出沙箱内当前页面状态摘要（body前150字、file input数、按钮文案），供卡住时定位。
+func uploadDiagnostics(fs frameScope) string {
+	var info string
+	_ = fs.evaluate(&info, `(function(){
+		var body = document.body ? (document.body.innerText || '') : '';
+		var inputs = document.querySelectorAll('input[type="file"]').length;
+		var btns = [];
+		var bs = document.querySelectorAll('button');
+		for (var i = 0; i < bs.length && btns.length < 6; i++) {
+			var t = ((bs[i].innerText || '') + '').trim();
+			if (t && t.length < 12) btns.push(t);
+		}
+		return 'body[' + body.replace(/\s+/g, ' ').slice(0, 150) + '] fileInputs=' + inputs + ' buttons=[' + btns.join(',') + ']';
+	})()`, 5*time.Second)
+	if info == "" {
+		return "沙箱内无任何可诊断内容(子应用可能未渲染或不可达)"
+	}
+	return info
+}
+
+// confirmUploadStarted 轮询检测上传启动信号（正在上传/进度/重新上传等）。
+func confirmUploadStarted(fs frameScope, tries int) bool {
+	for i := 0; i < tries; i++ {
+		if uploadStartedCrossFrame(fs) {
+			return true
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return false
+}
+
+// dispatchChangeCrossFrame 对沙箱内仍持有文件的 file input 补发 change/input 事件（兜底：
+// 部分内核 setFileInputFiles 接受路径不派发真实 change，前端组件无感知）。
+func dispatchChangeCrossFrame(fs frameScope, logger *logx.Logger) {
+	var info string
+	_ = fs.evaluate(&info, `(function(){
+		var els = document.querySelectorAll('input[type="file"]');
+		for (var i = 0; i < els.length; i++) {
+			if (els[i].files && els[i].files.length > 0) {
+				var W = els[i].ownerDocument.defaultView;
+				try { els[i].dispatchEvent(new W.Event('change', {bubbles: true})); } catch(e){}
+				try { els[i].dispatchEvent(new W.Event('input', {bubbles: true})); } catch(e2){}
+				return 'dispatched input.files=' + els[i].files.length;
+			}
+		}
+		return '';
+	})()`, 5*time.Second)
+	if info != "" {
+		logger.Print("WX3", "补发change事件: "+info)
+	}
+}
+
+// finishAfterChooser 选择框拦截填入完成后的统一收尾：先验证上传启动，未启动则依次兜底：
+// 补发change → 重新注入 → 再可信点击。均未确认则告警并交 WX4（附诊断，便于指纹浏览器环境定位）。
+func finishAfterChooser(fs frameScope, logger *logx.Logger, absVideoPath string) error {
+	if confirmUploadStarted(fs, 6) {
+		logger.Print("WX3", "上传已启动（选择框路线生效）")
+		return nil
+	}
+	logger.Print("WX3", "填入后12秒未检测到上传启动（前端可能未消费文件），开始兜底")
+	dispatchChangeCrossFrame(fs, logger)
+	if confirmUploadStarted(fs, 4) {
+		logger.Print("WX3", "上传已启动（补发change生效）")
+		return nil
+	}
+	injectFileCrossFrame(fs, logger, absVideoPath)
+	if confirmUploadStarted(fs, 4) {
+		logger.Print("WX3", "上传已启动（重新注入生效）")
+		return nil
+	}
+	trustedClickFileInput(fs, logger)
+	select {
+	case <-time.After(8 * time.Second):
+	}
+	if uploadStartedCrossFrame(fs) {
+		logger.Print("WX3", "上传已启动（再次可信点击生效）")
+		return nil
+	}
+	logger.Print("WX3", "【警告】所有填入路线均未确认上传启动，交WX4继续等待 诊断: "+uploadDiagnostics(fs))
 	return nil
 }
 
