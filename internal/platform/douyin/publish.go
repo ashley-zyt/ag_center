@@ -307,13 +307,16 @@ func waitAndUploadFile(ctx context.Context, logger *logx.Logger, absVideoPath st
 // waitForUploadComplete 智能等待视频上传完成。
 // 检测条件：上传进度文本消失 + 封面选择区/发布按钮出现。
 // 轮询期间主动关闭"视频预览功能"等引导弹窗，防止弹窗遮挡导致流程卡住。
-// 网速慢导致"上传失败，重新上传"时，自动点击重新上传并重新注入文件，最多重试3次。
+// 网速慢导致"上传失败，重新上传"时：连续2次确认失败后才触发重试（防抖）；
+// 重试核心是重新注入视频文件（点击"重新上传"会弹文件选择框，SetUploadFiles 即选中文件并确认），
+// 注入后观察15秒，最多重试5次。
 // 最长等待 5 分钟（每次重试额外延长 2 分钟）。
 func waitForUploadComplete(ctx context.Context, logger *logx.Logger, absVideoPath string) error {
 	logger.Print("DY4", "智能等待视频上传完成...")
 	deadline := time.Now().Add(5 * time.Minute)
 	loopCount := 0
 	retryCount := 0
+	failedStreak := 0
 
 	for time.Now().Before(deadline) {
 		loopCount++
@@ -365,45 +368,103 @@ func waitForUploadComplete(ctx context.Context, logger *logx.Logger, absVideoPat
 		})()`, &state))
 		cancelCheck()
 
+		// 非失败状态下重置失败连续计数（防抖用）
+		if state != "failed" {
+			failedStreak = 0
+		}
+
 		if state == "done" {
 			logger.Print("DY4", "视频上传完成，检测到封面选择区/发布按钮已就绪")
 			return nil
 		}
 
-		// 上传失败：点击"上传失败，重新上传"，并重新注入视频文件（防止点击后重新弹出文件选择框）
+		// 上传失败：防抖确认后重新注入视频文件重启上传。
+		// 关键事实：点击"上传失败，重新上传"后页面会重新弹出文件选择框，等待选中文件并确认；
+		// 对 file input 执行 SetUploadFiles(DOM.setFileInputFiles) 本身就是"接受文件选择对话框"，
+		// 等价于选中文件+点击确认，因此重试必须以重新注入文件为核心，单纯点击无效。
 		if state == "failed" {
-			retryCount++
-			if retryCount > 3 {
-				return errors.New("DY4 上传失败，重试3次后仍无法上传")
-			}
-			logger.Print("DY4", fmt.Sprintf("检测到上传失败，尝试点击'重新上传' (第%d次)", retryCount))
-			var retryClicked bool
-			retryCtx, cancelRetry := context.WithTimeout(ctx, 5*time.Second)
-			_ = chromedp.Run(retryCtx, chromedp.Evaluate(`(function(){
-				// 取文档序中最后一个匹配元素（最深节点），避免误点外层容器
-				var els = document.querySelectorAll('button, div[role="button"], a, span, p, div');
-				var target = null;
-				for(var i=0;i<els.length;i++){
-					var t = (els[i].innerText||"").trim();
-					if(t.indexOf("重新上传") >= 0 && t.length < 30){ target = els[i]; }
-				}
-				if(target){ try{target.click();}catch(e){} return true; }
-				return false;
-			})()`, &retryClicked))
-			cancelRetry()
-			if !retryClicked {
-				logger.Print("DY4", "未找到可点击的'重新上传'元素，等待页面刷新后重试检测")
+			failedStreak++
+			if failedStreak < 2 {
+				logger.Print("DY4", "检测到'上传失败'文字，3秒后复查确认（防抖，避免残留状态误判）")
 				time.Sleep(3 * time.Second)
 				continue
 			}
-			logger.Print("DY4", "已点击'重新上传'，重新注入视频文件")
-			// 尽力重新注入文件：若重新上传触发了文件选择框，此操作会直接完成选择；若未触发则无副作用
-			fiCtx, cancelFi := context.WithTimeout(ctx, 10*time.Second)
-			_ = chromedp.Run(fiCtx, chromedp.SetUploadFiles(`input[type="file"]`, []string{absVideoPath}, chromedp.ByQuery))
-			cancelFi()
-			// 重试需要额外时间，延长整体等待截止时间
+			failedStreak = 0
+			retryCount++
+			if retryCount > 5 {
+				return errors.New("DY4 上传失败，重试5次后仍无法上传")
+			}
+			logger.Print("DY4", fmt.Sprintf("确认上传失败，开始重试 (第%d次)", retryCount))
+
+			reinjected := false
+
+			// 策略1：直接向上传控件重新注入文件（与首次上传同方式，选择器与 DY3 一致）
+			injectCtx, cancelInject := context.WithTimeout(ctx, 15*time.Second)
+			if err := chromedp.Run(injectCtx, chromedp.SetUploadFiles(`//input[@type='file']`, []string{absVideoPath}, chromedp.BySearch)); err == nil {
+				reinjected = true
+				logger.Print("DY4", "已向上传控件直接重新注入视频文件")
+			} else {
+				logger.Print("DY4", "直接注入失败: "+err.Error())
+			}
+			cancelInject()
+
+			// 策略2：控件不存在或直接注入未生效 → 点击"重新上传"触发文件选择框，再拦截对话框自动填入文件（=选中文件并点击确认）
+			if !reinjected {
+				clicked := false
+				realCtx, cancelReal := context.WithTimeout(ctx, 8*time.Second)
+				if err := chromedp.Run(realCtx,
+					chromedp.ScrollIntoView(`//*[contains(text(),'重新上传')]`, chromedp.BySearch),
+					chromedp.Click(`//*[contains(text(),'重新上传')]`, chromedp.BySearch),
+				); err == nil {
+					clicked = true
+					logger.Print("DY4", "已用真实鼠标事件点击'重新上传'")
+				}
+				cancelReal()
+
+				// JS 兜底点击（取文档序中最后一个匹配元素即最深节点，避免误点外层容器）
+				if !clicked {
+					var jsClicked bool
+					retryCtx, cancelRetry := context.WithTimeout(ctx, 5*time.Second)
+					_ = chromedp.Run(retryCtx, chromedp.Evaluate(`(function(){
+						var els = document.querySelectorAll('button, div[role="button"], a, span, p, div');
+						var target = null;
+						for(var i=0;i<els.length;i++){
+							var t = (els[i].innerText||"").trim();
+							if(t.indexOf("重新上传") >= 0 && t.length < 30){ target = els[i]; }
+						}
+						if(target){ try{target.click();}catch(e){} return true; }
+						return false;
+					})()`, &jsClicked))
+					cancelRetry()
+					if jsClicked {
+						clicked = true
+						logger.Print("DY4", "已用 JS 兜底点击'重新上传'")
+					}
+				}
+
+				if clicked {
+					// 点击后页面会弹出文件选择框，SetUploadFiles 对该对话框填入文件（=选中文件并点击确认）
+					logger.Print("DY4", "等待文件选择框出现并自动填入视频文件...")
+					inject2Ctx, cancelInject2 := context.WithTimeout(ctx, 20*time.Second)
+					if err := chromedp.Run(inject2Ctx, chromedp.SetUploadFiles(`//input[@type='file']`, []string{absVideoPath}, chromedp.BySearch)); err == nil {
+						reinjected = true
+						logger.Print("DY4", "文件选择框已自动填入文件")
+					} else {
+						logger.Print("DY4", "文件选择框自动填入失败: "+err.Error())
+					}
+					cancelInject2()
+				}
+			}
+
+			if !reinjected {
+				logger.Print("DY4", "本轮未能重新注入文件，等待后下轮继续尝试")
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			// 重试需要额外时间，延长整体等待截止时间；注入后留足15秒观察时间，让页面切回上传中状态，避免误判连环重试
 			deadline = deadline.Add(2 * time.Minute)
-			time.Sleep(5 * time.Second)
+			logger.Print("DY4", "等待15秒观察上传是否恢复...")
+			time.Sleep(15 * time.Second)
 			continue
 		}
 
