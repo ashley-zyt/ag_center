@@ -51,6 +51,14 @@ func isPublishNetURL(u string) bool {
 	return strings.Contains(u, "/post/post_create")
 }
 
+// loginNetSignal 登录态失效网络信号：页面开始加载 login.html/扫码登录脚本即置 1。
+// 比 URL 轮询更早：实测地址栏还在 post/create 时，login 资源已先发（单次 URL 检查漏判）。
+var loginNetSignal int32
+
+func isLoginNetURL(u string) bool {
+	return strings.Contains(u, "channels.weixin.qq.com/login.html") || strings.Contains(u, "finder-helper-web/res/static/js/login.")
+}
+
 func (l *filterLogger) Printf(format string, v ...interface{}) {
 	msg := ""
 	if len(v) > 0 {
@@ -83,6 +91,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	// 包级信号跨请求会残留（服务常驻），每次发布开始必须重置，否则第二次请求会误判"上传已启动"
 	atomic.StoreInt32(&uploadNetSignal, 0)
 	atomic.StoreInt32(&publishNetSignal, 0)
+	atomic.StoreInt32(&loginNetSignal, 0)
 	if req.WebsocketURL == "" {
 		return errors.New("WX0 websocket_url is required")
 	}
@@ -448,6 +457,11 @@ func verifyModalVisible(tabCtx context.Context) bool {
 func waitLoginRedirect(tabCtx context.Context, logger *logx.Logger) bool {
 	deadline := time.Now().Add(18 * time.Second)
 	for time.Now().Before(deadline) {
+		// 网络层最先知：login 资源开始加载即失效（此时地址栏可能还是 post/create）
+		if atomic.LoadInt32(&loginNetSignal) == 1 {
+			logger.Print("WX2", "网络层检测到登录页资源加载，判定登录态失效")
+			return true
+		}
 		var href string
 		locCtx, cancelLoc := context.WithTimeout(tabCtx, 2*time.Second)
 		_ = chromedp.Run(locCtx, chromedp.Location(&href))
@@ -461,12 +475,17 @@ func waitLoginRedirect(tabCtx context.Context, logger *logx.Logger) bool {
 		var state string
 		jsCtx, cancelJS := context.WithTimeout(tabCtx, 3*time.Second)
 		_ = chromedp.Run(jsCtx, chromedp.Evaluate(`(function(){
-			var fs = document.querySelectorAll('input[type="file"]');
-			for (var i = 0; i < fs.length; i++) { return 'loggedin'; }
+			function hasFileInput(doc) {
+				try { if (doc.querySelectorAll('input[type="file"]').length > 0) return true; } catch(e) {}
+				return false;
+			}
+			// 发表页的文件输入框在同源沙箱 iframe 内（主文档查不到），需穿透同源 iframe；跨域(如 open.weixin.qq.com)自然抛异常跳过。
+			if (hasFileInput(document)) return 'loggedin';
 			var ifs = document.querySelectorAll('iframe');
 			for (var j = 0; j < ifs.length; j++) {
 				var src = ifs[j].src || '';
 				if (src.indexOf('qrconnect') >= 0 || src.indexOf('snsapi_login') >= 0) return 'login-iframe';
+				try { if (ifs[j].contentDocument && hasFileInput(ifs[j].contentDocument)) return 'loggedin'; } catch(e) {}
 			}
 			return '';
 		})()`, &state))
@@ -725,6 +744,10 @@ func enableNetworkDiagnostics(tabCtx context.Context, logger *logx.Logger) {
 				// 上传分片请求出现 = 前端已消费文件并启动上传（比页面文案更早更可靠）
 				if isUploadNetURL(e.Request.URL) {
 					atomic.StoreInt32(&uploadNetSignal, 1)
+				}
+				// 登录页/扫码登录脚本加载 = 登录态失效（比 URL 轮询更早）
+				if isLoginNetURL(e.Request.URL) {
+					atomic.StoreInt32(&loginNetSignal, 1)
 				}
 				netMu.Lock()
 				reqURLs[e.RequestID] = e.Request.URL
