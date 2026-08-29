@@ -101,7 +101,8 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		logger.Print("DY7", "资源清理完成")
 	}()
 
-	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 5*time.Minute)
+	// 整体超时 15 分钟：覆盖慢网速下的多次重新上传重试 + 验证码人工处理等待
+	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 15*time.Minute)
 	defer cancelTimeout()
 
 	// 打开抖音创作者中心上传页
@@ -143,8 +144,8 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	// 关闭上传后的提示弹窗（缩短超时，快速退出）
 	_ = dismissPopups(tabCtx, logger)
 
-	// 智能等待视频上传完成（进度条消失 + 封面出现）
-	if err := waitForUploadComplete(tabCtx, logger); err != nil {
+	// 智能等待视频上传完成（进度条消失 + 封面出现；上传失败时自动点击"重新上传"）
+	if err := waitForUploadComplete(tabCtx, logger, absVideoPath); err != nil {
 		return fmt.Errorf("DY4 %v", err)
 	}
 
@@ -306,11 +307,13 @@ func waitAndUploadFile(ctx context.Context, logger *logx.Logger, absVideoPath st
 // waitForUploadComplete 智能等待视频上传完成。
 // 检测条件：上传进度文本消失 + 封面选择区/发布按钮出现。
 // 轮询期间主动关闭"视频预览功能"等引导弹窗，防止弹窗遮挡导致流程卡住。
-// 最长等待 5 分钟。
-func waitForUploadComplete(ctx context.Context, logger *logx.Logger) error {
+// 网速慢导致"上传失败，重新上传"时，自动点击重新上传并重新注入文件，最多重试3次。
+// 最长等待 5 分钟（每次重试额外延长 2 分钟）。
+func waitForUploadComplete(ctx context.Context, logger *logx.Logger, absVideoPath string) error {
 	logger.Print("DY4", "智能等待视频上传完成...")
 	deadline := time.Now().Add(5 * time.Minute)
 	loopCount := 0
+	retryCount := 0
 
 	for time.Now().Before(deadline) {
 		loopCount++
@@ -342,6 +345,8 @@ func waitForUploadComplete(ctx context.Context, logger *logx.Logger) error {
 		checkCtx, cancelCheck := context.WithTimeout(ctx, 3*time.Second)
 		_ = chromedp.Run(checkCtx, chromedp.Evaluate(`(function(){
 			var body = document.body ? (document.body.innerText || "") : "";
+			// 上传失败判定（网速慢时抖音会显示"上传失败，重新上传"），需优先于上传中/完成判定
+			if(body.indexOf("上传失败") >= 0) return "failed";
 			// 上传中判定：仅依赖明确的上传进度文本（注意：不要用 class*="progress"，会误中视频播放器进度条）
 			if(body.indexOf("上传过程中请不要删除") >= 0) return "uploading";
 			if(body.indexOf("正在上传") >= 0) return "uploading";
@@ -363,6 +368,43 @@ func waitForUploadComplete(ctx context.Context, logger *logx.Logger) error {
 		if state == "done" {
 			logger.Print("DY4", "视频上传完成，检测到封面选择区/发布按钮已就绪")
 			return nil
+		}
+
+		// 上传失败：点击"上传失败，重新上传"，并重新注入视频文件（防止点击后重新弹出文件选择框）
+		if state == "failed" {
+			retryCount++
+			if retryCount > 3 {
+				return errors.New("DY4 上传失败，重试3次后仍无法上传")
+			}
+			logger.Print("DY4", fmt.Sprintf("检测到上传失败，尝试点击'重新上传' (第%d次)", retryCount))
+			var retryClicked bool
+			retryCtx, cancelRetry := context.WithTimeout(ctx, 5*time.Second)
+			_ = chromedp.Run(retryCtx, chromedp.Evaluate(`(function(){
+				// 取文档序中最后一个匹配元素（最深节点），避免误点外层容器
+				var els = document.querySelectorAll('button, div[role="button"], a, span, p, div');
+				var target = null;
+				for(var i=0;i<els.length;i++){
+					var t = (els[i].innerText||"").trim();
+					if(t.indexOf("重新上传") >= 0 && t.length < 30){ target = els[i]; }
+				}
+				if(target){ try{target.click();}catch(e){} return true; }
+				return false;
+			})()`, &retryClicked))
+			cancelRetry()
+			if !retryClicked {
+				logger.Print("DY4", "未找到可点击的'重新上传'元素，等待页面刷新后重试检测")
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			logger.Print("DY4", "已点击'重新上传'，重新注入视频文件")
+			// 尽力重新注入文件：若重新上传触发了文件选择框，此操作会直接完成选择；若未触发则无副作用
+			fiCtx, cancelFi := context.WithTimeout(ctx, 10*time.Second)
+			_ = chromedp.Run(fiCtx, chromedp.SetUploadFiles(`input[type="file"]`, []string{absVideoPath}, chromedp.ByQuery))
+			cancelFi()
+			// 重试需要额外时间，延长整体等待截止时间
+			deadline = deadline.Add(2 * time.Minute)
+			time.Sleep(5 * time.Second)
+			continue
 		}
 
 		// 每 5 轮(~15秒)输出一次状态，方便排查卡住原因
