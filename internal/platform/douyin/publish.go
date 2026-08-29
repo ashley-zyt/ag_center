@@ -15,6 +15,8 @@ import (
 	"minimax_pro/internal/undetectable"
 
 	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/dom"
+	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 )
 
@@ -406,13 +408,96 @@ func injectUploadFile(ctx context.Context, logger *logx.Logger, absVideoPath str
 	return false
 }
 
+// retryViaFileChooser 点击"重新上传"并接管其唤起的原生文件选择框。
+// 旧实现用真实鼠标点击唤起系统文件选择对话框后，再用 SetUploadFiles 绕过对话框注入文件，
+// 导致原生对话框无人关闭、一直残留在屏幕上。这里改为：先用 CDP 拦截文件选择框请求（拦截后系统对话框根本不会弹出），
+// 再按 fileChooserOpened 事件携带的 backendNodeId 对触发对话框的那个 input 注入文件，选择请求被接受后自动完成。
+// 返回 true 表示已成功接管并完成文件选择（上传是否恢复由调用方校验状态）。
+func retryViaFileChooser(ctx context.Context, logger *logx.Logger, absVideoPath string) bool {
+	enableCtx, cancelEnable := context.WithTimeout(ctx, 5*time.Second)
+	err := chromedp.Run(enableCtx, page.SetInterceptFileChooserDialog(true))
+	cancelEnable()
+	if err != nil {
+		logger.Print("DY4", "开启文件选择框拦截失败: "+err.Error())
+		return false
+	}
+	defer func() {
+		disableCtx, cancelDisable := context.WithTimeout(ctx, 5*time.Second)
+		_ = chromedp.Run(disableCtx, page.SetInterceptFileChooserDialog(false))
+		cancelDisable()
+	}()
+
+	handled := make(chan bool, 1)
+	listenCtx, cancelListen := context.WithCancel(ctx)
+	defer cancelListen() // 取消即移除事件监听器，避免影响后续流程（如首次上传）
+	// 注意：监听回调中不能同步执行 CDP 调用（会死锁），必须另起 goroutine
+	chromedp.ListenTarget(listenCtx, func(ev interface{}) {
+		e, ok := ev.(*page.EventFileChooserOpened)
+		if !ok {
+			return
+		}
+		backendNodeID := e.BackendNodeID
+		go func() {
+			if backendNodeID == 0 {
+				logger.Print("DY4", "文件选择框事件未携带控件节点，无法接管")
+				select {
+				case handled <- false:
+				default:
+				}
+				return
+			}
+			params := dom.SetFileInputFiles([]string{absVideoPath})
+			params.BackendNodeID = backendNodeID // 精确定位触发对话框的 input，避免误注入其他 file input
+			handleCtx, cancelHandle := context.WithTimeout(ctx, 10*time.Second)
+			err := chromedp.Run(handleCtx, params)
+			cancelHandle()
+			if err != nil {
+				logger.Print("DY4", "接管文件选择框失败: "+err.Error())
+				select {
+				case handled <- false:
+				default:
+				}
+				return
+			}
+			logger.Print("DY4", "已接管文件选择框并完成文件选择（对话框不会残留）")
+			select {
+			case handled <- true:
+			default:
+			}
+		}()
+	})
+
+	// 需真实鼠标事件（可信事件）才能唤起原生文件选择框，JS click 不可信可能无法弹出
+	realCtx, cancelReal := context.WithTimeout(ctx, 8*time.Second)
+	err = chromedp.Run(realCtx,
+		chromedp.ScrollIntoView(`//*[contains(text(),'重新上传')]`, chromedp.BySearch),
+		chromedp.Click(`//*[contains(text(),'重新上传')]`, chromedp.BySearch),
+	)
+	cancelReal()
+	if err != nil {
+		logger.Print("DY4", "未找到可点击的'重新上传'元素，回退直接注入方式")
+		return false
+	}
+	logger.Print("DY4", "已用真实鼠标事件点击'重新上传'，等待接管文件选择框...")
+
+	select {
+	case ok := <-handled:
+		return ok
+	case <-time.After(10 * time.Second):
+		logger.Print("DY4", "点击后未唤起原生文件选择框，回退直接注入方式")
+		return false
+	}
+}
+
 // waitForUploadComplete 智能等待视频上传完成。
 // 检测条件：上传进度文本消失 + 封面选择区/发布按钮出现。
 // 轮询期间主动关闭"视频预览功能"等引导弹窗，防止弹窗遮挡导致流程卡住。
 // 网速慢导致"上传失败，重新上传"时：连续2次确认失败后才触发重试（防抖）；
 // 重试策略（实测：失败态下直接向 input 注入文件 CDP 返回成功但页面不响应，必须先让组件重置状态）：
-//  1. 真实鼠标点击"重新上传"后再注入文件，并轮询校验状态确实脱离 failed；
-//  2. 仍未恢复则整页刷新，从头重新选择视频上传；
+//  1. 真实鼠标点击"重新上传"，用 CDP 拦截其唤起的文件选择框并按事件中的 backendNodeId 注入文件
+//     （拦截后系统对话框不会实际弹出，修复旧实现中对话框残留不消失的问题），并轮询校验状态脱离 failed；
+//  2. 未唤起原生对话框时回退为点击后直接向上传控件注入；
+//  3. 仍未恢复则整页刷新，从头重新选择视频上传；
 //
 // 最多重试5次，每次重试额外延长 2 分钟等待截止时间。
 func waitForUploadComplete(ctx context.Context, logger *logx.Logger, absVideoPath string) error {
@@ -479,15 +564,21 @@ func waitForUploadComplete(ctx context.Context, logger *logx.Logger, absVideoPat
 
 			recovered := false
 
-			// 策略1：先真实鼠标点击"重新上传"（让上传组件退出失败态/重置上传任务），再重新注入文件，
-			// 点击等价于用户手动重选文件，注入即相当于在弹出的文件选择框中选中文件并确认。
-			if clickRetryUpload(ctx, logger) {
-				time.Sleep(1500 * time.Millisecond)
+			// 策略1：点击"重新上传"并接管其唤起的文件选择框（CDP 拦截：对话框不再实际弹出，
+			// 按事件中的 backendNodeId 对触发控件注入文件即完成选择，修复旧实现中
+			// 真实鼠标点击唤起的系统文件选择框一直残留不消失的问题）
+			chooserHandled := retryViaFileChooser(ctx, logger, absVideoPath)
+
+			// 兜底：未唤起原生文件选择框 → 点击"重新上传"让组件退出失败态后直接向上传控件注入文件
+			if !chooserHandled {
+				if clickRetryUpload(ctx, logger) {
+					time.Sleep(1500 * time.Millisecond)
+				}
+				injectUploadFile(ctx, logger, absVideoPath)
 			}
-			injectUploadFile(ctx, logger, absVideoPath)
 
 			// 效果校验：轮询等待状态脱离 failed（切回 uploading / done 等），不再盲信注入结果
-			if newState, ok := waitUploadStateLeave(ctx, "failed", 12*time.Second); ok {
+			if newState, ok := waitUploadStateLeave(ctx, "failed", 15*time.Second); ok {
 				logger.Print("DY4", "重试生效，上传状态已恢复: "+newState)
 				recovered = true
 			} else {
