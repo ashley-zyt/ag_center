@@ -257,48 +257,11 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	}
 	cancelSz()
 
-	// 等待页面重定向稳定：未登录时视频号助手会从 /platform/post/create 跳到 /login.html 扫码页
-	time.Sleep(3 * time.Second)
-
-	// 检查是否需要登录（以 URL 为准：已登录时不会停留在 login 页）
-	var href string
-	locCtx0, cancelLoc0 := context.WithTimeout(tabCtx, 3*time.Second)
-	_ = chromedp.Run(locCtx0, chromedp.Location(&href))
-	cancelLoc0()
-	logger.Print("WX2", "当前页面URL: "+href)
-	if strings.Contains(href, "login") {
-		return errors.New("WX2 weixin channels not logged in in this profile: 请先用微信扫码登录视频号助手 (https://channels.weixin.qq.com/platform)")
-	}
-
-	// 兜底：URL 未变但页面出现扫码登录文案时，再确认发表页主体元素是否存在（已登录页面也可能含"微信扫一扫"等文案，避免误报）
-	loginCheckCtx, cancelLoginCheck := context.WithTimeout(tabCtx, 5*time.Second)
-	var loginNodes []*cdp.Node
-	_ = chromedp.Run(loginCheckCtx, chromedp.Nodes(`//*[contains(text(), '扫码登录') or contains(text(), '微信扫一扫') or contains(text(), '请使用微信扫码')]`, &loginNodes, chromedp.BySearch))
-	cancelLoginCheck()
-	if len(loginNodes) > 0 {
-		createCtx, cancelCreate := context.WithTimeout(tabCtx, 3*time.Second)
-		var createNodes []*cdp.Node
-		_ = chromedp.Run(createCtx, chromedp.Nodes(`//input[@type='file'] | //*[contains(text(), '上传视频') or contains(text(), '发表')]`, &createNodes, chromedp.BySearch))
-		cancelCreate()
-		// 过滤 script/style：contains(text(),'发表') 会命中内嵌脚本源码，不能作为已渲染内容的依据（实测曾命中 9 个 SCRIPT）
-		var meaningful int
-		names := make([]string, 0, 5)
-		for _, n := range createNodes {
-			tag := strings.ToLower(n.NodeName)
-			if tag == "script" || tag == "style" {
-				continue
-			}
-			meaningful++
-			if len(names) < 5 {
-				names = append(names, n.NodeName)
-			}
-		}
-		if meaningful == 0 {
-			// 仅命中脚本源码：以 URL 为准（未登录已被前面的 URL 检查排除），打印告警后继续，由后续快照确认渲染状态
-			logger.Print("WX2", "扫码文案检查命中的主体元素均为SCRIPT(脚本源码误匹配)，以URL判定为已登录，等待页面渲染")
-		} else {
-			logger.Print("WX2", fmt.Sprintf("页面含扫码相关文案，但检测到发表页主体元素(命中 %d 个: %v)，判定为已登录", meaningful, names))
-		}
+	// 等待页面重定向稳定：未登录时视频号助手会从 /platform/post/create 跳到 /login.html 扫码页。
+	// 实测登录态失效时：URL 检测时刻地址栏仍是 post/create，login.html 稍后才加载，
+	// 甚至存在 URL 不变、原页内直接嵌入 qrconnect 扫码 iframe 的形态——单次 URL 检查必然漏判，需持续观察。
+	if needLogin := waitLoginRedirect(tabCtx, logger); needLogin {
+		return errors.New("当前为视频号登录页面，需要扫码才能继续后续操作")
 	}
 
 	// 前置检查账号异常/功能不可用（仅匹配账号受限类专属文案，避免命中发表页的合规提示）
@@ -359,6 +322,14 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		redirectDeadline := time.Now().Add(120 * time.Second)
 		redirectOK = false
 		for time.Now().Before(redirectDeadline) {
+			// 流程中途被踢回登录页（登录态失效）：立即报错，不再傻等跳转/重试点击发表（重复点击会重复发布）
+			var locNow string
+			locChkCtx, cancelLocChk := context.WithTimeout(tabCtx, 1500*time.Millisecond)
+			_ = chromedp.Run(locChkCtx, chromedp.Location(&locNow))
+			cancelLocChk()
+			if strings.Contains(locNow, "login.html") {
+				return errors.New("当前为视频号登录页面，需要扫码才能继续后续操作")
+			}
 			// 网络层 post_create 已受理 = 发布成功（指纹浏览器下 wujie 子应用 URL 可能不变，不能仅凭 URL 判转）
 			if atomic.LoadInt32(&publishNetSignal) == 1 {
 				logger.Print("WX6", "网络层检测到 post_create 成功请求，判定发布成功")
@@ -467,6 +438,50 @@ func verifyModalVisible(tabCtx context.Context) bool {
 	defer cancel()
 	_ = chromedp.Run(vCtx, chromedp.Evaluate(js, &visible))
 	return visible
+}
+
+// waitLoginRedirect 持续观察登录态失效信号，返回 true 表示停在登录页需要扫码。
+// 失效形态有三种，单次 URL 检查只能命中第一种：
+// 1) 跳转到 /login.html（稍晚于导航检测时刻）；2) URL 不变，原页内直接嵌入
+// open.weixin.qq.com/connect/qrconnect 扫码 iframe；3) URL 含 login 的其他变体。
+// 反向信号：页面出现 file input（发表页主体已渲染）立即判已登录，避免无谓等待。
+func waitLoginRedirect(tabCtx context.Context, logger *logx.Logger) bool {
+	deadline := time.Now().Add(18 * time.Second)
+	for time.Now().Before(deadline) {
+		var href string
+		locCtx, cancelLoc := context.WithTimeout(tabCtx, 2*time.Second)
+		_ = chromedp.Run(locCtx, chromedp.Location(&href))
+		cancelLoc()
+		if strings.Contains(href, "login") {
+			logger.Print("WX2", "检测到登录页URL: "+href)
+			return true
+		}
+		// 页面特征：嵌入了扫码组件 iframe（qrconnect），或出现可见的扫码文案且无发表页主体。
+		// 用 JS 一次判完，比 CDP 节点搜索更快且能精确限定容器。
+		var state string
+		jsCtx, cancelJS := context.WithTimeout(tabCtx, 3*time.Second)
+		_ = chromedp.Run(jsCtx, chromedp.Evaluate(`(function(){
+			var fs = document.querySelectorAll('input[type="file"]');
+			for (var i = 0; i < fs.length; i++) { return 'loggedin'; }
+			var ifs = document.querySelectorAll('iframe');
+			for (var j = 0; j < ifs.length; j++) {
+				var src = ifs[j].src || '';
+				if (src.indexOf('qrconnect') >= 0 || src.indexOf('snsapi_login') >= 0) return 'login-iframe';
+			}
+			return '';
+		})()`, &state))
+		cancelJS()
+		if state == "loggedin" {
+			logger.Print("WX2", "页面已出现发表页文件输入框，判定已登录")
+			return false
+		}
+		if state == "login-iframe" {
+			logger.Print("WX2", "页面嵌入了微信扫码组件(qrconnect)，判定为登录态失效")
+			return true
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return false
 }
 
 // httpBaseFromWS 从 WebSocket 调试地址推导 HTTP 调试接口地址：
