@@ -309,10 +309,23 @@ func waitAndUploadFile(ctx context.Context, logger *logx.Logger, absVideoPath st
 // uploadStateJS 页面上传状态探测脚本：返回 {state: failed/uploading/done/waiting, speed: 当前上传速度}
 const uploadStateJS = `(function(){
 	var body = document.body ? (document.body.innerText || "") : "";
+	// 单位换算 → MB（页面进度文本如 "已上传: 0.9MB/5.1MB"）
+	function toMB(v, u){
+		u = (u || "").toUpperCase();
+		if(u.indexOf("T") === 0) return v * 1024 * 1024;
+		if(u.indexOf("G") === 0) return v * 1024;
+		if(u.indexOf("M") === 0) return v;
+		if(u.indexOf("K") === 0) return v / 1024;
+		return v / 1024 / 1024;
+	}
 	// 当前上传速度（如 "13.5KB/s"），仅上传中时页面才显示"当前速度"行
 	var speed = "";
 	var sm = body.match(/当前速度[:：]\s*([0-9.]+\s*[KMGT]?B\/s)/);
 	if(sm) speed = sm[1];
+	// 上传进度（如 "已上传: 0.9MB/5.1MB"），用于估算剩余上传时间、智能延长等待截止时间
+	var uploadedMB = 0, totalMB = 0;
+	var pm = body.match(/已上传[:：]?\s*([0-9.]+)\s*([KMGT]?B)\s*\/\s*([0-9.]+)\s*([KMGT]?B)/);
+	if(pm){ uploadedMB = toMB(parseFloat(pm[1]), pm[2]); totalMB = toMB(parseFloat(pm[3]), pm[4]); }
 	var state = "waiting";
 	// 上传失败判定（网速慢时抖音会显示"上传失败，重新上传"），需优先于上传中/完成判定
 	if(body.indexOf("上传失败") >= 0) state = "failed";
@@ -334,13 +347,15 @@ const uploadStateJS = `(function(){
 			if(publishBtn) state = "done";
 		}
 	}
-	return {state: state, speed: speed};
+	return {state: state, speed: speed, uploadedMB: uploadedMB, totalMB: totalMB};
 })()`
 
 // uploadStateInfo 页面上传状态探测结果
 type uploadStateInfo struct {
-	State string `json:"state"` // failed / uploading / done / waiting
-	Speed string `json:"speed"` // 当前上传速度（如 "13.5KB/s"），仅上传中才有值
+	State      string  `json:"state"`      // failed / uploading / done / waiting
+	Speed      string  `json:"speed"`      // 当前上传速度（如 "13.5KB/s"），仅上传中才有值
+	UploadedMB float64 `json:"uploadedMB"` // 已上传大小（MB），来自页面"已上传: x/y"
+	TotalMB    float64 `json:"totalMB"`    // 文件总大小（MB）
 }
 
 // fetchUploadState 读取一次页面上传状态与当前上传速度（读取失败时 State 为空）
@@ -404,6 +419,16 @@ func avgSpeedText(samples []float64) string {
 		sum += v
 	}
 	return "，平均上传速度: " + formatSpeed(sum/float64(len(samples)))
+}
+
+// hasPositiveSample 判断速度样本中是否存在大于 0 的速度（用于区分"有网速"与"速度一直为0"）
+func hasPositiveSample(samples []float64) bool {
+	for _, v := range samples {
+		if v > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // waitUploadStateLeave 轮询等待上传状态脱离 from（如脱离 failed），返回最新状态及是否脱离成功
@@ -568,7 +593,7 @@ func retryViaFileChooser(ctx context.Context, logger *logx.Logger, absVideoPath 
 //  2. 未唤起原生对话框时回退为点击后直接向上传控件注入；
 //  3. 仍未恢复则整页刷新，从头重新选择视频上传；
 //
-// 最多重试5次，每次重试额外延长 2 分钟等待截止时间。
+// 最多重试5次。等待截止时间智能延长：有速度时按 剩余大小/当前速度 估算延长，速度一直为 0 才固定延长 2 分钟。
 func waitForUploadComplete(ctx context.Context, logger *logx.Logger, absVideoPath string) error {
 	logger.Print("DY4", "智能等待视频上传完成...")
 	deadline := time.Now().Add(5 * time.Minute)
@@ -607,9 +632,27 @@ func waitForUploadComplete(ctx context.Context, logger *logx.Logger, absVideoPat
 		state := stateInfo.State
 
 		// 上传中持续采集速度样本，用于最终失败时计算平均上传速度（采样间隔均匀，直接取均值即可）
+		var curSpeedKBps float64
 		if state == "uploading" {
 			if v, ok := parseSpeedKBps(stateInfo.Speed); ok {
 				speedSamples = append(speedSamples, v)
+				curSpeedKBps = v
+			}
+		}
+
+		// 智能延长等待截止时间：当前速度 > 0 时，按 剩余大小/当前速度 估算剩余时间（另加 2 分钟缓冲应对速度波动），
+		// 只延长不缩短，避免慢网速下过早超时；速度一直为 0 时不在此处延长（由重试分支的固定延长兜底）
+		if state == "uploading" && curSpeedKBps > 0 && stateInfo.TotalMB > 0 {
+			remainingMB := stateInfo.TotalMB - stateInfo.UploadedMB
+			if remainingMB < 0 {
+				remainingMB = 0
+			}
+			estSec := remainingMB * 1024 / curSpeedKBps
+			newDeadline := time.Now().Add(time.Duration(estSec)*time.Second + 2*time.Minute)
+			// 仅在需延长幅度较大(≥15秒)时才调整并记日志，避免速度波动导致频繁刷屏
+			if newDeadline.Sub(deadline) > 15*time.Second {
+				deadline = newDeadline
+				logger.Print("DY4", fmt.Sprintf("按当前速度 %s 估算剩余约 %.0f 秒(已上传 %.1fMB/%.1fMB)，已延长等待截止时间", formatSpeed(curSpeedKBps), estSec, stateInfo.UploadedMB, stateInfo.TotalMB))
 			}
 		}
 
@@ -686,8 +729,11 @@ func waitForUploadComplete(ctx context.Context, logger *logx.Logger, absVideoPat
 				}
 			}
 
-			// 重试需要额外时间，延长整体等待截止时间（后续观察交给主循环轮询）
-			deadline = deadline.Add(2 * time.Minute)
+			// 重试需要额外时间：已有正速度样本时，由主循环按 剩余大小/当前速度 智能延长截止时间；
+			// 仅当速度一直为 0（或未采集到速度）时才使用固定延长 2 分钟兜底（后续观察交给主循环轮询）
+			if !hasPositiveSample(speedSamples) {
+				deadline = deadline.Add(2 * time.Minute)
+			}
 			if !recovered {
 				logger.Print("DY4", "本轮重试后上传仍未恢复，等待后下轮继续尝试")
 			}
