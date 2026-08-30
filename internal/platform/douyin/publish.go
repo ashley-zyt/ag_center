@@ -306,35 +306,104 @@ func waitAndUploadFile(ctx context.Context, logger *logx.Logger, absVideoPath st
 	return nil
 }
 
-// uploadStateJS 页面上传状态探测脚本：返回 failed / uploading / done / waiting
+// uploadStateJS 页面上传状态探测脚本：返回 {state: failed/uploading/done/waiting, speed: 当前上传速度}
 const uploadStateJS = `(function(){
 	var body = document.body ? (document.body.innerText || "") : "";
+	// 当前上传速度（如 "13.5KB/s"），仅上传中时页面才显示"当前速度"行
+	var speed = "";
+	var sm = body.match(/当前速度[:：]\s*([0-9.]+\s*[KMGT]?B\/s)/);
+	if(sm) speed = sm[1];
+	var state = "waiting";
 	// 上传失败判定（网速慢时抖音会显示"上传失败，重新上传"），需优先于上传中/完成判定
-	if(body.indexOf("上传失败") >= 0) return "failed";
+	if(body.indexOf("上传失败") >= 0) state = "failed";
 	// 上传中判定：仅依赖明确的上传进度文本（注意：不要用 class*="progress"，会误中视频播放器进度条）
-	if(body.indexOf("上传过程中请不要删除") >= 0) return "uploading";
-	if(body.indexOf("正在上传") >= 0) return "uploading";
-	var m = body.match(/\u4e0a\u4f20[^\n]*?(\d{1,3})%/);
-	if(m && m[1] !== "100") return "uploading";
-	// 完成判定：上传完成后才会出现的页面元素（实测抖音创作者中心）
-	if(body.indexOf("设置封面") >= 0) return "done";
-	if(body.indexOf("选择封面") >= 0) return "done";
-	if(body.indexOf("重新上传") >= 0) return "done";
-	if(body.indexOf("更换封面") >= 0) return "done";
-	if(body.indexOf("作品描述") >= 0 && body.indexOf("发布时间") >= 0) return "done";
-	// 发布按钮已存在（上传完成且视频处理完毕）
-	var publishBtn = document.querySelector('#popover-tip-container > button, button[class*="publish"]');
-	if(publishBtn) return "done";
-	return "waiting";
+	else if(body.indexOf("上传过程中请不要删除") >= 0) state = "uploading";
+	else if(body.indexOf("正在上传") >= 0) state = "uploading";
+	else {
+		var m = body.match(/\u4e0a\u4f20[^\n]*?(\d{1,3})%/);
+		if(m && m[1] !== "100") state = "uploading";
+		// 完成判定：上传完成后才会出现的页面元素（实测抖音创作者中心）
+		else if(body.indexOf("设置封面") >= 0) state = "done";
+		else if(body.indexOf("选择封面") >= 0) state = "done";
+		else if(body.indexOf("重新上传") >= 0) state = "done";
+		else if(body.indexOf("更换封面") >= 0) state = "done";
+		else if(body.indexOf("作品描述") >= 0 && body.indexOf("发布时间") >= 0) state = "done";
+		else {
+			// 发布按钮已存在（上传完成且视频处理完毕）
+			var publishBtn = document.querySelector('#popover-tip-container > button, button[class*="publish"]');
+			if(publishBtn) state = "done";
+		}
+	}
+	return {state: state, speed: speed};
 })()`
+
+// uploadStateInfo 页面上传状态探测结果
+type uploadStateInfo struct {
+	State string `json:"state"` // failed / uploading / done / waiting
+	Speed string `json:"speed"` // 当前上传速度（如 "13.5KB/s"），仅上传中才有值
+}
+
+// fetchUploadState 读取一次页面上传状态与当前上传速度（读取失败时 State 为空）
+func fetchUploadState(ctx context.Context) uploadStateInfo {
+	var info uploadStateInfo
+	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	_ = chromedp.Run(checkCtx, chromedp.Evaluate(uploadStateJS, &info))
+	return info
+}
 
 // checkUploadState 读取一次页面上传状态（读取失败时返回空字符串）
 func checkUploadState(ctx context.Context) string {
-	var state string
-	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	_ = chromedp.Run(checkCtx, chromedp.Evaluate(uploadStateJS, &state))
-	return state
+	return fetchUploadState(ctx).State
+}
+
+// parseSpeedKBps 解析页面速度文本（如 "13.5KB/s"、"1.2MB/s"）为 KB/s 数值
+func parseSpeedKBps(s string) (float64, bool) {
+	var v float64
+	var unit string
+	if _, err := fmt.Sscanf(strings.TrimSpace(s), "%f%s", &v, &unit); err != nil {
+		return 0, false
+	}
+	unit = strings.ToUpper(strings.TrimSuffix(strings.ToUpper(unit), "/S"))
+	switch {
+	case strings.HasPrefix(unit, "T"):
+		return v * 1024 * 1024 * 1024, true
+	case strings.HasPrefix(unit, "G"):
+		return v * 1024 * 1024, true
+	case strings.HasPrefix(unit, "M"):
+		return v * 1024, true
+	case strings.HasPrefix(unit, "K"):
+		return v, true
+	case unit == "B" || unit == "":
+		return v / 1024, true
+	}
+	return 0, false
+}
+
+// formatSpeed 将 KB/s 数值格式化为易读速度文本
+func formatSpeed(kbps float64) string {
+	switch {
+	case kbps >= 1024*1024:
+		return fmt.Sprintf("%.2fGB/s", kbps/(1024*1024))
+	case kbps >= 1024:
+		return fmt.Sprintf("%.2fMB/s", kbps/1024)
+	case kbps >= 1:
+		return fmt.Sprintf("%.1fKB/s", kbps)
+	default:
+		return fmt.Sprintf("%.0fB/s", kbps*1024)
+	}
+}
+
+// avgSpeedText 由速度样本计算平均速度文本（无样本时返回空字符串）
+func avgSpeedText(samples []float64) string {
+	if len(samples) == 0 {
+		return ""
+	}
+	var sum float64
+	for _, v := range samples {
+		sum += v
+	}
+	return "，平均上传速度: " + formatSpeed(sum/float64(len(samples)))
 }
 
 // waitUploadStateLeave 轮询等待上传状态脱离 from（如脱离 failed），返回最新状态及是否脱离成功
@@ -506,6 +575,7 @@ func waitForUploadComplete(ctx context.Context, logger *logx.Logger, absVideoPat
 	loopCount := 0
 	retryCount := 0
 	failedStreak := 0
+	var speedSamples []float64 // 上传中采集的速度样本，最终失败时用于计算平均上传速度
 
 	for time.Now().Before(deadline) {
 		loopCount++
@@ -532,8 +602,16 @@ func waitForUploadComplete(ctx context.Context, logger *logx.Logger, absVideoPat
 			continue
 		}
 
-		// 一次性获取页面状态：是否上传中 + 是否已完成（单次 JS 调用，减少 CDP 往返）
-		state := checkUploadState(ctx)
+		// 一次性获取页面状态：是否上传中 + 是否已完成 + 当前上传速度（单次 JS 调用，减少 CDP 往返）
+		stateInfo := fetchUploadState(ctx)
+		state := stateInfo.State
+
+		// 上传中持续采集速度样本，用于最终失败时计算平均上传速度（采样间隔均匀，直接取均值即可）
+		if state == "uploading" {
+			if v, ok := parseSpeedKBps(stateInfo.Speed); ok {
+				speedSamples = append(speedSamples, v)
+			}
+		}
 
 		// 非失败状态下重置失败连续计数（防抖用）
 		if state != "failed" {
@@ -558,7 +636,7 @@ func waitForUploadComplete(ctx context.Context, logger *logx.Logger, absVideoPat
 			failedStreak = 0
 			retryCount++
 			if retryCount > 5 {
-				return errors.New("DY4 上传失败，重试5次后仍无法上传")
+				return errors.New("DY4 上传失败，重试5次后仍无法上传" + avgSpeedText(speedSamples))
 			}
 			logger.Print("DY4", fmt.Sprintf("确认上传失败，开始重试 (第%d次)", retryCount))
 
@@ -617,9 +695,13 @@ func waitForUploadComplete(ctx context.Context, logger *logx.Logger, absVideoPat
 			continue
 		}
 
-		// 每 5 轮(~15秒)输出一次状态，方便排查卡住原因
+		// 每 5 轮(~15秒)输出一次状态，方便排查卡住原因（上传中附带当前网速）
 		if loopCount%5 == 0 {
-			logger.Print("DY4", fmt.Sprintf("上传状态轮询中: state=%s (已等待%ds)", state, loopCount*3))
+			msg := fmt.Sprintf("上传状态轮询中: state=%s (已等待%ds)", state, loopCount*3)
+			if state == "uploading" && stateInfo.Speed != "" {
+				msg += ", 当前速度: " + stateInfo.Speed
+			}
+			logger.Print("DY4", msg)
 		}
 
 		time.Sleep(3 * time.Second)
