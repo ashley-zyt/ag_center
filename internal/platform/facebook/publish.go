@@ -87,7 +87,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 4*time.Minute)
 	defer cancelTimeout()
 
-	if err := chromedp.Run(tabCtx, chromedp.Navigate("https://www.facebook.com/"), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
+	if err := chromedputil.NavigateAndWaitBody(tabCtx, logger, "https://www.facebook.com/", "FB2"); err != nil {
 		return fmt.Errorf("FB2 %v", err)
 	}
 	logger.Print("FB2", "已打开Facebook首页")

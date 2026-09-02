@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"minimax_pro/internal/auth"
 	"minimax_pro/internal/chromedputil"
 	chrome "minimax_pro/internal/clock"
 	"minimax_pro/internal/logx"
@@ -105,6 +106,10 @@ const (
 	// Can be overridden via ACCOUNT_STATS_UPDATE_API_URL environment variable.
 	accountStatsUpdateURL = "http://47.89.235.227:3366/api/v1/account_stats/batch_update"
 )
+
+// publishTimeout 发布等长流程使用独立 background context 时的超时上限，
+// 避免因客户端/nginx 超时断开导致 r.Context() 被取消而中断发布与收尾。
+const publishTimeout = 15 * time.Minute
 
 // profileOpMu 确保同一Profile同时只能执行一个浏览器操作(fetch/nurture), 避免并发操作同一浏览器导致标签页混乱、导航互相干扰
 var (
@@ -1595,10 +1600,15 @@ func main() {
 			return
 		}
 
+		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
+		// 导致 r.Context() 被取消、进而中断发布与收尾。
+		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+		defer cancelPub()
+
 		var absVideoPath string
 		if req.VideoOssURL != "" {
 			var err error
-			absVideoPath, err = downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
+			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 				return
@@ -1616,31 +1626,24 @@ func main() {
 			}
 		}
 
-		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
 			logger.Print("E", err.Error())
 			_ = os.Remove(absVideoPath)
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
-		var stopOnce sync.Once
-		stopProfile := func(reason string) {
-			stopOnce.Do(func() {
-				logger.Print("FB", "停止Profile: "+reason)
-				stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
-				_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-				cancelStop()
-			})
-		}
-		go func() {
-			select {
-			case <-r.Context().Done():
-				stopProfile("request canceled")
-				_ = os.Remove(absVideoPath)
-			}
-		}()
-		logger.Print("FB", "开始Facebook发布流程")
-		if err := facebook.PublishVideo(r.Context(), logger, facebook.PublishRequest{
+	var stopOnce sync.Once
+	stopProfile := func(reason string) {
+		stopOnce.Do(func() {
+			logger.Print("FB", "停止Profile: "+reason)
+			stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
+			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
+			cancelStop()
+		})
+	}
+	logger.Print("FB", "开始Facebook发布流程")
+		if err := facebook.PublishVideo(pubCtx, logger, facebook.PublishRequest{
 			WebsocketURL:     res.Info.WebsocketLink,
 			Title:            req.Title,
 			VideoPath:        absVideoPath,
@@ -1718,10 +1721,15 @@ func main() {
 			return
 		}
 
+		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
+		// 导致 r.Context() 被取消、进而中断发布与收尾。
+		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+		defer cancelPub()
+
 		var absVideoPath string
 		if req.VideoOssURL != "" {
 			var err error
-			absVideoPath, err = downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
+			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 				return
@@ -1739,7 +1747,7 @@ func main() {
 			}
 		}
 
-		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
 			logger.Print("E", err.Error())
 			_ = os.Remove(absVideoPath)
@@ -1751,7 +1759,7 @@ func main() {
 		if strings.TrimSpace(textToUse) == "" && strings.TrimSpace(req.Title) != "" {
 			textToUse = req.Title
 		}
-		if err := twitter.PublishVideo(r.Context(), logger, twitter.PublishRequest{
+		if err := twitter.PublishVideo(pubCtx, logger, twitter.PublishRequest{
 			WebsocketURL:     res.Info.WebsocketLink,
 			Text:             textToUse,
 			VideoPath:        absVideoPath,
@@ -1760,14 +1768,14 @@ func main() {
 			ProfileID:        res.ProfileID,
 		}); err != nil {
 			logger.Print("E", err.Error())
-			stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
+			stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
 			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 			cancelStop()
 			_ = os.Remove(absVideoPath)
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
-		stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
+		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
 		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 		cancelStop()
 		_ = os.Remove(absVideoPath)
@@ -1830,10 +1838,15 @@ func main() {
 			return
 		}
 
+		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
+		// 导致 r.Context() 被取消、进而中断发布与收尾。
+		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+		defer cancelPub()
+
 		var absVideoPath string
 		if req.VideoOssURL != "" {
 			var err error
-			absVideoPath, err = downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
+			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 				return
@@ -1851,7 +1864,7 @@ func main() {
 			}
 		}
 
-		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
 			logger.Print("E", err.Error())
 			_ = os.Remove(absVideoPath)
@@ -1863,7 +1876,7 @@ func main() {
 		if titleToUse == "" && strings.TrimSpace(req.Text) != "" {
 			titleToUse = req.Text
 		}
-		if err := youtube.PublishVideo(r.Context(), logger, youtube.PublishRequest{
+		if err := youtube.PublishVideo(pubCtx, logger, youtube.PublishRequest{
 			WebsocketURL:     res.Info.WebsocketLink,
 			Title:            titleToUse,
 			Description:      req.Description,
@@ -1878,7 +1891,7 @@ func main() {
 			return
 		}
 		time.Sleep(8 * time.Second)
-		stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
+		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
 		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 		cancelStop()
 		_ = os.Remove(absVideoPath)
@@ -1940,10 +1953,15 @@ func main() {
 			return
 		}
 
+		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
+		// 导致 r.Context() 被取消、进而中断发布与收尾。
+		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+		defer cancelPub()
+
 		var absVideoPath string
 		if req.VideoOssURL != "" {
 			var err error
-			absVideoPath, err = downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
+			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 				return
@@ -1961,7 +1979,7 @@ func main() {
 			}
 		}
 
-		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
 			logger.Print("E", err.Error())
 			_ = os.Remove(absVideoPath)
@@ -1973,7 +1991,7 @@ func main() {
 		if textToUse == "" && strings.TrimSpace(req.Title) != "" {
 			textToUse = req.Title
 		}
-		if err := tiktok.PublishVideo(r.Context(), logger, tiktok.PublishRequest{
+		if err := tiktok.PublishVideo(pubCtx, logger, tiktok.PublishRequest{
 			WebsocketURL:     res.Info.WebsocketLink,
 			Text:             textToUse,
 			VideoPath:        absVideoPath,
@@ -1987,7 +2005,7 @@ func main() {
 			return
 		}
 		time.Sleep(8 * time.Second)
-		stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
+		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
 		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 		cancelStop()
 		_ = os.Remove(absVideoPath)
@@ -2050,10 +2068,15 @@ func main() {
 			return
 		}
 
+		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
+		// 导致 r.Context() 被取消、进而中断发布与收尾。
+		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+		defer cancelPub()
+
 		var absVideoPath string
 		if req.VideoOssURL != "" {
 			var err error
-			absVideoPath, err = downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
+			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 				return
@@ -2071,7 +2094,7 @@ func main() {
 			}
 		}
 
-		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
 			logger.Print("E", err.Error())
 			_ = os.Remove(absVideoPath)
@@ -2083,7 +2106,7 @@ func main() {
 		if textToUse == "" && strings.TrimSpace(req.Title) != "" {
 			textToUse = req.Title
 		}
-		if err := douyin.PublishVideo(r.Context(), logger, douyin.PublishRequest{
+		if err := douyin.PublishVideo(pubCtx, logger, douyin.PublishRequest{
 			WebsocketURL:     res.Info.WebsocketLink,
 			Text:             textToUse,
 			VideoPath:        absVideoPath,
@@ -2097,7 +2120,7 @@ func main() {
 			return
 		}
 		time.Sleep(8 * time.Second)
-		stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
+		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
 		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 		cancelStop()
 		_ = os.Remove(absVideoPath)
@@ -2161,10 +2184,15 @@ func main() {
 			return
 		}
 
+		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
+		// 导致 r.Context() 被取消、进而中断发布与收尾。
+		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+		defer cancelPub()
+
 		var absVideoPath string
 		if req.VideoOssURL != "" {
 			var err error
-			absVideoPath, err = downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
+			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 				return
@@ -2182,7 +2210,7 @@ func main() {
 			}
 		}
 
-		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
 			logger.Print("E", err.Error())
 			_ = os.Remove(absVideoPath)
@@ -2194,7 +2222,7 @@ func main() {
 		if textToUse == "" && strings.TrimSpace(req.Title) != "" {
 			textToUse = req.Title
 		}
-		if err := weixin.PublishVideo(r.Context(), logger, weixin.PublishRequest{
+		if err := weixin.PublishVideo(pubCtx, logger, weixin.PublishRequest{
 			WebsocketURL:     res.Info.WebsocketLink,
 			Text:             textToUse,
 			VideoPath:        absVideoPath,
@@ -2208,7 +2236,7 @@ func main() {
 			return
 		}
 		time.Sleep(8 * time.Second)
-		stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
+		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
 		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 		cancelStop()
 		_ = os.Remove(absVideoPath)
@@ -2271,10 +2299,15 @@ func main() {
 			return
 		}
 
+		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
+		// 导致 r.Context() 被取消、进而中断发布与收尾。
+		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+		defer cancelPub()
+
 		var absVideoPath string
 		if req.VideoOssURL != "" {
 			var err error
-			absVideoPath, err = downloadVideoFromOss(r.Context(), logger, req.VideoOssURL)
+			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 				return
@@ -2292,7 +2325,7 @@ func main() {
 			}
 		}
 
-		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 		if err != nil {
 			logger.Print("E", err.Error())
 			_ = os.Remove(absVideoPath)
@@ -2304,7 +2337,7 @@ func main() {
 		if strings.TrimSpace(textToUse) == "" && strings.TrimSpace(req.Title) != "" {
 			textToUse = req.Title
 		}
-		if err := instagram.PublishVideo(r.Context(), logger, instagram.PublishRequest{
+		if err := instagram.PublishVideo(pubCtx, logger, instagram.PublishRequest{
 			WebsocketURL:     res.Info.WebsocketLink,
 			Text:             textToUse,
 			VideoPath:        absVideoPath,
@@ -2313,14 +2346,14 @@ func main() {
 			ProfileID:        res.ProfileID,
 		}); err != nil {
 			logger.Print("E", err.Error())
-			stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
+			stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
 			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 			cancelStop()
 			_ = os.Remove(absVideoPath)
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
 			return
 		}
-		stopCtx, cancelStop := context.WithTimeout(r.Context(), 6*time.Second)
+		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
 		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 		cancelStop()
 		_ = os.Remove(absVideoPath)
@@ -2340,9 +2373,29 @@ func main() {
 	mux.HandleFunc("/accounts/check_reply", handleCheckReply(logger))
 
 	mux.HandleFunc("/api/browser/locked", chrome.GetLockedProfilesHandler(logger, "127.0.0.1", 25325))
-	addr := ":8080"
+
+	// 鉴权：API Key 认证 + HMAC-SHA256 请求签名，保护所有发布/消息/账号接口。
+	authCfg, err := auth.LoadConfig()
+	if err != nil {
+		logger.Print("E", err.Error())
+		logger.Close() // 同步刷新日志，避免 os.Exit 时异步终端日志丢失
+		fmt.Fprintf(os.Stderr, "\n[启动失败] %s\n\n", err.Error())
+		fmt.Fprintln(os.Stderr, "请先设置鉴权环境变量再启动：")
+		fmt.Fprintln(os.Stderr, "  Windows:  set API_KEY=<你的密钥> && set API_SECRET=<你的签名密钥>")
+		fmt.Fprintln(os.Stderr, "  Linux:    export API_KEY=<你的密钥> API_SECRET=<你的签名密钥>")
+		fmt.Fprintln(os.Stderr, "  （API_SECRET 可不设，缺省自动复用 API_KEY）")
+		os.Exit(1)
+	}
+	handler := auth.Middleware(authCfg, mux)
+
+	// 默认只监听本机回环地址，由同机 nginx 反代对外提供 HTTPS 访问，
+	// 避免公网直连明文 IP:8080。如需调整可用 LISTEN_ADDR 环境变量覆盖。
+	addr := os.Getenv("LISTEN_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:8080"
+	}
 	logger.Print("BOOT", "listening on "+addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		logger.Print("E", err.Error())
 		os.Exit(1)
 	}

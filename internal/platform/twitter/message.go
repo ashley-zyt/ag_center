@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/platform/message"
 
@@ -108,7 +109,7 @@ func (m *twitterMessenger) CheckLogin(ctx context.Context) (string, error) {
 // OpenTargetProfile 打开私信主页并处理 Passcode 验证拦截(X 为搜索型平台, 不访问对方主页)
 func (m *twitterMessenger) OpenTargetProfile(ctx context.Context, task message.SendTask) error {
 	m.logger.Print("TW_MSG2", "打开私信主页: "+twChatURL)
-	if err := chromedp.Run(ctx, chromedp.Navigate(twChatURL), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
+	if err := chromedputil.NavigateAndWaitBody(ctx, m.logger, twChatURL, "TW_MSG2"); err != nil {
 		return err
 	}
 	time.Sleep(3 * time.Second)

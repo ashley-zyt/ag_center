@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/platform/message"
 
@@ -90,7 +91,7 @@ func (m *instagramMessenger) CheckLogin(ctx context.Context) (string, error) {
 
 // OpenTargetProfile 导航到对方主页
 func (m *instagramMessenger) OpenTargetProfile(ctx context.Context, task message.SendTask) error {
-	if err := chromedp.Run(ctx, chromedp.Navigate(task.TargetURL), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
+	if err := chromedputil.NavigateAndWaitBody(ctx, m.logger, task.TargetURL, "IG_MSG2"); err != nil {
 		return err
 	}
 	time.Sleep(3 * time.Second)

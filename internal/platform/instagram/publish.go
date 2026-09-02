@@ -90,7 +90,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	defer cancelTimeout()
 
 	logger.Print("IG2", "打开Instagram首页")
-	if err := chromedp.Run(tabCtx, chromedp.Navigate("https://www.instagram.com/"), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
+	if err := chromedputil.NavigateAndWaitBody(tabCtx, logger, "https://www.instagram.com/", "IG2"); err != nil {
 		return fmt.Errorf("IG2 %v", err)
 	}
 	logger.Print("IG2", "已打开Instagram首页")

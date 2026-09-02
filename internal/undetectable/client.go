@@ -220,6 +220,15 @@ func WaitProfileStarted(ctx context.Context, c *Client, profileID string, timeou
 }
 
 func (c *Client) StopProfileBestEffort(ctx context.Context, profileID string) error {
+	// 停止 profile 属于清理动作，必须可靠：即使调用方的请求上下文已取消
+	// (客户端超时/断开导致 r.Context() 被取消)，也要完成停止，避免浏览器残留。
+	// 因此当传入 ctx 已失效时，改用独立的 background context。
+	if ctx == nil || ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+	}
+
 	candidates := []struct {
 		Method string
 		Path   string

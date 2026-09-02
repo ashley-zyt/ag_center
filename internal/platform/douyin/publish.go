@@ -108,7 +108,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	defer cancelTimeout()
 
 	// 打开抖音创作者中心上传页
-	if err := chromedp.Run(tabCtx, chromedp.Navigate("https://creator.douyin.com/creator-micro/content/upload"), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
+	if err := chromedputil.NavigateAndWaitBody(tabCtx, logger, "https://creator.douyin.com/creator-micro/content/upload", "DY2"); err != nil {
 		return fmt.Errorf("DY2 %v", err)
 	}
 	logger.Print("DY2", "已打开抖音创作者中心上传页")

@@ -78,7 +78,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 6*time.Minute)
 	defer cancelTimeout()
 
-	if err := chromedp.Run(tabCtx, chromedp.Navigate("https://studio.youtube.com/channel/%s/videos/upload?d=ud&filter%%5B%%5D&sort=%%7B%%22columnType%%22%%3A%%22date%%22%%2C%%22sortOrder%%22%%3A%%22DESCENDING%%22%%7D"), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
+	if err := chromedputil.NavigateAndWaitBody(tabCtx, logger, "https://studio.youtube.com/channel/%s/videos/upload?d=ud&filter%%5B%%5D&sort=%%7B%%22columnType%%22%%3A%%22date%%22%%2C%%22sortOrder%%22%%3A%%22DESCENDING%%22%%7D", "YTB2"); err != nil {
 		return fmt.Errorf("YTB2 %v", err)
 	}
 	logger.Print("YTB2", "已打开YouTube Studio")
@@ -168,18 +168,24 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	if err := clickSelector(tabCtx, `tp-yt-paper-radio-group#privacy-radios > tp-yt-paper-radio-button[name="PUBLIC"]`, chromedp.ByQuery); err != nil {
 		return fmt.Errorf("YTB9 %v", err)
 	}
-	logger.Print("YTB10", "已点击发布，开始检测发布结果")
-	logger.Print("YTB10", "确认发布按钮检测")
+	logger.Print("YTB9", "已选择 PUBLIC")
+
+	logger.Print("YTB10", "检测并点击 Save 发布按钮")
 	existsDone, _ := existsSelector(tabCtx, `ytcp-button#done-button`, chromedp.ByQuery)
-	if existsDone {
-		logger.Print("YTB10", "点击确认发布")
-		if err := clickSelector(tabCtx, `ytcp-button#done-button`, chromedp.ByQuery); err != nil {
-			return fmt.Errorf("YTB10 %v", err)
-		}
-	} else {
-		logger.Print("YTB10", "未找到确认发布按钮")
+	if !existsDone {
+		return errors.New("YTB10 save(done) button not found")
 	}
-	time.Sleep(8 * time.Second)
+	if err := clickSelector(tabCtx, `ytcp-button#done-button`, chromedp.ByQuery); err != nil {
+		return fmt.Errorf("YTB10 %v", err)
+	}
+	logger.Print("YTB10", "已点击 Save")
+
+	// 点击 Save 后用元素判断发布是否成功：等待 "Video published" 分享弹窗出现。
+	// 用 ytcp-video-share-dialog + #close-icon-button 判断，不依赖页面语言。
+	if err := waitPublishSuccess(tabCtx, logger, 30*time.Second); err != nil {
+		return err
+	}
+
 	tabCloseCtx, cancelTabClose := context.WithTimeout(tabCtx, 4*time.Second)
 	_ = chromedp.Run(tabCloseCtx, chromedp.ActionFunc(func(ctx context.Context) error {
 		return page.Close().Do(ctx)
@@ -399,6 +405,39 @@ func existsSelector(ctx context.Context, selector string, by chromedp.QueryOptio
 	var nodes []*cdp.Node
 	err := chromedp.Run(checkCtx, chromedp.Nodes(selector, &nodes, by))
 	return len(nodes) > 0, err
+}
+
+// waitPublishSuccess 用元素判断发布是否成功：等待 "Video published" 分享弹窗出现。
+// 弹窗由 <ytcp-video-share-dialog> 容器承载。只判断该容器是否出现且未被隐藏，
+// 不再依赖内部的 close 按钮或 getBoundingClientRect（YouTube 的 Polymer 组件常使用
+// display:contents 或 shadow DOM，导致子元素查询/宽高判断失效）。
+func waitPublishSuccess(ctx context.Context, logger *logx.Logger, timeout time.Duration) error {
+	logger.Print("YTB11", "检测发布是否成功")
+	deadline := time.Now().Add(timeout)
+	lastState := ""
+	for time.Now().Before(deadline) {
+		var state string
+		js := `(function(){
+			var dlg = document.querySelector('ytcp-video-share-dialog');
+			if(!dlg) return 'no-dialog';
+			var cs = getComputedStyle(dlg);
+			if(cs.display === 'none' || cs.visibility === 'hidden') return 'dialog-hidden';
+			return 'ok';
+		})()`
+		stepCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		_ = chromedp.Run(stepCtx, chromedp.Evaluate(js, &state))
+		cancel()
+		if state == "ok" {
+			logger.Print("YTB11", "发布成功弹窗已出现 (Video published)")
+			return nil
+		}
+		if state != lastState {
+			logger.Print("YTB11", "发布成功弹窗尚未出现，当前状态: "+state)
+			lastState = state
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return errors.New("YTB11 publish success dialog not detected")
 }
 
 func truncateRunes(s string, max int) string {

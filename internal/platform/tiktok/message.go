@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/platform/message"
 
@@ -112,7 +113,7 @@ func (t *tiktokMessenger) CheckLogin(ctx context.Context) (string, error) {
 // OpenTargetProfile 导航到对方主页
 func (t *tiktokMessenger) OpenTargetProfile(ctx context.Context, task message.SendTask) error {
 	t.setPartnerHandle(task)
-	if err := chromedp.Run(ctx, chromedp.Navigate(task.TargetURL), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
+	if err := chromedputil.NavigateAndWaitBody(ctx, t.logger, task.TargetURL, "TT_MSG2"); err != nil {
 		return err
 	}
 	time.Sleep(3 * time.Second)

@@ -2,11 +2,13 @@ package twitter
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"minimax_pro/internal/chromedputil"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,7 +82,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 4*time.Minute)
 	defer cancelTimeout()
 
-	if err := chromedp.Run(tabCtx, chromedp.Navigate("https://x.com/compose/tweet"), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
+	if err := chromedputil.NavigateAndWaitBody(tabCtx, logger, "https://x.com/compose/tweet", "TW2"); err != nil {
 		return fmt.Errorf("TW2 %v", err)
 	}
 	logger.Print("TW2", "已打开推文发布页")
@@ -103,8 +105,11 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		}
 	}
 
-	logger.Print("TW6", "等待100秒后点击发布")
-	time.Sleep(100 * time.Second)
+	logger.Print("TW6", "等待发布按钮可用")
+	// 替代原先固定的 100 秒 sleep：轮询等待视频上传/转码完成、发布按钮从禁用变为可用。
+	if err := waitPublishButtonReady(tabCtx, logger, 3*time.Minute); err != nil {
+		return fmt.Errorf("TW6 %v", err)
+	}
 
 	if err := clickPublish(tabCtx, logger); err != nil {
 		return fmt.Errorf("TW6 %v", err)
@@ -231,26 +236,90 @@ func fillText(ctx context.Context, logger *logx.Logger, text string) error {
 	return errors.New("TW5 cannot fill tweet text: content not confirmed")
 }
 
+// publishButtonSelectors 是发布按钮的候选选择器列表，按优先级排列。
+// X/Twitter 改版后 data-testid 可能变化，这里同时覆盖 modal 与 inline 两种形态。
+var publishButtonSelectors = []string{
+	`button[data-testid="tweetButton"]`,
+	`button[data-testid="tweetButtonInline"]`,
+	`div[data-testid="tweetButton"]`,
+	`div[data-testid="tweetButtonInline"]`,
+	`div[role="dialog"] button[data-testid="tweetButton"]`,
+	`div[aria-labelledby="modal-header"] button[data-testid="tweetButton"]`,
+}
+
+// waitPublishButtonReady 轮询等待发布按钮出现且变为可用(未禁用)。
+// 视频上传/转码期间按钮会处于禁用状态，这里等待其变为可点击，替代固定 sleep。
+func waitPublishButtonReady(ctx context.Context, logger *logx.Logger, timeout time.Duration) error {
+	selsJSON, _ := json.Marshal(publishButtonSelectors)
+	js := fmt.Sprintf(`(function(){
+		var sels = %s;
+		for(var i=0;i<sels.length;i++){
+			var b = document.querySelector(sels[i]);
+			if(b && !b.disabled && b.getAttribute('aria-disabled') !== 'true'){
+				return 'ready:' + sels[i];
+			}
+		}
+		for(var i=0;i<sels.length;i++){
+			var b = document.querySelector(sels[i]);
+			if(b) return 'disabled:' + sels[i];
+		}
+		return 'none';
+	})()`, selsJSON)
+
+	deadline := time.Now().Add(timeout)
+	var lastState string
+	for time.Now().Before(deadline) {
+		var state string
+		stepCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		_ = chromedp.Run(stepCtx, chromedp.Evaluate(js, &state))
+		cancel()
+
+		if strings.HasPrefix(state, "ready:") {
+			logger.Print("TW6", "发布按钮已可用: "+strings.TrimPrefix(state, "ready:"))
+			return nil
+		}
+		if state != lastState {
+			if strings.HasPrefix(state, "disabled:") {
+				logger.Print("TW6", "发布按钮存在但禁用中，等待视频上传/转码: "+strings.TrimPrefix(state, "disabled:"))
+			} else if state == "none" {
+				logger.Print("TW6", "发布按钮尚未出现，继续等待")
+			} else if state == "" {
+				logger.Print("TW6", "查询页面状态失败，继续等待")
+			}
+			lastState = state
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return errors.New("TW6 publish button not ready within timeout")
+}
+
 func clickPublish(ctx context.Context, logger *logx.Logger) error {
 	logger.Print("TW6", "尝试点击发布按钮")
 	_ = logButtonStructure(ctx, logger)
 	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
-		var ok bool
-		js := `(function(){
-			var btn = document.querySelector('button[data-testid="tweetButton"]');
-			if(!btn) return false;
-			try{btn.scrollIntoView({block:"center",inline:"center"});}catch(e){}
-			try{btn.click();return true;}catch(e){return false;}
-		})()`
-		eCtx, cancelEval := context.WithTimeout(ctx, 3*time.Second)
-		_ = chromedp.Run(eCtx, chromedp.Evaluate(js, &ok))
-		cancelEval()
-		if !ok {
+		var clicked bool
+		var hitSelector string
+		for _, sel := range publishButtonSelectors {
+			js := fmt.Sprintf(`(function(){
+				var btn = document.querySelector(%s);
+				if(!btn) return false;
+				try{btn.scrollIntoView({block:"center",inline:"center"});}catch(e){}
+				try{btn.click();return true;}catch(e){return false;}
+			})()`, strconv.Quote(sel))
+			eCtx, cancelEval := context.WithTimeout(ctx, 3*time.Second)
+			_ = chromedp.Run(eCtx, chromedp.Evaluate(js, &clicked))
+			cancelEval()
+			if clicked {
+				hitSelector = sel
+				break
+			}
+		}
+		if !clicked {
 			time.Sleep(900 * time.Millisecond)
 			continue
 		}
-		logger.Print("TW6", "已点击发布")
+		logger.Print("TW6", "已点击发布按钮: "+hitSelector)
 		if err := waitPublishEffect(ctx, logger); err == nil {
 			logger.Print("TW6", "发布效果检测通过")
 			return nil
@@ -264,26 +333,26 @@ func clickPublish(ctx context.Context, logger *logx.Logger) error {
 }
 
 func logButtonStructure(ctx context.Context, logger *logx.Logger) error {
-	var html string
+	// 输出当前页面 URL 以及所有与发布相关的 data-testid 元素，便于定位选择器变化。
+	var diag string
 	js := `(function(){
-		var el = document.querySelector('div[aria-labelledby="modal-header"] > div[data-viewportview="true"] > button[data-testid="tweetButton"]');
-		if(!el) {
-			el = document.querySelector('button[data-testid="tweetButton"]');
-		}
-		if(!el) {
-			el = document.querySelector('div[aria-labelledby="modal-header"]');
-		}
-		return el ? el.outerHTML : "NOT_FOUND";
+		var url = location.href;
+		var btns = [];
+		document.querySelectorAll('[data-testid]').forEach(function(el){
+			var tid = el.getAttribute('data-testid');
+			if(/tweet|post|send|publish|button/i.test(tid)) btns.push(el.tagName.toLowerCase() + '[data-testid="' + tid + '"]');
+		});
+		return JSON.stringify({url: url, candidates: btns.slice(0, 40)});
 	})()`
 	stepCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	_ = chromedp.Run(stepCtx, chromedp.Evaluate(js, &html))
+	_ = chromedp.Run(stepCtx, chromedp.Evaluate(js, &diag))
 	cancel()
 
-	if html == "" || html == "NOT_FOUND" {
+	if diag == "" {
 		logger.Print("TW6", "未找到发布按钮及其容器结构")
 		return errors.New("TW6 button structure not found")
 	}
-	logger.Print("TW6", "发布按钮元素结构: "+html)
+	logger.Print("TW6", "发布按钮诊断: "+diag)
 	return nil
 }
 

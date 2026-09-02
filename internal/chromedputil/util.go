@@ -112,6 +112,23 @@ func CleanExtraTabs(ctx context.Context, logger *logx.Logger, platformTag string
 	logger.Print(platformTag, "已清理多余标签页，保留1个")
 }
 
+// PageLoadTimeout 打开页面后的加载超时时间：页面在该时长内未完成加载则终止流程。
+const PageLoadTimeout = 30 * time.Second
+
+// ErrPageLoadTimeout 表示页面加载超时。
+var ErrPageLoadTimeout = errors.New("页面加载超时")
+
+// NavigateAndWaitBody 导航到指定 URL 并等待 body 就绪。
+// 注意：这里直接用原 ctx 导航，不再套 context.WithTimeout 子上下文——chromedp 的
+// Navigate 内部用 responseAction 监听 load/lifecycle 事件，子上下文的超时/取消会与
+// 事件派发产生竞态，导致后续上传等操作被干扰。
+func NavigateAndWaitBody(ctx context.Context, logger *logx.Logger, url, tag string) error {
+	if err := chromedp.Run(ctx, chromedp.Navigate(url), chromedp.WaitReady("body", chromedp.ByQuery)); err != nil {
+		return err
+	}
+	return nil
+}
+
 // CloseTabsAndStopProfile 关闭所有标签页, 并请求停止 Undetectable Profile。
 // browserCtx 必须是 chromedp.NewContext 创建的浏览器上下文。
 func CloseTabsAndStopProfile(ctx context.Context, browserCtx context.Context, logger *logx.Logger,
