@@ -617,6 +617,8 @@ func stopProfileWithCleanup(ctx context.Context, logger *logx.Logger, browserCtx
 	cancelStop()
 	if err != nil {
 		logger.Print("E", "停止 Profile 失败(浏览器可能未彻底关闭): "+err.Error())
+		// 兜底：stop 接口失败时，直接通过 CDP 关闭浏览器本体，避免浏览器残留
+		chromedputil.CloseBrowserViaCDP(browserCtx, logger, "STOP")
 	}
 }
 

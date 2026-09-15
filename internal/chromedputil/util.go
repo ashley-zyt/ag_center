@@ -10,6 +10,7 @@ import (
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/undetectable"
 
+	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
@@ -151,12 +152,36 @@ func CloseTabsAndStopProfile(ctx context.Context, browserCtx context.Context, lo
 
 		if err != nil {
 			logger.Print(platformTag, "请求停止 Undetectable Profile 失败: "+err.Error())
+			// 兜底：stop 接口失败时，直接通过 CDP 关闭浏览器本体，避免浏览器残留
+			CloseBrowserViaCDP(browserCtx, logger, platformTag)
 		} else {
 			logger.Print(platformTag, "已成功请求停止 Undetectable Profile")
 			time.Sleep(3 * time.Second)
 			logger.Print(platformTag, "云端同步缓冲完成，配置安全关闭")
 		}
 	}
+}
+
+// CloseBrowserViaCDP 通过 CDP 的 Browser.close 命令直接关闭浏览器本体。
+// 作为 Undetectable stop 接口失败时的兜底：即使 HTTP stop 请求失效，也能当场关掉浏览器，
+// 避免遗留一个空白标签页的浏览器、只能等 Undetectable 的空闲超时(约10分钟)才被关闭。
+// browserCtx 必须是 chromedp.NewContext 创建的浏览器上下文。
+func CloseBrowserViaCDP(browserCtx context.Context, logger *logx.Logger, tag string) {
+	if browserCtx == nil || browserCtx.Err() != nil {
+		return
+	}
+	exec, err := browserExecutor(browserCtx)
+	if err != nil {
+		logger.Print(tag, "CDP 关闭浏览器失败(无法获取 executor): "+err.Error())
+		return
+	}
+	closeCtx, cancelClose := context.WithTimeout(browserCtx, 5*time.Second)
+	defer cancelClose()
+	if err := browser.Close().Do(cdp.WithExecutor(closeCtx, exec)); err != nil {
+		logger.Print(tag, "CDP 关闭浏览器失败: "+err.Error())
+		return
+	}
+	logger.Print(tag, "已通过 CDP 直接关闭浏览器本体")
 }
 
 // PageStallTimeout 页面停留超时默认值(30秒)
