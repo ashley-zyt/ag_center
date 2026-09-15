@@ -103,6 +103,9 @@ const (
 	// statistics (followers, total posts) after post scraping completes.
 	// Can be overridden via ACCOUNT_STATS_UPDATE_API_URL environment variable.
 	accountStatsUpdateURL = "http://47.89.235.227:3366/api/v1/account_stats/batch_update"
+
+	// browserReleaseURL 浏览器彻底关闭后，通知后端释放该浏览器占用的接口地址。
+	browserReleaseURL = "http://47.89.235.227:3366/api/v1/browser_occupations/release"
 )
 
 // publishTimeout 发布等长流程使用独立 background context 时的超时上限，
@@ -1053,6 +1056,8 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 		}
 
 		stopProfileWithCleanup(context.Background(), logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+		// 浏览器已彻底关闭，通知后端释放该浏览器占用
+		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
 
 		writeJSON(w, http.StatusOK, FetchPostsResponse{
 			Type:      "success",
@@ -1111,6 +1116,63 @@ func callSinglePostUpdateAPI(ctx context.Context, logger *logx.Logger, endpoint 
 	}
 
 	return nil
+}
+
+// releaseBrowserOccupation 在浏览器彻底关闭后，通知后端释放该浏览器占用。
+// profileName 为 Undetectable 指纹浏览器的 profile 名称（与后端 browser 记录对应）。
+// 接口约定：无论结果如何 HTTP 都返回 200，靠响应 body 的 type 字段区分 success/error。
+// 该调用是 Best Effort：失败仅打日志，不影响主流程返回结果。
+func releaseBrowserOccupation(ctx context.Context, logger *logx.Logger, profileName string) {
+	if profileName == "" {
+		return
+	}
+	payload := map[string]string{"profile_name": profileName}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		logger.Print("REL", "序列化 release 请求失败: "+err.Error())
+		return
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, browserReleaseURL, bytes.NewReader(body))
+	if err != nil {
+		logger.Print("REL", "构建 release 请求失败: "+err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", accountCheckUA)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logger.Print("REL", "release 请求失败: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		logger.Print("REL", fmt.Sprintf("release 返回异常 HTTP 状态: status=%d body=%s", resp.StatusCode, string(raw)))
+		return
+	}
+
+	// 解析响应体，靠 type 字段区分结果（接口约定 HTTP 恒为 200）
+	var relResp struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &relResp); err != nil {
+		logger.Print("REL", fmt.Sprintf("release 响应解析失败: %v body=%s", err, string(raw)))
+		return
+	}
+	switch relResp.Type {
+	case "success":
+		logger.Print("REL", fmt.Sprintf("释放浏览器占用成功: profile_name=%s, 后端消息: %s", profileName, relResp.Message))
+	case "error":
+		logger.Print("REL", fmt.Sprintf("释放浏览器占用失败: profile_name=%s, 后端消息: %s", profileName, relResp.Message))
+	default:
+		logger.Print("REL", fmt.Sprintf("release 返回未知 type=%q message=%s", relResp.Type, relResp.Message))
+	}
 }
 
 // handleSendMessage POST /accounts/send_message 已移除(批量发送不再需要, 只保留单条发送)
@@ -1509,6 +1571,8 @@ func main() {
 		})
 
 		stopProfileWithCleanup(context.Background(), logger, browserCtx, res.Host, res.Port, res.ProfileID)
+		// 浏览器已彻底关闭，通知后端释放该浏览器占用
+		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
 
 		if nurtureErr != nil {
 			logger.Print("E", "养号流程失败: "+nurtureErr.Error())
@@ -1668,18 +1732,21 @@ func main() {
 		})
 	}
 	logger.Print("FB", "开始Facebook发布流程")
-		if err := facebook.PublishVideo(pubCtx, logger, facebook.PublishRequest{
+		pubErr := facebook.PublishVideo(pubCtx, logger, facebook.PublishRequest{
 			WebsocketURL:     res.Info.WebsocketLink,
 			Title:            req.Title,
 			VideoPath:        absVideoPath,
 			UndetectableHost: res.Host,
 			UndetectablePort: res.Port,
 			ProfileID:        res.ProfileID,
-		}); err != nil {
-			logger.Print("E", err.Error())
+		})
+		// 发布流程结束（无论成败），浏览器已由内部 defer 关闭，通知后端释放占用
+		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
+		if pubErr != nil {
+			logger.Print("E", pubErr.Error())
 			stopProfile("publish error")
 			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: pubErr.Error()})
 			return
 		}
 
@@ -1784,20 +1851,23 @@ func main() {
 		if strings.TrimSpace(textToUse) == "" && strings.TrimSpace(req.Title) != "" {
 			textToUse = req.Title
 		}
-		if err := twitter.PublishVideo(pubCtx, logger, twitter.PublishRequest{
+		pubErr := twitter.PublishVideo(pubCtx, logger, twitter.PublishRequest{
 			WebsocketURL:     res.Info.WebsocketLink,
 			Text:             textToUse,
 			VideoPath:        absVideoPath,
 			UndetectableHost: res.Host,
 			UndetectablePort: res.Port,
 			ProfileID:        res.ProfileID,
-		}); err != nil {
-			logger.Print("E", err.Error())
+		})
+		// 发布流程结束（无论成败），浏览器已由内部 defer 关闭，通知后端释放占用
+		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
+		if pubErr != nil {
+			logger.Print("E", pubErr.Error())
 			stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
 			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 			cancelStop()
 			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: pubErr.Error()})
 			return
 		}
 		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
@@ -1901,7 +1971,7 @@ func main() {
 		if titleToUse == "" && strings.TrimSpace(req.Text) != "" {
 			titleToUse = req.Text
 		}
-		if err := youtube.PublishVideo(pubCtx, logger, youtube.PublishRequest{
+		pubErr := youtube.PublishVideo(pubCtx, logger, youtube.PublishRequest{
 			WebsocketURL:     res.Info.WebsocketLink,
 			Title:            titleToUse,
 			Description:      req.Description,
@@ -1909,10 +1979,13 @@ func main() {
 			UndetectableHost: res.Host,
 			UndetectablePort: res.Port,
 			ProfileID:        res.ProfileID,
-		}); err != nil {
-			logger.Print("E", err.Error())
+		})
+		// 发布流程结束（无论成败），浏览器已由内部 defer 关闭，通知后端释放占用
+		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
+		if pubErr != nil {
+			logger.Print("E", pubErr.Error())
 			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: pubErr.Error()})
 			return
 		}
 		time.Sleep(8 * time.Second)
@@ -2016,17 +2089,20 @@ func main() {
 		if textToUse == "" && strings.TrimSpace(req.Title) != "" {
 			textToUse = req.Title
 		}
-		if err := tiktok.PublishVideo(pubCtx, logger, tiktok.PublishRequest{
+		pubErr := tiktok.PublishVideo(pubCtx, logger, tiktok.PublishRequest{
 			WebsocketURL:     res.Info.WebsocketLink,
 			Text:             textToUse,
 			VideoPath:        absVideoPath,
 			UndetectableHost: res.Host,
 			UndetectablePort: res.Port,
 			ProfileID:        res.ProfileID,
-		}); err != nil {
-			logger.Print("E", err.Error())
+		})
+		// 发布流程结束（无论成败），浏览器已由内部 defer 关闭，通知后端释放占用
+		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
+		if pubErr != nil {
+			logger.Print("E", pubErr.Error())
 			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: pubErr.Error()})
 			return
 		}
 		time.Sleep(8 * time.Second)
@@ -2131,20 +2207,23 @@ func main() {
 		if strings.TrimSpace(textToUse) == "" && strings.TrimSpace(req.Title) != "" {
 			textToUse = req.Title
 		}
-		if err := instagram.PublishVideo(pubCtx, logger, instagram.PublishRequest{
+		pubErr := instagram.PublishVideo(pubCtx, logger, instagram.PublishRequest{
 			WebsocketURL:     res.Info.WebsocketLink,
 			Text:             textToUse,
 			VideoPath:        absVideoPath,
 			UndetectableHost: res.Host,
 			UndetectablePort: res.Port,
 			ProfileID:        res.ProfileID,
-		}); err != nil {
-			logger.Print("E", err.Error())
+		})
+		// 发布流程结束（无论成败），浏览器已由内部 defer 关闭，通知后端释放占用
+		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
+		if pubErr != nil {
+			logger.Print("E", pubErr.Error())
 			stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
 			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 			cancelStop()
 			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: pubErr.Error()})
 			return
 		}
 		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
