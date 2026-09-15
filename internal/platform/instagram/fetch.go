@@ -213,6 +213,7 @@ func FetchInstagramPosts(ctx context.Context, logger *logx.Logger, req scraper.F
 		let anchors = Array.from(document.querySelectorAll('a[href*="/reel/"]'));
 		
 		anchors.forEach((a, index) => {
+			if (results.length >= 10) return;
 			let viewStr = "0";
 			// 1. 根据你提供的特征定位包含 SVG 的外层 div
 			let iconWrapper = a.querySelector('div svg[aria-label="View Count Icon"]').parentElement;
@@ -253,6 +254,10 @@ func FetchInstagramPosts(ctx context.Context, logger *logx.Logger, req scraper.F
 
 	// 4. 遍历抓取到的链接，进入详情页获取标题、时间、点赞、评论等明细
 	for idx, item := range rawItems {
+		if idx >= 10 {
+			logger.Print("INS_FETCH", "已处理前 10 条，跳过剩余发文详情抓取")
+			break
+		}
 		var data map[string]string
 
 		logger.Print("INS_FETCH", fmt.Sprintf("▶ 正在进入详情页 [%d/%d] (附带浏览量数据: %s)", idx+1, len(rawItems), item.Views))
@@ -304,7 +309,7 @@ func FetchInstagramPosts(ctx context.Context, logger *logx.Logger, req scraper.F
 
 				return {
 					"title": title,
-					"time": document.querySelector('time')?.getAttribute('datetime') || "Unknown",
+					"time": (function(){ var t = document.querySelector('main[role="main"] time[datetime]') || document.querySelector('time[datetime]') || document.querySelector('time'); return t ? (t.getAttribute('datetime') || t.getAttribute('title') || '') : ''; })(),
 					"likes": likes,
 					"comments": comments,
 					"shares": shares

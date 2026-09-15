@@ -355,8 +355,18 @@ func waitAndClick(ctx context.Context, logger *logx.Logger, parentSel string, bu
 }
 
 func fillReelTitle(ctx context.Context, logger *logx.Logger, text string) error {
-	sel := `div[aria-label="Write a caption..."]`
+	// Instagram 改版：标题输入框 aria-label 从 "Write a caption..." 改为 "Add a caption..."，优先新文案、兼容旧文案
+	sel := `div[aria-label="Add a caption..."]`
+	altSel := `div[aria-label="Write a caption..."]`
 	logger.Print("IG5", "查找标题输入框: "+sel)
+	probeCtx, cancelProbe := context.WithTimeout(ctx, 3*time.Second)
+	var probeNodes []*cdp.Node
+	_ = chromedp.Run(probeCtx, chromedp.Nodes(sel, &probeNodes, chromedp.ByQuery))
+	cancelProbe()
+	if len(probeNodes) == 0 {
+		sel = altSel
+		logger.Print("IG5", "新文案输入框不存在，改用旧文案选择器: "+sel)
+	}
 
 	for retry := 0; retry < 3; retry++ {
 		var nodes []*cdp.Node
@@ -619,8 +629,31 @@ func clickExpandCropButton(ctx context.Context, logger *logx.Logger) error {
 
 // clickOriginalOption 点击视频格式选项中的 Original
 func clickOriginalOption(ctx context.Context, logger *logx.Logger) error {
-	deadline := time.Now().Add(20 * time.Second)
+	// 新版 Instagram：点击左下角 Select crop 后进入 Crop 对话框，
+	// 需再点对话框内的 Select crop 按钮弹出比例面板，才能看到 Original 选项。
+	openCropPanelJs := `(function(){
+		var cropDlg = document.querySelector('div[role="dialog"][aria-label="Crop"]');
+		if(!cropDlg) return false;
+		var svg = cropDlg.querySelector('svg[aria-label="Select crop"]');
+		if(!svg) return false;
+		var btn = svg.closest('button') || svg.parentElement;
+		if(btn){ try{ btn.click(); return true; }catch(e){ return false; } }
+		return false;
+	})()`
+
+	deadline := time.Now().Add(25 * time.Second)
+	panelLogged := false
 	for time.Now().Before(deadline) {
+		// 每次循环都尝试弹比例面板（覆盖对话框/面板渲染慢的时序），找不到 Original 时持续重试
+		var opened bool
+		openCtx, cancelOpen := context.WithTimeout(ctx, 3*time.Second)
+		_ = chromedp.Run(openCtx, chromedp.Evaluate(openCropPanelJs, &opened))
+		cancelOpen()
+		if opened && !panelLogged {
+			logger.Print("IG4", "已在 Crop 对话框中点击 Select crop，弹出比例面板")
+			panelLogged = true
+		}
+
 		var ok bool
 		js := `(function(){
 			function isVisible(el){
@@ -632,25 +665,41 @@ func clickOriginalOption(ctx context.Context, logger *logx.Logger) error {
 			}
 			function tryClick(el){
 				if(!el) return false;
-				try{ el.click(); return true; }catch(e){ return false; }
+				try{
+					var r = el.getBoundingClientRect();
+					var cx = r.left + r.width/2, cy = r.top + r.height/2;
+					var opts = {bubbles:true, cancelable:true, view:window, clientX:cx, clientY:cy};
+					try{ el.dispatchEvent(new PointerEvent('pointerdown', opts)); }catch(e){}
+					try{ el.dispatchEvent(new MouseEvent('mousedown', opts)); }catch(e){}
+					try{ el.dispatchEvent(new PointerEvent('pointerup', opts)); }catch(e){}
+					try{ el.dispatchEvent(new MouseEvent('mouseup', opts)); }catch(e){}
+					try{ el.dispatchEvent(new MouseEvent('click', opts)); }catch(e){}
+					el.click();
+					return true;
+				}catch(e){ return false; }
 			}
-			// 1) 确认结构: Original 是 div[role=button] 内的 span[dir="auto"], 文本恰为 Original
+			// 1) 多语言 Original 匹配（英文 Original / 越南语 Nguyên bản / 中文 原始 等），覆盖多语言账号
+			function isOriginalText(t){
+				t = (t||'').trim().toLowerCase();
+				var texts = ['original', 'nguyên bản', 'nguyen ban', 'nguyên', 'gốc', 'goc', '原始', '原图', '原圖', 'オリジナル'];
+				for(var x=0;x<texts.length;x++){ if(t === texts[x]) return true; }
+				return false;
+			}
 			var spans = document.querySelectorAll('span[dir="auto"]');
 			for(var i=0;i<spans.length;i++){
-				if((spans[i].textContent||'').trim() !== 'Original') continue;
+				if(!isOriginalText(spans[i].textContent)) continue;
 				var btn = spans[i].closest('[role="button"]') || spans[i].closest('button');
 				if(btn && isVisible(btn)){ return tryClick(btn); }
 				if(isVisible(spans[i])){ return tryClick(spans[i]); }
 			}
-			// 2) 兜底: 文本恰为 Original 的最内层可见元素, 点击其最近可点击容器
+			// 2) 兜底: 文本为 Original 的最内层可见元素, 点击其最近可点击容器
 			var all = document.querySelectorAll('button, [role="button"], div, span');
 			for(var j=0;j<all.length;j++){
 				var el = all[j];
-				var txt = (el.textContent||'').trim();
-				if(txt !== 'Original') continue;
+				if(!isOriginalText(el.textContent)) continue;
 				var hasTextChild = false;
 				for(var k=0;k<el.children.length;k++){
-					if((el.children[k].textContent||'').trim() === 'Original'){ hasTextChild = true; break; }
+					if(isOriginalText(el.children[k].textContent)){ hasTextChild = true; break; }
 				}
 				if(hasTextChild) continue;
 				if(isVisible(el)){
@@ -676,6 +725,10 @@ func clickOriginalOption(ctx context.Context, logger *logx.Logger) error {
 func fillCaption(ctx context.Context, logger *logx.Logger, text string) error {
 	logger.Print("IG5", "填写图片/视频描述")
 	captionSelectors := []string{
+		`//div[@role="textbox"][@aria-label="Add a caption..."]`,
+		`//div[@aria-label="Add a caption..."]`,
+		`//div[@contenteditable="true"][@aria-label="Add a caption..."]`,
+		`//textarea[@aria-label="Add a caption..."]`,
 		`//div[@role="textbox"][@aria-label="Write a caption..."]`,
 		`//div[@aria-label="Write a caption..."]`,
 		`//textarea[@aria-label="Write a caption..."]`,

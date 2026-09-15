@@ -162,18 +162,18 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 	// 4. 采集Shorts (/videos/short) 和 长视频 (/videos)
 	var posts []scraper.Post
 
-	// Shorts采集
+	// Shorts采集（最多 10 条）
 	shortsTabURL := studioBase + "/videos/short"
-	shortsPosts, shortsErr := collectStudioTab(ctx, logger, shortsTabURL, true)
+	shortsPosts, shortsErr := collectStudioTab(ctx, logger, shortsTabURL, true, 10)
 	if shortsErr != nil {
 		logger.Print("YT_WARN", fmt.Sprintf("Shorts采集遇到问题: %v", shortsErr))
 	}
 	posts = append(posts, shortsPosts...)
 	logger.Print("YT_FETCH", fmt.Sprintf("Shorts采集完成: %d 条", len(shortsPosts)))
 
-	// 长视频采集
+	// 长视频采集（最多 10 条）
 	videosTabURL := studioBase + "/videos"
-	videosPosts, videosErr := collectStudioTab(ctx, logger, videosTabURL, false)
+	videosPosts, videosErr := collectStudioTab(ctx, logger, videosTabURL, false, 10)
 	if videosErr != nil {
 		logger.Print("YT_WARN", fmt.Sprintf("长视频采集遇到问题: %v", videosErr))
 	}
@@ -192,7 +192,7 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 
 // collectStudioTab 采集Studio指定Tab(Shorts或Videos)的视频列表和点赞数
 // isShorts=true时访问 /videos/short 详情页用 /shorts/{id}; false时访问 /videos 详情页用 /watch?v={id}
-func collectStudioTab(ctx context.Context, logger *logx.Logger, tabURL string, isShorts bool) ([]scraper.Post, error) {
+func collectStudioTab(ctx context.Context, logger *logx.Logger, tabURL string, isShorts bool, maxPosts int) ([]scraper.Post, error) {
 	tag := "YT_SHORTS"
 	detailURLPrefix := "https://www.youtube.com/shorts/"
 	if !isShorts {
@@ -284,11 +284,14 @@ func collectStudioTab(ctx context.Context, logger *logx.Logger, tabURL string, i
 		return nil, nil
 	}
 
-	// 每个Tab最多只处理前10条
-	const maxPostsPerTab = 10
-	if len(jsResult) > maxPostsPerTab {
-		logger.Print(tag, fmt.Sprintf("嗅探到 %d 条记录，仅处理前 %d 条", len(jsResult), maxPostsPerTab))
-		jsResult = jsResult[:maxPostsPerTab]
+	// 每个Tab最多只处理前 maxPosts 条（0 或负数则直接跳过该 Tab）
+	if maxPosts <= 0 {
+		logger.Print(tag, "已达发文上限，跳过该 Tab 采集")
+		return nil, nil
+	}
+	if len(jsResult) > maxPosts {
+		logger.Print(tag, fmt.Sprintf("嗅探到 %d 条记录，仅处理前 %d 条", len(jsResult), maxPosts))
+		jsResult = jsResult[:maxPosts]
 	} else {
 		logger.Print(tag, fmt.Sprintf("嗅探到 %d 条记录，开始追溯点赞明细...", len(jsResult)))
 	}
@@ -548,6 +551,14 @@ const ytStudioCollectJS = `
         if (cnMatch) {
             let pad = (n) => n.length < 2 ? '0' + n : n;
             return cnMatch[1] + '-' + pad(cnMatch[2]) + '-' + pad(cnMatch[3]) + ' 00:00:00';
+        }
+
+        // 越南语日期: "12 thg 9, 2026" / "3 tháng 9, 2026"（日 thg/tháng 月, 年）
+        let vnMatch = cleanStr.match(/(\d{1,2})\s*th(?:g|áng|ang)\s*(\d{1,2})(?:\s*,\s*(\d{4}))?/i);
+        if (vnMatch) {
+            let pad2 = (n) => String(n).length < 2 ? '0' + String(n) : String(n);
+            let vnYear = vnMatch[3] ? vnMatch[3] : new Date().getFullYear();
+            return vnYear + '-' + pad2(vnMatch[2]) + '-' + pad2(vnMatch[1]) + ' 00:00:00';
         }
 
         let normalized = cleanStr.toLowerCase();
@@ -812,12 +823,25 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
+// metricThousandsDotRe 匹配越南语/欧洲格式的"点号千分位"（"1.314" = 1314）。
+// Go regexp(RE2) 不支持 lookahead，用"点号+3位数字+非数字或结尾"捕获组实现。
+var metricThousandsDotRe = regexp.MustCompile(`\.(\d{3})([^\d]|$)`)
+
 func parseYoutubeMetric(s string) int {
 	s = strings.TrimSpace(strings.ToLower(s))
 	if s == "" || s == "–" {
 		return 0
 	}
 	s = strings.ReplaceAll(s, ",", "")
+	// 越南语/欧洲格式：点号做千分位分隔符（"1.314" = 1314），点号后恰好 3 位数字视为千分位。
+	// 循环替换以处理多点号（如 "1.314.567" = 1314567）。
+	for {
+		next := metricThousandsDotRe.ReplaceAllString(s, "$1$2")
+		if next == s {
+			break
+		}
+		s = next
+	}
 
 	var clean strings.Builder
 	for _, r := range s {

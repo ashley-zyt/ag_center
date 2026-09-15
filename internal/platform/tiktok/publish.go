@@ -203,16 +203,24 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	return nil
 }
 
-// handlePostNowModal 检查并处理 “Post now” 确认弹窗
+// handlePostNowModal 检查并处理 "Post now" 确认弹窗。
+// 点击发布按钮后 TikTok 会弹出确认框，需再点弹窗内的 "Post now" 按钮才真正发布。
+// 弹窗按钮 DOM: button.TUXButton > div.TUXButton-content > div.TUXButton-label(文字 "Post now")。
+// 注意：不能用 ">" 直接子元素选择器——中间隔了一层 TUXButton-content，需用后代选择器(空格)。
 func handlePostNowModal(ctx context.Context, logger *logx.Logger) bool {
 	var found bool
-	// 检查是否存在指定的按钮，且文本匹配且 aria-disabled 为 false
+	// 检测弹窗内的 "Post now" 按钮：TUXButton-label 文字含 "Post"(兼容 "Post now"/"Post")。
+	// 另兼容 confirm-modal 结构：role=dialog 内 button[data-e2e="post_video_button"]。
 	js := `(function(){
-		var labels = document.querySelectorAll('button[aria-disabled="false"] > div[class="TUXButton-label"]');
-		for(var i=0; i<labels.length; i++) {
-			if(labels[i].textContent.trim().includes("Post now")) {
-				return true;
-			}
+		var labels = document.querySelectorAll('button[aria-disabled="false"] div.TUXButton-label');
+		for(var i=0;i<labels.length;i++){
+			var t = (labels[i].textContent||'').trim().toLowerCase();
+			if(t.indexOf('post') !== -1) return true;
+		}
+		var dialogs = document.querySelectorAll('div[role="dialog"]');
+		for(var j=0;j<dialogs.length;j++){
+			var b = dialogs[j].querySelector('button[data-e2e="post_video_button"]');
+			if(b && b.getAttribute('aria-disabled') !== 'true' && !b.disabled) return true;
 		}
 		return false;
 	})()`
@@ -222,13 +230,21 @@ func handlePostNowModal(ctx context.Context, logger *logx.Logger) bool {
 	cancel()
 
 	if found {
-		logger.Print("TT6", "检测到 'Post now' 确认按钮，进行点击确认")
-		// 使用更通用的点击脚本，确保能点到
+		logger.Print("TT6", "检测到 'Post now' 确认弹窗，点击确认")
 		jsClick := `(function(){
-			var labels = document.querySelectorAll('button[aria-disabled="false"] > div[class="TUXButton-label"]');
-			for(var i=0; i<labels.length; i++) {
-				if(labels[i].textContent.trim().includes("Post now")) {
-					labels[i].parentElement.click();
+			var labels = document.querySelectorAll('button[aria-disabled="false"] div.TUXButton-label');
+			for(var i=0;i<labels.length;i++){
+				var t = (labels[i].textContent||'').trim().toLowerCase();
+				if(t.indexOf('post') !== -1){
+					var btn = labels[i].closest('button');
+					if(btn){ btn.click(); return true; }
+				}
+			}
+			var dialogs = document.querySelectorAll('div[role="dialog"]');
+			for(var j=0;j<dialogs.length;j++){
+				var b = dialogs[j].querySelector('button[data-e2e="post_video_button"]');
+				if(b && b.getAttribute('aria-disabled') !== 'true'){
+					b.click();
 					return true;
 				}
 			}
@@ -241,12 +257,11 @@ func handlePostNowModal(ctx context.Context, logger *logx.Logger) bool {
 		cancelClick()
 
 		if !clicked {
-			logger.Print("TT6", "点击 'Post now' 失败")
+			logger.Print("TT6", "点击 'Post now' 确认失败")
 			return false
 		}
 
-		logger.Print("TT6", "已点击 Post now，等待5秒后重新尝试点击发布")
-		time.Sleep(5 * time.Second)
+		logger.Print("TT6", "已点击 Post now 确认发布")
 		return true
 	}
 	return false

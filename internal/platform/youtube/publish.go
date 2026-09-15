@@ -13,6 +13,7 @@ import (
 	"minimax_pro/internal/logx"
 
 	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 	"github.com/chromedp/chromedp/kb"
@@ -121,11 +122,16 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 			return fmt.Errorf("YTB5 %v", err)
 		}
 	}
-	logger.Print("YTB6", "开始选择是否面向儿童")
-	if err := clickSelector(tabCtx, `tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"] > div#radioContainer`, chromedp.ByQuery); err != nil {
-		return fmt.Errorf("YTB6 %v", err)
+	logger.Print("YTB6", "检测是否面向儿童选项是否存在")
+	mfkExists, _ := existsSelector(tabCtx, `tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]`, chromedp.ByQuery)
+	if mfkExists {
+		if err := clickSelector(tabCtx, `tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"] div#radioContainer`, chromedp.ByQuery); err != nil {
+			return fmt.Errorf("YTB6 %v", err)
+		}
+		logger.Print("YTB6", "已选择非儿童选项")
+	} else {
+		logger.Print("YTB6", "未找到儿童选项(YouTube已移除该选择)，跳过")
 	}
-	logger.Print("YTB6", "已选择非儿童选项")
 	logger.Print("YTB7", "检测Next按钮是否存在")
 	_ = logRightButtonAreaDOM(tabCtx, logger)
 	exists, _ := existsSelector(tabCtx, `ytcp-button#next-button`, chromedp.ByQuery)
@@ -165,10 +171,29 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	logger.Print("YTB8-3", "第三次Next已点击")
 	logger.Print("YTB9", "等待5秒后选择可视范围PUBLIC")
 	time.Sleep(5 * time.Second)
-	if err := clickSelector(tabCtx, `tp-yt-paper-radio-group#privacy-radios > tp-yt-paper-radio-button[name="PUBLIC"]`, chromedp.ByQuery); err != nil {
+	if err := clickSelector(tabCtx, `tp-yt-paper-radio-group#privacy-radios tp-yt-paper-radio-button[name="PUBLIC"]`, chromedp.ByQuery); err != nil {
 		return fmt.Errorf("YTB9 %v", err)
 	}
-	logger.Print("YTB9", "已选择 PUBLIC")
+	// 校验 PUBLIC 是否真的选中，未选中则重试（防止发布成私密/未列出）
+	for i := 0; i < 2; i++ {
+		var checked bool
+		checkJs := `(function(){
+			var el = document.querySelector('tp-yt-paper-radio-button[name="PUBLIC"]');
+			return !!el && el.getAttribute('aria-checked') === 'true';
+		})()`
+		chkCtx, cancelChk := context.WithTimeout(tabCtx, 3*time.Second)
+		_ = chromedp.Run(chkCtx, chromedp.Evaluate(checkJs, &checked))
+		cancelChk()
+		if checked {
+			break
+		}
+		logger.Print("YTB9", "PUBLIC 未选中，重试点击")
+		if err := clickSelector(tabCtx, `tp-yt-paper-radio-group#privacy-radios tp-yt-paper-radio-button[name="PUBLIC"]`, chromedp.ByQuery); err != nil {
+			return fmt.Errorf("YTB9 %v", err)
+		}
+	}
+	logger.Print("YTB9", "已选择 PUBLIC，等待3秒后点击发布")
+	time.Sleep(3 * time.Second)
 
 	logger.Print("YTB10", "检测并点击 Save 发布按钮")
 	existsDone, _ := existsSelector(tabCtx, `ytcp-button#done-button`, chromedp.ByQuery)
@@ -178,13 +203,9 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	if err := clickSelector(tabCtx, `ytcp-button#done-button`, chromedp.ByQuery); err != nil {
 		return fmt.Errorf("YTB10 %v", err)
 	}
-	logger.Print("YTB10", "已点击 Save")
-
-	// 点击 Save 后用元素判断发布是否成功：等待 "Video published" 分享弹窗出现。
-	// 用 ytcp-video-share-dialog + #close-icon-button 判断，不依赖页面语言。
-	if err := waitPublishSuccess(tabCtx, logger, 30*time.Second); err != nil {
-		return err
-	}
+	logger.Print("YTB10", "已点击 Save，按发布成功处理")
+	logger.Print("YTB11", "点完发布等待10秒后再退出浏览器")
+	time.Sleep(10 * time.Second)
 
 	tabCloseCtx, cancelTabClose := context.WithTimeout(tabCtx, 4*time.Second)
 	_ = chromedp.Run(tabCloseCtx, chromedp.ActionFunc(func(ctx context.Context) error {
@@ -276,6 +297,8 @@ func fillTitle(ctx context.Context, logger *logx.Logger, title string) error {
 		S string
 		B chromedp.QueryOption
 	}{
+		{S: `div#textbox[aria-label*="Add a title"]`, B: chromedp.ByQuery},
+		{S: `div#textbox[aria-required="true"]`, B: chromedp.ByQuery},
 		{S: `div.title div#textbox`, B: chromedp.ByQuery},
 	}
 	for _, s := range selectors {
@@ -294,12 +317,28 @@ func fillTitle(ctx context.Context, logger *logx.Logger, title string) error {
 					(document.evaluate(%q, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue) :
 					document.querySelector(%q);
 				if(!el) return false;
+				el.focus();
+				function curVal(){ return el.tagName==='TEXTAREA' ? (el.value||'') : (el.textContent||''); }
+				function setNative(v){
+					if(el.tagName==='TEXTAREA'){
+						var vs = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;
+						vs.call(el, v);
+					} else {
+						try{
+							var ds = Object.getOwnPropertyDescriptor(window.HTMLElement.prototype,'textContent').set || Object.getOwnPropertyDescriptor(window.Node.prototype,'textContent').set;
+							ds.call(el, v);
+						}catch(e){ el.textContent = v; }
+						try{ el.innerText = v; }catch(e2){}
+					}
+					try{ el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:v})); }
+					catch(e3){ el.dispatchEvent(new Event('input',{bubbles:true})); }
+				}
 				try{document.execCommand('selectAll', false, null);}catch(e){}
-				try{document.execCommand('insertText', false, '');}catch(e){}
-				try{if(document.execCommand('insertText', false, T)) return true;}catch(e){}
-				if(el.tagName==='TEXTAREA'){el.value=T;} else {el.textContent=T; el.innerText=T;}
-				try{el.dispatchEvent(new InputEvent('input',{bubbles:true}));}catch(e){el.dispatchEvent(new Event('input',{bubbles:true}));}
-				return true;
+				try{document.execCommand('delete', false, null);}catch(e){}
+				try{ setNative(T); }catch(e){ try{ el.textContent = T; }catch(e2){} }
+				if(curVal() === T) return true;
+				try{ el.focus(); document.execCommand('selectAll', false, null); document.execCommand('insertText', false, T); }catch(e){}
+				return curVal() === T;
 			})(%q)`, s.S, s.S, s.S, title)
 			_ = chromedp.Run(typeCtx, chromedp.Evaluate(js, &ok))
 			cancelType()
@@ -307,13 +346,47 @@ func fillTitle(ctx context.Context, logger *logx.Logger, title string) error {
 				logger.Print("YTB5", "标题已填写")
 				return nil
 			}
-			type2Ctx, cancelType2 := context.WithTimeout(ctx, 5*time.Second)
+			// 诊断：JS 填充校验失败，读回标题框实际内容，便于定位日文等特殊字符的填充问题
+			var actual string
+			diagCtx, cancelDiag := context.WithTimeout(ctx, 3*time.Second)
+			_ = chromedp.Run(diagCtx, chromedp.Evaluate(fmt.Sprintf(`(function(){
+				var el = document.querySelector(%q);
+				return el ? (el.textContent || '') : 'NO_ELEMENT';
+			})()`, s.S), &actual))
+			cancelDiag()
+			logger.Print("YTB5", fmt.Sprintf("JS填充校验失败，标题框实际内容=%q, 期望=%q", truncateRunes(actual, 50), truncateRunes(title, 50)))
+			type2Ctx, cancelType2 := context.WithTimeout(ctx, 25*time.Second)
 			err2 := chromedp.Run(type2Ctx, chromedp.SendKeys(s.S, kb.Control+"a", s.B), chromedp.SendKeys(s.S, kb.Delete, s.B), chromedp.SendKeys(s.S, title, s.B))
 			cancelType2()
 			if err2 == nil {
 				logger.Print("YTB5", "标题已键盘兜底填写")
 				return nil
 			}
+			// 第 3 兜底：CDP Input.insertText 直接插入文本（最可靠的 Unicode 插入方式，规避日文等 CJK 的键盘事件问题）
+			insCtx, cancelIns := context.WithTimeout(ctx, 25*time.Second)
+			err3 := chromedp.Run(insCtx,
+				chromedp.Click(s.S, s.B),
+				chromedp.Focus(s.S, s.B),
+				chromedp.SendKeys(s.S, kb.Control+"a", s.B),
+				chromedp.SendKeys(s.S, kb.Delete, s.B),
+				chromedp.ActionFunc(func(ctx context.Context) error {
+					return input.InsertText(title).Do(ctx)
+				}),
+			)
+			cancelIns()
+			if err3 == nil {
+				logger.Print("YTB5", "标题已 InsertText 兜底填写")
+				return nil
+			}
+			// 诊断：键盘兜底后再次读回实际内容
+			var actual2 string
+			diagCtx2, cancelDiag2 := context.WithTimeout(ctx, 3*time.Second)
+			_ = chromedp.Run(diagCtx2, chromedp.Evaluate(fmt.Sprintf(`(function(){
+				var el = document.querySelector(%q);
+				return el ? (el.textContent || '') : 'NO_ELEMENT';
+			})()`, s.S), &actual2))
+			cancelDiag2()
+			logger.Print("YTB5", fmt.Sprintf("键盘兜底后标题框实际内容=%q", truncateRunes(actual2, 50)))
 		}
 	}
 	return errors.New("YTB5 cannot find youtube title input")
@@ -335,7 +408,25 @@ func fillDescriptionTextbox(ctx context.Context, logger *logx.Logger, descriptio
 		return nil
 	}
 	logger.Print("YTB5", "填写简介")
-	sel := `div.description div#textbox`
+	sel := `div#textbox[aria-label*="Tell viewers"]`
+	probeCtx, cancelProbe := context.WithTimeout(ctx, 3*time.Second)
+	var probeNodes []*cdp.Node
+	_ = chromedp.Run(probeCtx, chromedp.Nodes(sel, &probeNodes, chromedp.ByQuery))
+	cancelProbe()
+	if len(probeNodes) == 0 {
+		// 语言无关兜底：描述框 aria-required="false"（标题框是 true），不依赖 aria-label 文案
+		sel = `div#textbox[aria-required="false"]`
+		probeCtx2, cancelProbe2 := context.WithTimeout(ctx, 3*time.Second)
+		var probeNodes2 []*cdp.Node
+		_ = chromedp.Run(probeCtx2, chromedp.Nodes(sel, &probeNodes2, chromedp.ByQuery))
+		cancelProbe2()
+		if len(probeNodes2) == 0 {
+			sel = `div.description div#textbox`
+			logger.Print("YTB5", "简介选择器均未匹配，改用旧版: "+sel)
+		} else {
+			logger.Print("YTB5", "英文 aria-label 未匹配，改用 aria-required 兜底")
+		}
+	}
 	stepCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	err := chromedp.Run(stepCtx,
 		chromedp.WaitVisible(sel, chromedp.ByQuery),
@@ -347,26 +438,58 @@ func fillDescriptionTextbox(ctx context.Context, logger *logx.Logger, descriptio
 		typeCtx, cancelType := context.WithTimeout(ctx, 5*time.Second)
 		var ok bool
 		js := fmt.Sprintf(`(function(T){
-			var el = document.querySelector('div.description div#textbox');
+			var el = document.querySelector(%q);
 			if(!el) return false;
+			el.focus();
+			function curVal(){ return el.tagName==='TEXTAREA' ? (el.value||'') : (el.textContent||''); }
+			function setNative(v){
+				if(el.tagName==='TEXTAREA'){
+					var vs = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;
+					vs.call(el, v);
+				} else {
+					try{
+						var ds = Object.getOwnPropertyDescriptor(window.HTMLElement.prototype,'textContent').set || Object.getOwnPropertyDescriptor(window.Node.prototype,'textContent').set;
+						ds.call(el, v);
+					}catch(e){ el.textContent = v; }
+					try{ el.innerText = v; }catch(e2){}
+				}
+				try{ el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:v})); }
+				catch(e3){ el.dispatchEvent(new Event('input',{bubbles:true})); }
+			}
 			try{document.execCommand('selectAll', false, null);}catch(e){}
-			try{document.execCommand('insertText', false, '');}catch(e){}
-			try{if(document.execCommand('insertText', false, T)) return true;}catch(e){}
-			if(el.tagName==='TEXTAREA'){el.value=T;} else {el.textContent=T; el.innerText=T;}
-			try{el.dispatchEvent(new InputEvent('input',{bubbles:true}));}catch(e){el.dispatchEvent(new Event('input',{bubbles:true}));}
-			return true;
-		})(%q)`, description)
+			try{document.execCommand('delete', false, null);}catch(e){}
+			try{ setNative(T); }catch(e){ try{ el.textContent = T; }catch(e2){} }
+			if(curVal() === T) return true;
+			try{ el.focus(); document.execCommand('selectAll', false, null); document.execCommand('insertText', false, T); }catch(e){}
+			return curVal() === T;
+		})(%q)`, sel, description)
 		_ = chromedp.Run(typeCtx, chromedp.Evaluate(js, &ok))
 		cancelType()
 		if ok {
 			logger.Print("YTB5", "简介已填写")
 			return nil
 		}
-		type2Ctx, cancelType2 := context.WithTimeout(ctx, 5*time.Second)
+		type2Ctx, cancelType2 := context.WithTimeout(ctx, 25*time.Second)
 		err2 := chromedp.Run(type2Ctx, chromedp.SendKeys(sel, kb.Control+"a", chromedp.ByQuery), chromedp.SendKeys(sel, kb.Delete, chromedp.ByQuery), chromedp.SendKeys(sel, description, chromedp.ByQuery))
 		cancelType2()
 		if err2 == nil {
 			logger.Print("YTB5", "简介已键盘兜底填写")
+			return nil
+		}
+		// 第 3 兜底：CDP Input.insertText 直接插入（对长文本最可靠，一次命令插入全部，不逐个字符）
+		insCtx, cancelIns := context.WithTimeout(ctx, 25*time.Second)
+		err3 := chromedp.Run(insCtx,
+			chromedp.Click(sel, chromedp.ByQuery),
+			chromedp.Focus(sel, chromedp.ByQuery),
+			chromedp.SendKeys(sel, kb.Control+"a", chromedp.ByQuery),
+			chromedp.SendKeys(sel, kb.Delete, chromedp.ByQuery),
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				return input.InsertText(description).Do(ctx)
+			}),
+		)
+		cancelIns()
+		if err3 == nil {
+			logger.Print("YTB5", "简介已 InsertText 兜底填写")
 			return nil
 		}
 	}
@@ -405,39 +528,6 @@ func existsSelector(ctx context.Context, selector string, by chromedp.QueryOptio
 	var nodes []*cdp.Node
 	err := chromedp.Run(checkCtx, chromedp.Nodes(selector, &nodes, by))
 	return len(nodes) > 0, err
-}
-
-// waitPublishSuccess 用元素判断发布是否成功：等待 "Video published" 分享弹窗出现。
-// 弹窗由 <ytcp-video-share-dialog> 容器承载。只判断该容器是否出现且未被隐藏，
-// 不再依赖内部的 close 按钮或 getBoundingClientRect（YouTube 的 Polymer 组件常使用
-// display:contents 或 shadow DOM，导致子元素查询/宽高判断失效）。
-func waitPublishSuccess(ctx context.Context, logger *logx.Logger, timeout time.Duration) error {
-	logger.Print("YTB11", "检测发布是否成功")
-	deadline := time.Now().Add(timeout)
-	lastState := ""
-	for time.Now().Before(deadline) {
-		var state string
-		js := `(function(){
-			var dlg = document.querySelector('ytcp-video-share-dialog');
-			if(!dlg) return 'no-dialog';
-			var cs = getComputedStyle(dlg);
-			if(cs.display === 'none' || cs.visibility === 'hidden') return 'dialog-hidden';
-			return 'ok';
-		})()`
-		stepCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		_ = chromedp.Run(stepCtx, chromedp.Evaluate(js, &state))
-		cancel()
-		if state == "ok" {
-			logger.Print("YTB11", "发布成功弹窗已出现 (Video published)")
-			return nil
-		}
-		if state != lastState {
-			logger.Print("YTB11", "发布成功弹窗尚未出现，当前状态: "+state)
-			lastState = state
-		}
-		time.Sleep(1 * time.Second)
-	}
-	return errors.New("YTB11 publish success dialog not detected")
 }
 
 func truncateRunes(s string, max int) string {

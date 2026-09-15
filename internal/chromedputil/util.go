@@ -145,7 +145,7 @@ func CloseTabsAndStopProfile(ctx context.Context, browserCtx context.Context, lo
 	}
 
 	if profileID != "" && undetectableHost != "" && undetectablePort != 0 {
-		stopCtx, cancelStop := context.WithTimeout(ctx, 10*time.Second)
+		stopCtx, cancelStop := context.WithTimeout(ctx, 30*time.Second)
 		err := undetectable.NewClient(undetectableHost, undetectablePort).StopProfileBestEffort(stopCtx, profileID)
 		cancelStop()
 

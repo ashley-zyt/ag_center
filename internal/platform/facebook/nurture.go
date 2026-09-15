@@ -46,10 +46,18 @@ func (a *facebookActions) IsAd(ctx context.Context) (bool, error) {
 
 func (a *facebookActions) LikePost(ctx context.Context) error {
 	likeJs := `(function(){
-		var likeBtn = document.querySelector('[aria-label="Like"]');
-		if(!likeBtn) return false;
-		likeBtn.click();
-		return true;
+		function safeClick(el) {
+			if (!el) return false;
+			if (typeof el.click === 'function') { el.click(); return true; }
+			// 元素本身无 click 方法(如 svg 内的 use/特殊元素)，向上找真正的按钮
+			if (typeof el.closest === 'function') {
+				var btn = el.closest('[role="button"], button');
+				if (btn && typeof btn.click === 'function') { btn.click(); return true; }
+			}
+			// 兜底：派发原生点击事件
+			try { el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window})); return true; } catch(e) { return false; }
+		}
+		return safeClick(document.querySelector('[aria-label="Like"]'));
 	})()`
 	var liked bool
 	if err := chromedp.Run(ctx, chromedp.Evaluate(likeJs, &liked)); err != nil {

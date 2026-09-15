@@ -197,6 +197,7 @@ func FetchTikTokPosts(ctx context.Context, logger *logx.Logger, req scraper.Fetc
 			
 			if (cells.length > 0) {
 				cells.forEach(cell => {
+					if (postsMap.size >= 10) return;
 					let infoContainer = cell.querySelector('div[data-tt="components_PostInfoCell_Container"]');
 					let linkNode = infoContainer ? infoContainer.querySelector('a') : null;
 					
@@ -232,7 +233,7 @@ func FetchTikTokPosts(ctx context.Context, logger *logx.Logger, req scraper.Fetc
 				});
 
 				currentRound++;
-				if (currentRound >= maxRounds) {
+				if (postsMap.size >= 10 || currentRound >= maxRounds) {
 					clearInterval(penetrationTimer);
 					window._ttPostsData = Array.from(postsMap.values());
 					window._ttScrollDone = true;
@@ -306,9 +307,14 @@ func FetchTikTokPosts(ctx context.Context, logger *logx.Logger, req scraper.Fetc
 
 	logger.Print("TT_FETCH", fmt.Sprintf("TikTok 抓取执行完毕。本次成功收录 %d 条发文", len(posts)))
 
-	// 7. 导航到个人主页提取总粉丝数和总点赞量
-	logger.Print("TT_FETCH", "正在导航到个人主页提取粉丝数和点赞量...")
-	if err := chromedp.Run(ctx, chromedp.Navigate("https://www.tiktok.com/profile")); err != nil {
+	// 7. 导航到个人主页提取总粉丝数和总点赞量（使用接口传入的 source_url，避免 /profile 404）
+	profileURL := strings.TrimSpace(req.SourceURL)
+	if profileURL == "" {
+		logger.Print("TT_WARN", "source_url 为空，跳过个人主页粉丝数/点赞量采集")
+		return scraper.SanitizeResult(scraper.FetchResult{Posts: posts}), nil
+	}
+	logger.Print("TT_FETCH", "正在导航到个人主页提取粉丝数和点赞量: "+profileURL)
+	if err := chromedp.Run(ctx, chromedp.Navigate(profileURL)); err != nil {
 		logger.Print("TT_WARN", fmt.Sprintf("导航到个人主页失败: %v", err))
 		return scraper.SanitizeResult(scraper.FetchResult{Posts: posts}), nil
 	}

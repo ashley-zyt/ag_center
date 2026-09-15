@@ -231,6 +231,7 @@ func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchReque
 		function collectData() {
 			let cells = document.querySelectorAll('div[data-testid="cellInnerDiv"]');
 			cells.forEach(cell => {
+				if (postsMap.size >= 10) return;
 				let textNode = cell.querySelector('div[data-testid="tweetText"]');
 				let linkNode = cell.querySelector('div[data-testid="User-Name"] a[href*="/status/"]');
 				
@@ -263,7 +264,7 @@ func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchReque
 						postsMap.set(link, {
 							title: textNode.innerText || "",
 							link: link,
-							publishTime: timeNode ? (timeNode.getAttribute('datetime') || "") : "",
+							publishTime: timeNode ? (timeNode.getAttribute('datetime') || timeNode.getAttribute('title') || "") : "",
 							comments: replyNode ? (replyNode.innerText || replyNode.getAttribute('aria-label') || "") : "",
 							shares: retweetNode ? (retweetNode.innerText || retweetNode.getAttribute('aria-label') || "") : "",
 							likes: likeNode ? (likeNode.innerText || likeNode.getAttribute('aria-label') || "") : "",
@@ -277,7 +278,7 @@ func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchReque
 		let timer = setInterval(() => {
 			collectData();
 			currentRound++;
-			if (currentRound >= maxRounds) {
+			if (postsMap.size >= 10 || currentRound >= maxRounds) {
 				clearInterval(timer);
 				window._xPostsData = Array.from(postsMap.values());
 				window._xScrollDone = true;

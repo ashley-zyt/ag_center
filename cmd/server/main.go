@@ -21,7 +21,6 @@ import (
 	"minimax_pro/internal/chromedputil"
 	chrome "minimax_pro/internal/clock"
 	"minimax_pro/internal/logx"
-	"minimax_pro/internal/platform/douyin"
 	"minimax_pro/internal/platform/facebook"
 	"minimax_pro/internal/platform/instagram"
 	"minimax_pro/internal/platform/message"
@@ -29,7 +28,6 @@ import (
 	"minimax_pro/internal/platform/scraper"
 	"minimax_pro/internal/platform/tiktok"
 	"minimax_pro/internal/platform/twitter"
-	"minimax_pro/internal/platform/weixin" // [合并] 加入 git 上的 weixin 模块
 	"minimax_pro/internal/platform/youtube"
 	"minimax_pro/internal/undetectable"
 
@@ -110,6 +108,10 @@ const (
 // publishTimeout 发布等长流程使用独立 background context 时的超时上限，
 // 避免因客户端/nginx 超时断开导致 r.Context() 被取消而中断发布与收尾。
 const publishTimeout = 15 * time.Minute
+
+// fetchStallTimeout 抓取流程的"页面停留超时"监控阈值。
+// Facebook 抓取需在同一页面连续滚动多次(导航+等待+滚动约 40s+)，30s 会误判卡住，故放宽到 90s。
+const fetchStallTimeout = 90 * time.Second
 
 // profileOpMu 确保同一Profile同时只能执行一个浏览器操作(fetch/nurture), 避免并发操作同一浏览器导致标签页混乱、导航互相干扰
 var (
@@ -405,10 +407,6 @@ func platformRule(platform string) (string, []string, error) {
 		return "https://x.com/home", []string{"already have an account", "create account", "sign in"}, nil
 	case "tiktok":
 		return "https://www.tiktok.com/tiktokstudio/upload", []string{"log in to tiktok", "sign up", "don't have an account", "don’t have an account"}, nil
-	case "douyin":
-		return "https://creator.douyin.com/creator-micro/content/upload", []string{"登录", "扫码登录", "手机号登录", "请登录"}, nil
-	case "weixin": // [合并] 加入 git 上的微信平台规则
-		return "https://channels.weixin.qq.com/platform/post/create", []string{"登录", "扫码登录", "微信扫一扫", "请登录"}, nil
 	case "facebook":
 		return "https://www.facebook.com/", []string{"confirm your identity", "confirm you're human to use your account", "log in", "sign up"}, nil
 	default:
@@ -610,9 +608,13 @@ func stopProfileWithCleanup(ctx context.Context, logger *logx.Logger, browserCtx
 		_ = chromedputil.CloseAllTabsThenBrowser(closeCtx)
 		cancelClose()
 	}
-	stopCtx, cancelStop := context.WithTimeout(ctx, 6*time.Second)
-	_ = undetectable.NewClient(host, port).StopProfileBestEffort(stopCtx, profileID)
+	// 停止 profile 需逐个尝试多个 API 端点，超时给足，避免端点响应稍慢就导致浏览器残留
+	stopCtx, cancelStop := context.WithTimeout(ctx, 30*time.Second)
+	err := undetectable.NewClient(host, port).StopProfileBestEffort(stopCtx, profileID)
 	cancelStop()
+	if err != nil {
+		logger.Print("E", "停止 Profile 失败(浏览器可能未彻底关闭): "+err.Error())
+	}
 }
 
 // [合并保留本地优化] isProfileLocked 判断启动/停止 profile 的错误是否为"锁被占用"类错误。
@@ -749,6 +751,8 @@ func checkReplyByPlatform(ctx context.Context, logger *logx.Logger, platform str
 		return twitter.CheckTwitterReply(ctx, logger, opts)
 	case "instagram", "ig":
 		return instagram.CheckInstagramReply(ctx, logger, opts)
+	case "facebook", "fb":
+		return facebook.CheckFacebookReply(ctx, logger, opts)
 	default:
 		return message.CheckReplyResult{Status: "failed", ErrorInfo: "unsupported platform: " + platform}, fmt.Errorf("message check_reply: unsupported platform %q", platform)
 	}
@@ -966,7 +970,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			openedTabs = append(openedTabs, tabInfo{ctx: tabCtx, cancel: cancelTab})
 
 			fetchCtx, cancelFetch := context.WithTimeout(tabCtx, 20*time.Minute)
-			stallCtx, cancelStall, watcher := chromedputil.WatchPageStall(fetchCtx, logger, 30*time.Second)
+			stallCtx, cancelStall, watcher := chromedputil.WatchPageStall(fetchCtx, logger, fetchStallTimeout)
 			fetchRes, fetchErr := fetchPostsByPlatform(stallCtx, logger, acc.Platform, scraper.FetchRequest{
 				SourceURL:            trimmedURL,
 				AccountID:            int64(acc.ID),
@@ -978,7 +982,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			if fetchErr != nil {
 				if watcher.Stalled() {
 					res.StalledURL = watcher.URL()
-					res.ErrorInfo = "页面停留超时(30s), 卡在页面: " + watcher.URL()
+					res.ErrorInfo = "页面停留超时, 卡在页面: " + watcher.URL()
 					logger.Print("FP3", fmt.Sprintf("[%d/%d] 页面停留超时, 卡在: %s", i+1, len(req.ActiveAccounts), watcher.URL()))
 				} else {
 					res.ErrorInfo = fetchErr.Error()
@@ -1002,11 +1006,8 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 				} else {
 					successCount := 0
 					for _, post := range res.Posts {
-						// 将提取出来的空串/相对时间转换为 Rails 能够解析的标准字符串
-						postDate := post.PublishTime
-						if postDate == "" {
-							postDate = time.Now().Format(time.RFC3339) // 如果拿不到时间，提供当前时间降级
-						}
+						// 将各平台提取的日期归一化为 Rails 能解析的标准字符串
+						postDate := normalizePostDate(post.PublishTime)
 
 						// 转换为 Rails 对应的单条结构
 						payload := RailsPostParam{
@@ -1060,6 +1061,30 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 		})
 	}
 }
+// normalizePostDate 将各平台抓取到的发文时间归一化为 Rails 可解析的 RFC3339 字符串。
+// 各平台返回的日期格式不一：Twitter/Instagram 是 ISO8601("2026-09-15T05:30:00.000Z")，
+// TikTok/YouTube 是 "YYYY-MM-DD HH:mm:ss"，Facebook 是绝对日期文本；提取失败时可能是
+// 空串或 "Unknown"。统一解析后输出 RFC3339，无法解析的降级为当前时间。
+func normalizePostDate(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.EqualFold(s, "Unknown") || strings.EqualFold(s, "无标题") {
+		return time.Now().Format(time.RFC3339)
+	}
+	layouts := []string{
+		time.RFC3339,                    // "2006-01-02T15:04:05Z07:00"（可含小数秒）
+		"2006-01-02T15:04:05.000Z07:00", // ISO 带毫秒+时区
+		"2006-01-02 15:04:05",          // "YYYY-MM-DD HH:mm:ss"
+		"2006-01-02",                   // 纯日期
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.Format(time.RFC3339)
+		}
+	}
+	// 无法解析的格式，降级为当前时间
+	return time.Now().Format(time.RFC3339)
+}
+
 func callSinglePostUpdateAPI(ctx context.Context, logger *logx.Logger, endpoint string, payload RailsPostParam) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -2010,237 +2035,6 @@ func main() {
 		cancelStop()
 		_ = os.Remove(absVideoPath)
 		writeJSON(w, http.StatusOK, TikTokPublishResponse{
-			Type:             "success",
-			ProfileID:        res.ProfileID,
-			DebugPort:        res.Info.DebugPort,
-			WebsocketLink:    res.Info.WebsocketLink,
-			Status:           "publish_triggered",
-			UndetectableHost: res.Host,
-			UndetectablePort: res.Port,
-		})
-	})
-
-	mux.HandleFunc("/douyin/publish", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
-			return
-		}
-		type DouyinPublishRequest struct {
-			ProfileName      string `json:"profile_name"`
-			Text             string `json:"text"`
-			Title            string `json:"title"`
-			VideoOssURL      string `json:"video_oss_url"`
-			VideoPath        string `json:"video_path"`
-			Host             string `json:"host"`
-			Port             int    `json:"port"`
-			WaitSeconds      int    `json:"wait_seconds"`
-			UndetectablePath string `json:"undetectable_path"`
-		}
-		type DouyinPublishResponse struct {
-			Type             string `json:"type"`
-			ProfileID        string `json:"profile_id"`
-			DebugPort        string `json:"debug_port"`
-			WebsocketLink    string `json:"websocket_link"`
-			Status           string `json:"status"`
-			UndetectableHost string `json:"undetectable_host"`
-			UndetectablePort int    `json:"undetectable_port"`
-			ErrorInfo        string `json:"error_info,omitempty"`
-		}
-		var req DouyinPublishRequest
-		raw, err := decodeJSONBody(r, &req, 2<<20)
-		if err != nil {
-			logger.Print("E", "JSON解析失败: "+err.Error())
-			logger.Print("E", "Content-Type: "+r.Header.Get("Content-Type"))
-			if raw != "" {
-				logger.Print("E", "Body: "+safeSnippet(raw, 1200))
-			}
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
-			return
-		}
-		logger.Print("DY_REQ", "Content-Type: "+r.Header.Get("Content-Type"))
-		logger.Print("DY_REQ", "Body: "+safeSnippet(raw, 1200))
-		if req.ProfileName == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
-			return
-		}
-		if req.VideoOssURL == "" && req.VideoPath == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url or video_path is required"})
-			return
-		}
-
-		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
-		// 导致 r.Context() 被取消、进而中断发布与收尾。
-		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
-		defer cancelPub()
-
-		var absVideoPath string
-		if req.VideoOssURL != "" {
-			var err error
-			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-				return
-			}
-		} else {
-			var err error
-			absVideoPath, err = filepath.Abs(req.VideoPath)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid video_path: " + err.Error()})
-				return
-			}
-			if _, err := os.Stat(absVideoPath); err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path file not found"})
-				return
-			}
-		}
-
-		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-		if err != nil {
-			logger.Print("E", err.Error())
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
-		logger.Print("DY", "开始抖音发布流程")
-		textToUse := strings.TrimSpace(req.Text)
-		if textToUse == "" && strings.TrimSpace(req.Title) != "" {
-			textToUse = req.Title
-		}
-		if err := douyin.PublishVideo(pubCtx, logger, douyin.PublishRequest{
-			WebsocketURL:     res.Info.WebsocketLink,
-			Text:             textToUse,
-			VideoPath:        absVideoPath,
-			UndetectableHost: res.Host,
-			UndetectablePort: res.Port,
-			ProfileID:        res.ProfileID,
-		}); err != nil {
-			logger.Print("E", err.Error())
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
-		time.Sleep(8 * time.Second)
-		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
-		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-		cancelStop()
-		_ = os.Remove(absVideoPath)
-		writeJSON(w, http.StatusOK, DouyinPublishResponse{
-			Type:             "success",
-			ProfileID:        res.ProfileID,
-			DebugPort:        res.Info.DebugPort,
-			WebsocketLink:    res.Info.WebsocketLink,
-			Status:           "publish_triggered",
-			UndetectableHost: res.Host,
-			UndetectablePort: res.Port,
-		})
-	})
-
-	// [合并] 新增: 从 Git 合并过来的微信视频号发布功能
-	mux.HandleFunc("/weixin/publish", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
-			return
-		}
-		type WeixinPublishRequest struct {
-			ProfileName      string `json:"profile_name"`
-			Text             string `json:"text"`
-			Title            string `json:"title"`
-			VideoOssURL      string `json:"video_oss_url"`
-			VideoPath        string `json:"video_path"`
-			Host             string `json:"host"`
-			Port             int    `json:"port"`
-			WaitSeconds      int    `json:"wait_seconds"`
-			UndetectablePath string `json:"undetectable_path"`
-		}
-		type WeixinPublishResponse struct {
-			Type             string `json:"type"`
-			ProfileID        string `json:"profile_id"`
-			DebugPort        string `json:"debug_port"`
-			WebsocketLink    string `json:"websocket_link"`
-			Status           string `json:"status"`
-			UndetectableHost string `json:"undetectable_host"`
-			UndetectablePort int    `json:"undetectable_port"`
-			ErrorInfo        string `json:"error_info,omitempty"`
-		}
-		var req WeixinPublishRequest
-		raw, err := decodeJSONBody(r, &req, 2<<20)
-		if err != nil {
-			logger.Print("E", "JSON解析失败: "+err.Error())
-			logger.Print("E", "Content-Type: "+r.Header.Get("Content-Type"))
-			if raw != "" {
-				logger.Print("E", "Body: "+safeSnippet(raw, 1200))
-			}
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
-			return
-		}
-		logger.Print("WX_REQ", "Content-Type: "+r.Header.Get("Content-Type"))
-		logger.Print("WX_REQ", "Body: "+safeSnippet(raw, 1200))
-		if req.ProfileName == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name is required"})
-			return
-		}
-		if req.VideoOssURL == "" && req.VideoPath == "" {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_oss_url or video_path is required"})
-			return
-		}
-
-		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
-		// 导致 r.Context() 被取消、进而中断发布与收尾。
-		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
-		defer cancelPub()
-
-		var absVideoPath string
-		if req.VideoOssURL != "" {
-			var err error
-			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-				return
-			}
-		} else {
-			var err error
-			absVideoPath, err = filepath.Abs(req.VideoPath)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid video_path: " + err.Error()})
-				return
-			}
-			if _, err := os.Stat(absVideoPath); err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path file not found"})
-				return
-			}
-		}
-
-		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-		if err != nil {
-			logger.Print("E", err.Error())
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
-		logger.Print("WX", "开始微信视频号发布流程")
-		textToUse := strings.TrimSpace(req.Text)
-		if textToUse == "" && strings.TrimSpace(req.Title) != "" {
-			textToUse = req.Title
-		}
-		if err := weixin.PublishVideo(pubCtx, logger, weixin.PublishRequest{
-			WebsocketURL:     res.Info.WebsocketLink,
-			Text:             textToUse,
-			VideoPath:        absVideoPath,
-			UndetectableHost: res.Host,
-			UndetectablePort: res.Port,
-			ProfileID:        res.ProfileID,
-		}); err != nil {
-			logger.Print("E", err.Error())
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
-		time.Sleep(8 * time.Second)
-		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
-		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-		cancelStop()
-		_ = os.Remove(absVideoPath)
-		writeJSON(w, http.StatusOK, WeixinPublishResponse{
 			Type:             "success",
 			ProfileID:        res.ProfileID,
 			DebugPort:        res.Info.DebugPort,
