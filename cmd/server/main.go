@@ -560,8 +560,16 @@ func startProfileByName(ctx context.Context, logger *logx.Logger, profileName st
 	logger.Print("3", "找到profile_id="+profileID)
 
 	if info, ok := profiles[profileID]; ok && info.Status == "Started" {
-		logger.Print("4", "profile已在运行中，跳过启动")
-		return startByNameResult{ProfileID: profileID, Info: info, Host: host, Port: port, Path: path}, nil
+		if info.WebsocketLink != "" {
+			logger.Print("4", "profile已在运行中，跳过启动")
+			return startByNameResult{ProfileID: profileID, Info: info, Host: host, Port: port, Path: path}, nil
+		}
+		// websocket_link 为空：说明这是残留/异常的浏览器实例（正常关闭不会残留），
+		// 直接跳过启动会导致后续 PublishVideo 报 websocket_url is required。
+		// 先停止残留实例，再走下方正常启动流程，重新获取有效的连接信息。
+		logger.Print("4", "profile已在运行但 websocket_link 为空(疑似残留实例)，先停止再重新启动")
+		_ = client.StopProfileBestEffort(localCtx, profileID)
+		time.Sleep(5 * time.Second)
 	}
 
 	logger.Print("4", "启动profile")
