@@ -942,8 +942,11 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 
 		// execute 执行完整采集流程：并发额度 → profile锁 → 启动(带重试) → 遍历采集+上报 → 关闭释放。
 		// 返回 (status, info, results, profileID)。
+		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
+		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
+		var taskCtx context.Context = context.Background()
 		execute := func() (string, string, []FetchPostsAccountResult, string) {
-			bgCtx := context.Background()
+			bgCtx := taskCtx
 
 			// 获取全局并发额度（排队等待）
 			if err := acquireBrowserSlot(bgCtx); err != nil {
@@ -1117,17 +1120,17 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID := newTaskID()
-			setTaskState(taskID, taskStatusQueued)
-			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
-			go func() {
-				setTaskState(taskID, taskStatusRunning)
-				status, info, results, _ := execute()
-				finalStatus := taskStatusSuccess
-				if status != "success" {
-					finalStatus = taskStatusFailed
-				}
-				setTaskState(taskID, finalStatus)
+		taskID, tctx := registerTask("fetch", req.ProfileName, req.Ref)
+		taskCtx = tctx
+		writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+		go func() {
+			setTaskState(taskID, taskStatusRunning)
+			status, info, results, _ := execute()
+			finalStatus := taskStatusSuccess
+			if status != "success" {
+				finalStatus = taskStatusFailed
+			}
+			finishTask(taskID, finalStatus, info)
 				callbackTaskResult(context.Background(), logger, TaskResultPayload{
 					TaskID:      taskID,
 					ProfileName: req.ProfileName,
@@ -1259,8 +1262,11 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 
 		// execute 执行完整私信流程：并发额度 → profile锁 → 启动(带重试) → 发送 → 关闭。
 		// 返回 (status, info, resp)：status 为 success/failed；resp 为同步响应结构。
+		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
+		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
+		var taskCtx context.Context = context.Background()
 		execute := func() (string, string, SendSingleMessageResponse) {
-			bgCtx := context.Background()
+			bgCtx := taskCtx
 
 			// 构造只含一个任务的切片
 			tasks := []message.SendTask{{
@@ -1337,8 +1343,8 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID := newTaskID()
-			setTaskState(taskID, taskStatusQueued)
+			taskID, tctx := registerTask("send_message", req.ProfileName, req.Ref)
+			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
 				setTaskState(taskID, taskStatusRunning)
@@ -1347,7 +1353,7 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 				if status != "success" {
 					finalStatus = taskStatusFailed
 				}
-				setTaskState(taskID, finalStatus)
+				finishTask(taskID, finalStatus, info)
 				callbackTaskResult(context.Background(), logger, TaskResultPayload{
 					TaskID:      taskID,
 					ProfileName: req.ProfileName,
@@ -1409,8 +1415,11 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 
 		// execute 执行完整判断回复流程：并发额度 → profile锁 → 启动(带重试) → 检查 → 关闭。
 		// 返回 (status, info, resp)：status 为 success/failed；resp 为同步响应结构。
+		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
+		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
+		var taskCtx context.Context = context.Background()
 		execute := func() (string, string, CheckReplyResponse) {
-			bgCtx := context.Background()
+			bgCtx := taskCtx
 
 			if err := acquireBrowserSlot(bgCtx); err != nil {
 				return "failed", "获取并发额度失败: " + err.Error(), CheckReplyResponse{Type: "error", AccountID: req.AccountID, ErrorInfo: "获取并发额度失败: " + err.Error()}
@@ -1487,8 +1496,8 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID := newTaskID()
-			setTaskState(taskID, taskStatusQueued)
+			taskID, tctx := registerTask("check_reply", req.ProfileName, req.Ref)
+			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
 				setTaskState(taskID, taskStatusRunning)
@@ -1497,7 +1506,7 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 				if status != "success" {
 					finalStatus = taskStatusFailed
 				}
-				setTaskState(taskID, finalStatus)
+				finishTask(taskID, finalStatus, info)
 				callbackTaskResult(context.Background(), logger, TaskResultPayload{
 					TaskID:      taskID,
 					ProfileName: req.ProfileName,
@@ -1527,6 +1536,12 @@ func main() {
 	})
 
 	// 任务状态查询（按 task_id 查询，作为回调失败/重启丢任务时的补充排查手段）
+	// 任务查询与清理：
+	//   GET  /tasks        任务总览与进度列表
+	//   GET  /tasks/{id}   单个任务详情
+	//   POST /tasks/clear  中断并清空所有任务
+	mux.HandleFunc("/tasks", handleTaskList(logger))
+	mux.HandleFunc("/tasks/clear", handleTaskClear(logger))
 	mux.HandleFunc("/tasks/", handleTaskQuery(logger))
 
 	mux.HandleFunc("/accounts/check_login_status", func(w http.ResponseWriter, r *http.Request) {
@@ -1642,8 +1657,11 @@ func main() {
 
 		// execute 执行完整养号流程：并发额度 → profile锁 → 启动(带重试) → 养号 → 关闭+释放。
 		// 返回 (status, info)，status 为 success / error / failed。
+		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
+		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
+		var taskCtx context.Context = context.Background()
 		execute := func() (string, string) {
-			bgCtx := context.Background()
+			bgCtx := taskCtx
 
 			// 1. 获取全局并发额度（超出的任务在此排队等待）
 			if err := acquireBrowserSlot(bgCtx); err != nil {
@@ -1700,8 +1718,8 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID := newTaskID()
-			setTaskState(taskID, taskStatusQueued)
+			taskID, tctx := registerTask("nurture", req.ProfileName, req.Ref)
+			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
 				setTaskState(taskID, taskStatusRunning)
@@ -1710,7 +1728,7 @@ func main() {
 				if status != "success" {
 					finalStatus = taskStatusFailed
 				}
-				setTaskState(taskID, finalStatus)
+				finishTask(taskID, finalStatus, info)
 				callbackTaskResult(context.Background(), logger, TaskResultPayload{
 					TaskID:      taskID,
 					ProfileName: req.ProfileName,
@@ -1823,8 +1841,11 @@ func main() {
 
 		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
 		// 返回 (status, info, res)：status 为 success/failed；res 为成功启动的浏览器信息（失败时零值）。
+		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
+		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
+		var taskCtx context.Context = context.Background()
 		execute := func() (string, string, startByNameResult) {
-			pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
 			defer cancelPub()
 
 			// 1. 获取全局并发额度
@@ -1893,8 +1914,8 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID := newTaskID()
-			setTaskState(taskID, taskStatusQueued)
+			taskID, tctx := registerTask("facebook_publish", req.ProfileName, req.Ref)
+			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
 				setTaskState(taskID, taskStatusRunning)
@@ -1903,7 +1924,7 @@ func main() {
 				if status != "success" {
 					finalStatus = taskStatusFailed
 				}
-				setTaskState(taskID, finalStatus)
+				finishTask(taskID, finalStatus, info)
 				callbackTaskResult(context.Background(), logger, TaskResultPayload{
 					TaskID:      taskID,
 					ProfileName: req.ProfileName,
@@ -1984,8 +2005,11 @@ func main() {
 		}
 
 		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
+		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
+		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
+		var taskCtx context.Context = context.Background()
 		execute := func() (string, string, startByNameResult) {
-			pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
 			defer cancelPub()
 
 			if err := acquireBrowserSlot(pubCtx); err != nil {
@@ -2048,8 +2072,8 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID := newTaskID()
-			setTaskState(taskID, taskStatusQueued)
+			taskID, tctx := registerTask("twitter_publish", req.ProfileName, req.Ref)
+			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
 				setTaskState(taskID, taskStatusRunning)
@@ -2058,7 +2082,7 @@ func main() {
 				if status != "success" {
 					finalStatus = taskStatusFailed
 				}
-				setTaskState(taskID, finalStatus)
+				finishTask(taskID, finalStatus, info)
 				callbackTaskResult(context.Background(), logger, TaskResultPayload{
 					TaskID:      taskID,
 					ProfileName: req.ProfileName,
@@ -2139,8 +2163,11 @@ func main() {
 		}
 
 		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
+		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
+		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
+		var taskCtx context.Context = context.Background()
 		execute := func() (string, string, startByNameResult) {
-			pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
 			defer cancelPub()
 
 			if err := acquireBrowserSlot(pubCtx); err != nil {
@@ -2202,8 +2229,8 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID := newTaskID()
-			setTaskState(taskID, taskStatusQueued)
+			taskID, tctx := registerTask("youtube_publish", req.ProfileName, req.Ref)
+			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
 				setTaskState(taskID, taskStatusRunning)
@@ -2212,7 +2239,7 @@ func main() {
 				if status != "success" {
 					finalStatus = taskStatusFailed
 				}
-				setTaskState(taskID, finalStatus)
+				finishTask(taskID, finalStatus, info)
 				callbackTaskResult(context.Background(), logger, TaskResultPayload{
 					TaskID:      taskID,
 					ProfileName: req.ProfileName,
@@ -2292,8 +2319,11 @@ func main() {
 		}
 
 		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
+		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
+		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
+		var taskCtx context.Context = context.Background()
 		execute := func() (string, string, startByNameResult) {
-			pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
 			defer cancelPub()
 
 			if err := acquireBrowserSlot(pubCtx); err != nil {
@@ -2354,8 +2384,8 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID := newTaskID()
-			setTaskState(taskID, taskStatusQueued)
+			taskID, tctx := registerTask("tiktok_publish", req.ProfileName, req.Ref)
+			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
 				setTaskState(taskID, taskStatusRunning)
@@ -2364,7 +2394,7 @@ func main() {
 				if status != "success" {
 					finalStatus = taskStatusFailed
 				}
-				setTaskState(taskID, finalStatus)
+				finishTask(taskID, finalStatus, info)
 				callbackTaskResult(context.Background(), logger, TaskResultPayload{
 					TaskID:      taskID,
 					ProfileName: req.ProfileName,
@@ -2445,8 +2475,11 @@ func main() {
 		}
 
 		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
+		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
+		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
+		var taskCtx context.Context = context.Background()
 		execute := func() (string, string, startByNameResult) {
-			pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
 			defer cancelPub()
 
 			if err := acquireBrowserSlot(pubCtx); err != nil {
@@ -2509,8 +2542,8 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID := newTaskID()
-			setTaskState(taskID, taskStatusQueued)
+			taskID, tctx := registerTask("instagram_publish", req.ProfileName, req.Ref)
+			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
 				setTaskState(taskID, taskStatusRunning)
@@ -2519,7 +2552,7 @@ func main() {
 				if status != "success" {
 					finalStatus = taskStatusFailed
 				}
-				setTaskState(taskID, finalStatus)
+				finishTask(taskID, finalStatus, info)
 				callbackTaskResult(context.Background(), logger, TaskResultPayload{
 					TaskID:      taskID,
 					ProfileName: req.ProfileName,

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,10 +53,12 @@ func releaseBrowserSlot() {
 // ===== 任务 ID 与状态 =====
 
 var (
-	taskSeq      int64
-	taskSeqMu    sync.Mutex
-	taskStates   = make(map[string]string)
-	taskStatesMu sync.Mutex
+	taskSeq       int64
+	taskSeqMu     sync.Mutex
+	taskRecords   = make(map[string]*TaskRecord)
+	taskCancels   = make(map[string]context.CancelFunc)
+	clearedTasks  = make(map[string]bool)
+	taskRecordsMu sync.Mutex
 )
 
 const (
@@ -64,6 +67,18 @@ const (
 	taskStatusSuccess = "success"
 	taskStatusFailed  = "failed"
 )
+
+// TaskRecord 单个任务在内存中的运行记录，用于查询进度。
+type TaskRecord struct {
+	TaskID      string    `json:"task_id"`
+	Type        string    `json:"type"`
+	ProfileName string    `json:"profile_name,omitempty"`
+	Ref         string    `json:"ref,omitempty"`
+	Status      string    `json:"status"`
+	Message     string    `json:"message,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
 
 // newTaskID 生成一个唯一任务 ID。
 func newTaskID() string {
@@ -74,16 +89,92 @@ func newTaskID() string {
 	return fmt.Sprintf("t%d_%d", time.Now().UnixNano(), n)
 }
 
+// registerTask 登记一个新任务（状态 queued），返回 task_id 与该任务的可取消 context。
+// 调用方必须把返回的 ctx 作为任务执行的根 context，这样"清空任务队列"时才能中断它。
+func registerTask(taskType, profileName, ref string) (string, context.Context) {
+	taskID := newTaskID()
+	ctx, cancel := context.WithCancel(context.Background())
+	now := time.Now()
+	taskRecordsMu.Lock()
+	taskRecords[taskID] = &TaskRecord{
+		TaskID:      taskID,
+		Type:        taskType,
+		ProfileName: profileName,
+		Ref:         ref,
+		Status:      taskStatusQueued,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	taskCancels[taskID] = cancel
+	taskRecordsMu.Unlock()
+	return taskID, ctx
+}
+
+// setTaskState 更新任务状态（message 保持不变）。
 func setTaskState(taskID, status string) {
-	taskStatesMu.Lock()
-	taskStates[taskID] = status
-	taskStatesMu.Unlock()
+	taskRecordsMu.Lock()
+	if rec, ok := taskRecords[taskID]; ok {
+		rec.Status = status
+		rec.UpdatedAt = time.Now()
+	}
+	taskRecordsMu.Unlock()
+}
+
+// finishTask 更新任务终态与结果信息，并释放该任务的 cancel 资源。
+func finishTask(taskID, status, message string) {
+	taskRecordsMu.Lock()
+	if rec, ok := taskRecords[taskID]; ok {
+		rec.Status = status
+		rec.Message = message
+		rec.UpdatedAt = time.Now()
+	}
+	if cancel, ok := taskCancels[taskID]; ok {
+		cancel()
+		delete(taskCancels, taskID)
+	}
+	taskRecordsMu.Unlock()
 }
 
 func getTaskState(taskID string) string {
-	taskStatesMu.Lock()
-	defer taskStatesMu.Unlock()
-	return taskStates[taskID]
+	taskRecordsMu.Lock()
+	defer taskRecordsMu.Unlock()
+	if rec, ok := taskRecords[taskID]; ok {
+		return rec.Status
+	}
+	return ""
+}
+
+func getTaskRecord(taskID string) *TaskRecord {
+	taskRecordsMu.Lock()
+	defer taskRecordsMu.Unlock()
+	return taskRecords[taskID]
+}
+
+// clearAllTasks 中断所有任务（排队中与正在运行的全部取消），清空任务记录，
+// 并把这些任务标记为「已清除」以抑制回调，返回被清理的任务数。
+func clearAllTasks() int {
+	taskRecordsMu.Lock()
+	defer taskRecordsMu.Unlock()
+	n := len(taskRecords)
+	newCleared := make(map[string]bool, n)
+	for id, cancel := range taskCancels {
+		cancel()
+		newCleared[id] = true
+	}
+	for id := range taskRecords {
+		newCleared[id] = true
+	}
+	clearedTasks = newCleared
+	taskCancels = make(map[string]context.CancelFunc)
+	taskRecords = make(map[string]*TaskRecord)
+	return n
+}
+
+// isTaskCleared 判断任务是否已被手动清除（用于抑制回调）。
+func isTaskCleared(taskID string) bool {
+	taskRecordsMu.Lock()
+	defer taskRecordsMu.Unlock()
+	return clearedTasks[taskID]
 }
 
 // ===== 启动重试 =====
@@ -131,6 +222,11 @@ func callbackTaskResult(ctx context.Context, logger *logx.Logger, payload TaskRe
 	if taskResultURL == "" {
 		return
 	}
+	// 任务已被手动清除：不再回调 account_sys，避免把「已作废」的任务状态写回去。
+	if isTaskCleared(payload.TaskID) {
+		logger.Print("TASK_CB", "任务已被清除，跳过回调: "+payload.TaskID)
+		return
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		logger.Print("TASK_CB", "序列化任务回调失败: "+err.Error())
@@ -157,7 +253,7 @@ func callbackTaskResult(ctx context.Context, logger *logx.Logger, payload TaskRe
 	logger.Print("TASK_CB", fmt.Sprintf("任务回调完成: status=%d body=%s", resp.StatusCode, string(raw)))
 }
 
-// handleTaskQuery GET /tasks/{id} 查询任务状态（作为回调失败/重启丢任务时的补充排查手段）。
+// handleTaskQuery GET /tasks/{id} 查询单个任务状态（作为回调失败/重启丢任务时的补充排查手段）。
 func handleTaskQuery(logger *logx.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -165,15 +261,102 @@ func handleTaskQuery(logger *logx.Logger) http.HandlerFunc {
 			return
 		}
 		taskID := strings.TrimPrefix(r.URL.Path, "/tasks/")
-		if taskID == "" {
+		if taskID == "" || strings.Contains(taskID, "/") {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "task_id is required"})
 			return
 		}
-		status := getTaskState(taskID)
-		if status == "" {
+		rec := getTaskRecord(taskID)
+		if rec == nil {
 			writeJSON(w, http.StatusNotFound, ErrorResponse{Type: "error", ErrorInfo: "task not found"})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"task_id": taskID, "status": status})
+		writeJSON(w, http.StatusOK, rec)
+	}
+}
+
+// handleTaskList GET /tasks 查询任务汇总与进度。
+// 可选 query 参数：
+//   - status: queued | running | success | failed（按状态过滤列表）
+//   - type:   fetch | nurture | send_message | check_reply | *_publish（按类型过滤列表）
+//   - limit:  列表返回条数，默认 50，最大 500
+//
+// 返回：total（全局任务总数）、status_counts（全局各状态计数）、type_counts（全局各类型计数）、
+// matched（符合过滤条件的条数）、has_more（是否还有更多）、tasks（明细列表，按提交时间倒序）。
+func handleTaskList(logger *logx.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
+			return
+		}
+
+		q := r.URL.Query()
+		filterStatus := q.Get("status")
+		filterType := q.Get("type")
+		limit := 50
+		if v := q.Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				limit = n
+				if limit > 500 {
+					limit = 500
+				}
+			}
+		}
+
+		taskRecordsMu.Lock()
+		totalAll := len(taskRecords)
+		statusCounts := map[string]int{
+			taskStatusQueued:  0,
+			taskStatusRunning: 0,
+			taskStatusSuccess: 0,
+			taskStatusFailed:  0,
+		}
+		typeCounts := map[string]int{}
+		var matched []*TaskRecord
+		for _, rec := range taskRecords {
+			typeCounts[rec.Type]++
+			statusCounts[rec.Status]++
+			if filterStatus != "" && rec.Status != filterStatus {
+				continue
+			}
+			if filterType != "" && rec.Type != filterType {
+				continue
+			}
+			matched = append(matched, rec)
+		}
+		taskRecordsMu.Unlock()
+
+		sort.Slice(matched, func(i, j int) bool {
+			return matched[i].CreatedAt.After(matched[j].CreatedAt)
+		})
+
+		hasMore := false
+		if len(matched) > limit {
+			matched = matched[:limit]
+			hasMore = true
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"total":         totalAll,
+			"status_counts": statusCounts,
+			"type_counts":   typeCounts,
+			"matched":       len(matched),
+			"has_more":      hasMore,
+			"tasks":         matched,
+		})
+	}
+}
+
+// handleTaskClear POST /tasks/clear 中断并清空所有任务。
+// 排队中(queued)的任务会被取消、不再执行；正在运行(running)的任务会被中断（对应浏览器可能
+// 来不及正常收尾而残留，需自行确认）；被清除的任务不再回调 account_sys。
+func handleTaskClear(logger *logx.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
+			return
+		}
+		n := clearAllTasks()
+		logger.Print("TASK_CLEAR", fmt.Sprintf("已清除全部任务: %d 个", n))
+		writeJSON(w, http.StatusOK, map[string]any{"type": "cleared", "count": n})
 	}
 }
