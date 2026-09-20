@@ -103,9 +103,6 @@ const (
 	// statistics (followers, total posts) after post scraping completes.
 	// Can be overridden via ACCOUNT_STATS_UPDATE_API_URL environment variable.
 	accountStatsUpdateURL = "http://47.89.235.227:3366/api/v1/account_stats/batch_update"
-
-	// browserReleaseURL 浏览器彻底关闭后，通知后端释放该浏览器占用的接口地址。
-	browserReleaseURL = "http://47.89.235.227:3366/api/v1/browser_occupations/release"
 )
 
 // publishTimeout 发布等长流程使用独立 background context 时的超时上限，
@@ -613,6 +610,30 @@ func startProfileByName(ctx context.Context, logger *logx.Logger, profileName st
 	return startByNameResult{ProfileID: profileID, Info: info, Host: host, Port: port, Path: path}, nil
 }
 
+// startProfileByNameWithRetry 启动浏览器并带重试：仅对"指纹浏览器相关"的临时性错误
+// 重试（最多 browserStartRetryTimes 次，间隔 browserStartRetryInterval），其它错误直接返回。
+func startProfileByNameWithRetry(ctx context.Context, logger *logx.Logger, profileName, host string, port, waitSeconds int, undetectablePath string) (startByNameResult, error) {
+	var lastErr error
+	for attempt := 0; attempt <= browserStartRetryTimes; attempt++ {
+		res, err := startProfileByName(ctx, logger, profileName, host, port, waitSeconds, undetectablePath)
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+		if !isRetryableBrowserError(err.Error()) || attempt == browserStartRetryTimes {
+			break
+		}
+		logger.Print("RETRY", fmt.Sprintf("profile=%s 启动失败(第%d次)，%d秒后重试: %s",
+			profileName, attempt+1, int(browserStartRetryInterval.Seconds()), err.Error()))
+		select {
+		case <-ctx.Done():
+			return startByNameResult{}, ctx.Err()
+		case <-time.After(browserStartRetryInterval):
+		}
+	}
+	return startByNameResult{}, lastErr
+}
+
 func stopProfileWithCleanup(ctx context.Context, logger *logx.Logger, browserCtx context.Context, host string, port int, profileID string) {
 	if browserCtx != nil {
 		closeCtx, cancelClose := context.WithTimeout(browserCtx, 10*time.Second)
@@ -786,6 +807,8 @@ type SendSingleMessageRequest struct {
 	Port             int    `json:"port"`
 	WaitSeconds      int    `json:"wait_seconds"`
 	UndetectablePath string `json:"undetectable_path"`
+	Async            bool   `json:"async"`         // true 时立即返回 task_id、后台执行、完成后回调
+	Ref              string `json:"ref,omitempty"` // 业务标识，透传：提交时传入，回调时原样带回
 }
 
 // SendSingleMessageResponse POST /accounts/send_single_message 响应
@@ -810,6 +833,8 @@ type CheckReplyRequest struct {
 	Port               int    `json:"port"`
 	WaitSeconds        int    `json:"wait_seconds"`
 	UndetectablePath   string `json:"undetectable_path"`
+	Async              bool   `json:"async"`         // true 时立即返回 task_id、后台执行、完成后回调
+	Ref                string `json:"ref,omitempty"` // 业务标识，透传：提交时传入，回调时原样带回
 }
 
 // CheckReplyResponse POST /accounts/check_reply 响应
@@ -842,6 +867,10 @@ type FetchPostsRequest struct {
 	UndetectablePath string              `json:"undetectable_path"`
 	// UpdateAPIURL optionally overrides the per-account posts update endpoint.
 	UpdateAPIURL string `json:"update_api_url,omitempty"`
+	// Async true 时立即返回 task_id、后台执行、完成后回调。
+	Async bool `json:"async"`
+	// Ref 业务标识，透传：提交时传入，回调时原样带回（供 account_sys 精确关联任务）。
+	Ref string `json:"ref,omitempty"`
 }
 
 type FetchPostsAccountResult struct {
@@ -911,171 +940,221 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 
 		updateEndpoint := resolvePostsUpdateURL(req.UpdateAPIURL)
 
-		// 获取Profile操作锁(防止同一Profile的fetch和nurture并发执行导致浏览器混乱)
-		releaseLock := acquireProfileLock(req.ProfileName, logger)
-		defer releaseLock()
+		// execute 执行完整采集流程：并发额度 → profile锁 → 启动(带重试) → 遍历采集+上报 → 关闭释放。
+		// 返回 (status, info, results, profileID)。
+		execute := func() (string, string, []FetchPostsAccountResult, string) {
+			bgCtx := context.Background()
 
-		// 1. 启动指纹浏览器环境
-		logger.Print("FP1", fmt.Sprintf("启动Profile环境: %s (任务数: %d)", req.ProfileName, len(req.ActiveAccounts)))
-		startRes, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-		if err != nil {
-			logger.Print("E", "启动Profile失败: "+err.Error())
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+			// 获取全局并发额度（排队等待）
+			if err := acquireBrowserSlot(bgCtx); err != nil {
+				return "failed", "获取并发额度失败: " + err.Error(), nil, ""
+			}
+			defer releaseBrowserSlot()
+
+			// 获取Profile操作锁(防止同一Profile的fetch和nurture并发执行导致浏览器混乱)
+			releaseLock := acquireProfileLock(req.ProfileName, logger)
+			defer releaseLock()
+
+			// 1. 启动指纹浏览器环境
+			logger.Print("FP1", fmt.Sprintf("启动Profile环境: %s (任务数: %d)", req.ProfileName, len(req.ActiveAccounts)))
+			startRes, err := startProfileByNameWithRetry(bgCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+			if err != nil {
+				logger.Print("E", "启动Profile失败: "+err.Error())
+				return "failed", err.Error(), nil, ""
+			}
+
+			// 建立 CDP 远程连接
+			allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(bgCtx, startRes.Info.WebsocketLink, chromedp.NoModifyURL)
+			defer cancelAlloc()
+
+			// 🌟 双重静音保险：阻止 Chrome 底层未定义事件乱喷日志
+			browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
+				chromedp.WithLogf(func(string, ...interface{}) {}),
+				chromedp.WithErrorf(func(string, ...interface{}) {}),
+			)
+			defer cancelBrowser()
+
+			// 清理多余标签页
+			chromedputil.CleanExtraTabs(browserCtx, logger, "FETCH")
+
+			type tabInfo struct {
+				ctx    context.Context
+				cancel context.CancelFunc
+			}
+			openedTabs := make([]tabInfo, 0, len(req.ActiveAccounts))
+			results := make([]FetchPostsAccountResult, 0, len(req.ActiveAccounts))
+			statsEndpoint := resolveAccountStatsUpdateURL()
+			if statsEndpoint != "" {
+				logger.Print("FP3", fmt.Sprintf("账号统计更新API: %s (采集到粉丝数后立即上报)", statsEndpoint))
+			}
+
+			// 2. 串行遍历账号采集
+			// 第一个账号复用browserCtx(已含错误抑制)，后续账号新建标签页(同样带错误抑制)，避免多余空白标签页
+			for i, acc := range req.ActiveAccounts {
+				res := FetchPostsAccountResult{
+					AccountID: acc.ID,
+					Platform:  acc.Platform,
+					SourceURL: acc.SourceURL,
+					Status:    "abnormal",
+					Posts:     []scraper.Post{},
+				}
+
+				trimmedURL := strings.TrimSpace(acc.SourceURL)
+				if acc.ID == 0 || strings.TrimSpace(acc.Platform) == "" {
+					res.ErrorInfo = "账号参数不完整"
+					results = append(results, res)
+					continue
+				}
+
+				logger.Print("FP3", fmt.Sprintf("[%d/%d] 正在创建标签页任务 -> 平台: %s", i+1, len(req.ActiveAccounts), acc.Platform))
+
+				var tabCtx context.Context
+				var cancelTab context.CancelFunc
+				if i == 0 {
+					// 首个账号复用browserCtx，避免创建多余空白标签
+					tabCtx = browserCtx
+					cancelTab = cancelBrowser // 使用已有的cancel，不重复defer
+				} else {
+					// 注意: WithLogf/WithErrorf 是 BrowserOption(分配浏览器时用), 不是 ContextOption(创建tab时用)
+					// 在已有的browserCtx上创建新tab时传入这些选项会导致 panic
+					tabCtx, cancelTab = chromedp.NewContext(browserCtx)
+				}
+				openedTabs = append(openedTabs, tabInfo{ctx: tabCtx, cancel: cancelTab})
+
+				fetchCtx, cancelFetch := context.WithTimeout(tabCtx, 20*time.Minute)
+				stallCtx, cancelStall, watcher := chromedputil.WatchPageStall(fetchCtx, logger, fetchStallTimeout)
+				fetchRes, fetchErr := fetchPostsByPlatform(stallCtx, logger, acc.Platform, scraper.FetchRequest{
+					SourceURL:            trimmedURL,
+					AccountID:            int64(acc.ID),
+					AccountStatsEndpoint: statsEndpoint,
+				})
+				cancelStall()
+				cancelFetch()
+
+				if fetchErr != nil {
+					if watcher.Stalled() {
+						res.StalledURL = watcher.URL()
+						res.ErrorInfo = "页面停留超时, 卡在页面: " + watcher.URL()
+						logger.Print("FP3", fmt.Sprintf("[%d/%d] 页面停留超时, 卡在: %s", i+1, len(req.ActiveAccounts), watcher.URL()))
+					} else {
+						res.ErrorInfo = fetchErr.Error()
+					}
+				} else {
+					res.Posts = fetchRes.Posts
+					if res.Posts == nil {
+						res.Posts = []scraper.Post{}
+					}
+					res.PostCount = len(res.Posts)
+					res.TotalFollowers = fetchRes.TotalFollowers
+					res.TotalLikes = fetchRes.TotalLikes
+					res.TotalPosts = fetchRes.TotalPosts
+					res.Status = "normal"
+				}
+
+				// 🌟 2. 核心调整：如果配置了接口，将多条发文拆解为 Rails 期待的单条参数，循环推送
+				if res.Status == "normal" && len(res.Posts) > 0 {
+					if updateEndpoint == "" {
+						logger.Print("POSTS_UPD", fmt.Sprintf("未配置发文更新接口，跳过同步 (account_id=%d)", acc.ID))
+					} else {
+						successCount := 0
+						for _, post := range res.Posts {
+							// 将各平台提取的日期归一化为 Rails 能解析的标准字符串
+							postDate := normalizePostDate(post.PublishTime)
+
+							// 转换为 Rails 对应的单条结构
+							payload := RailsPostParam{
+								AccountID:     int64(acc.ID),
+								PostDate:      postDate,
+								URL:           post.Link,
+								Title:         post.Title,
+								LikesCount:    post.Likes,
+								SharesCount:   post.Shares,
+								CommentsCount: post.Comments,
+								ViewsCount:    post.Views,
+								DataUpdatedAt: time.Now().Format(time.RFC3339),
+							}
+
+							// 发起请求
+							updateErr := callSinglePostUpdateAPI(bgCtx, logger, updateEndpoint, payload)
+							if updateErr != nil {
+								logger.Print("E", fmt.Sprintf("同步单条推文失败 (URL: %s): %s", post.Link, updateErr.Error()))
+								res.UpdateError = updateErr.Error()
+							} else {
+								successCount++
+							}
+						}
+
+						if successCount == len(res.Posts) {
+							res.UpdateSent = true
+						}
+						logger.Print("POSTS_UPD", fmt.Sprintf("账号(account_id=%d) 数据推送完毕。成功: %d/%d", acc.ID, successCount, len(res.Posts)))
+					}
+				}
+
+				results = append(results, res)
+
+				if i < len(req.ActiveAccounts)-1 {
+					time.Sleep(2 * time.Second)
+				}
+			}
+
+			// 3. 收尾清理
+			logger.Print("FP4", "任务结束，正在释放标签页与关闭Profile进程...")
+			for _, tab := range openedTabs {
+				tab.cancel()
+			}
+
+			stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+
+			normalCount := 0
+			for _, res := range results {
+				if res.Status == "normal" {
+					normalCount++
+				}
+			}
+			return "success", fmt.Sprintf("采集完成 %d/%d 个账号", normalCount, len(results)), results, startRes.ProfileID
+		}
+
+		// 异步：立即返回 task_id，后台执行，完成后回调
+		if req.Async {
+			taskID := newTaskID()
+			setTaskState(taskID, taskStatusQueued)
+			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			go func() {
+				setTaskState(taskID, taskStatusRunning)
+				status, info, results, _ := execute()
+				finalStatus := taskStatusSuccess
+				if status != "success" {
+					finalStatus = taskStatusFailed
+				}
+				setTaskState(taskID, finalStatus)
+				callbackTaskResult(context.Background(), logger, TaskResultPayload{
+					TaskID:      taskID,
+					ProfileName: req.ProfileName,
+					TaskType:    "fetch",
+					Ref:         req.Ref,
+					Status:      status,
+					Message:     info,
+					Result:      results,
+				})
+			}()
 			return
 		}
 
-		// 建立 CDP 远程连接
-		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(r.Context(), startRes.Info.WebsocketLink, chromedp.NoModifyURL)
-		defer cancelAlloc()
-
-		// 🌟 双重静音保险：阻止 Chrome 底层未定义事件乱喷日志
-		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
-			chromedp.WithLogf(func(string, ...interface{}) {}),
-			chromedp.WithErrorf(func(string, ...interface{}) {}),
-		)
-		defer cancelBrowser()
-
-		// 清理多余标签页
-		chromedputil.CleanExtraTabs(browserCtx, logger, "FETCH")
-
-		type tabInfo struct {
-			ctx    context.Context
-			cancel context.CancelFunc
+		// 同步：原地执行并返回
+		status, info, results, profileID := execute()
+		if status != "success" {
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
+			return
 		}
-		openedTabs := make([]tabInfo, 0, len(req.ActiveAccounts))
-		results := make([]FetchPostsAccountResult, 0, len(req.ActiveAccounts))
-		statsEndpoint := resolveAccountStatsUpdateURL()
-		if statsEndpoint != "" {
-			logger.Print("FP3", fmt.Sprintf("账号统计更新API: %s (采集到粉丝数后立即上报)", statsEndpoint))
-		}
-
-		// 2. 串行遍历账号采集
-		// 第一个账号复用browserCtx(已含错误抑制)，后续账号新建标签页(同样带错误抑制)，避免多余空白标签页
-		for i, acc := range req.ActiveAccounts {
-			res := FetchPostsAccountResult{
-				AccountID: acc.ID,
-				Platform:  acc.Platform,
-				SourceURL: acc.SourceURL,
-				Status:    "abnormal",
-				Posts:     []scraper.Post{},
-			}
-
-			trimmedURL := strings.TrimSpace(acc.SourceURL)
-			if acc.ID == 0 || strings.TrimSpace(acc.Platform) == "" {
-				res.ErrorInfo = "账号参数不完整"
-				results = append(results, res)
-				continue
-			}
-
-			logger.Print("FP3", fmt.Sprintf("[%d/%d] 正在创建标签页任务 -> 平台: %s", i+1, len(req.ActiveAccounts), acc.Platform))
-
-			var tabCtx context.Context
-			var cancelTab context.CancelFunc
-			if i == 0 {
-				// 首个账号复用browserCtx，避免创建多余空白标签
-				tabCtx = browserCtx
-				cancelTab = cancelBrowser // 使用已有的cancel，不重复defer
-			} else {
-				// 注意: WithLogf/WithErrorf 是 BrowserOption(分配浏览器时用), 不是 ContextOption(创建tab时用)
-				// 在已有的browserCtx上创建新tab时传入这些选项会导致 panic
-				tabCtx, cancelTab = chromedp.NewContext(browserCtx)
-			}
-			openedTabs = append(openedTabs, tabInfo{ctx: tabCtx, cancel: cancelTab})
-
-			fetchCtx, cancelFetch := context.WithTimeout(tabCtx, 20*time.Minute)
-			stallCtx, cancelStall, watcher := chromedputil.WatchPageStall(fetchCtx, logger, fetchStallTimeout)
-			fetchRes, fetchErr := fetchPostsByPlatform(stallCtx, logger, acc.Platform, scraper.FetchRequest{
-				SourceURL:            trimmedURL,
-				AccountID:            int64(acc.ID),
-				AccountStatsEndpoint: statsEndpoint,
-			})
-			cancelStall()
-			cancelFetch()
-
-			if fetchErr != nil {
-				if watcher.Stalled() {
-					res.StalledURL = watcher.URL()
-					res.ErrorInfo = "页面停留超时, 卡在页面: " + watcher.URL()
-					logger.Print("FP3", fmt.Sprintf("[%d/%d] 页面停留超时, 卡在: %s", i+1, len(req.ActiveAccounts), watcher.URL()))
-				} else {
-					res.ErrorInfo = fetchErr.Error()
-				}
-			} else {
-				res.Posts = fetchRes.Posts
-				if res.Posts == nil {
-					res.Posts = []scraper.Post{}
-				}
-				res.PostCount = len(res.Posts)
-				res.TotalFollowers = fetchRes.TotalFollowers
-				res.TotalLikes = fetchRes.TotalLikes
-				res.TotalPosts = fetchRes.TotalPosts
-				res.Status = "normal"
-			}
-
-			// 🌟 2. 核心调整：如果配置了接口，将多条发文拆解为 Rails 期待的单条参数，循环推送
-			if res.Status == "normal" && len(res.Posts) > 0 {
-				if updateEndpoint == "" {
-					logger.Print("POSTS_UPD", fmt.Sprintf("未配置发文更新接口，跳过同步 (account_id=%d)", acc.ID))
-				} else {
-					successCount := 0
-					for _, post := range res.Posts {
-						// 将各平台提取的日期归一化为 Rails 能解析的标准字符串
-						postDate := normalizePostDate(post.PublishTime)
-
-						// 转换为 Rails 对应的单条结构
-						payload := RailsPostParam{
-							AccountID:     int64(acc.ID),
-							PostDate:      postDate,
-							URL:           post.Link,
-							Title:         post.Title,
-							LikesCount:    post.Likes,
-							SharesCount:   post.Shares,
-							CommentsCount: post.Comments,
-							ViewsCount:    post.Views,
-							DataUpdatedAt: time.Now().Format(time.RFC3339),
-						}
-
-						// 发起请求
-						updateErr := callSinglePostUpdateAPI(r.Context(), logger, updateEndpoint, payload)
-						if updateErr != nil {
-							logger.Print("E", fmt.Sprintf("同步单条推文失败 (URL: %s): %s", post.Link, updateErr.Error()))
-							res.UpdateError = updateErr.Error()
-						} else {
-							successCount++
-						}
-					}
-
-					if successCount == len(res.Posts) {
-						res.UpdateSent = true
-					}
-					logger.Print("POSTS_UPD", fmt.Sprintf("账号(account_id=%d) 数据推送完毕。成功: %d/%d", acc.ID, successCount, len(res.Posts)))
-				}
-			}
-
-			results = append(results, res)
-
-			if i < len(req.ActiveAccounts)-1 {
-				time.Sleep(2 * time.Second)
-			}
-		}
-
-		// 3. 收尾清理
-		logger.Print("FP4", "任务结束，正在释放标签页与关闭Profile进程...")
-		for _, tab := range openedTabs {
-			tab.cancel()
-		}
-
-		stopProfileWithCleanup(context.Background(), logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
-		// 浏览器已彻底关闭，通知后端释放该浏览器占用
-		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
-
 		writeJSON(w, http.StatusOK, FetchPostsResponse{
 			Type:      "success",
-			ProfileID: startRes.ProfileID,
+			ProfileID: profileID,
 			Results:   results,
 		})
 	}
 }
+
 // normalizePostDate 将各平台抓取到的发文时间归一化为 Rails 可解析的 RFC3339 字符串。
 // 各平台返回的日期格式不一：Twitter/Instagram 是 ISO8601("2026-09-15T05:30:00.000Z")，
 // TikTok/YouTube 是 "YYYY-MM-DD HH:mm:ss"，Facebook 是绝对日期文本；提取失败时可能是
@@ -1088,8 +1167,8 @@ func normalizePostDate(s string) string {
 	layouts := []string{
 		time.RFC3339,                    // "2006-01-02T15:04:05Z07:00"（可含小数秒）
 		"2006-01-02T15:04:05.000Z07:00", // ISO 带毫秒+时区
-		"2006-01-02 15:04:05",          // "YYYY-MM-DD HH:mm:ss"
-		"2006-01-02",                   // 纯日期
+		"2006-01-02 15:04:05",           // "YYYY-MM-DD HH:mm:ss"
+		"2006-01-02",                    // 纯日期
 	}
 	for _, layout := range layouts {
 		if t, err := time.Parse(layout, s); err == nil {
@@ -1126,63 +1205,6 @@ func callSinglePostUpdateAPI(ctx context.Context, logger *logx.Logger, endpoint 
 	}
 
 	return nil
-}
-
-// releaseBrowserOccupation 在浏览器彻底关闭后，通知后端释放该浏览器占用。
-// profileName 为 Undetectable 指纹浏览器的 profile 名称（与后端 browser 记录对应）。
-// 接口约定：无论结果如何 HTTP 都返回 200，靠响应 body 的 type 字段区分 success/error。
-// 该调用是 Best Effort：失败仅打日志，不影响主流程返回结果。
-func releaseBrowserOccupation(ctx context.Context, logger *logx.Logger, profileName string) {
-	if profileName == "" {
-		return
-	}
-	payload := map[string]string{"profile_name": profileName}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		logger.Print("REL", "序列化 release 请求失败: "+err.Error())
-		return
-	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, browserReleaseURL, bytes.NewReader(body))
-	if err != nil {
-		logger.Print("REL", "构建 release 请求失败: "+err.Error())
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", accountCheckUA)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		logger.Print("REL", "release 请求失败: "+err.Error())
-		return
-	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		logger.Print("REL", fmt.Sprintf("release 返回异常 HTTP 状态: status=%d body=%s", resp.StatusCode, string(raw)))
-		return
-	}
-
-	// 解析响应体，靠 type 字段区分结果（接口约定 HTTP 恒为 200）
-	var relResp struct {
-		Type    string `json:"type"`
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(raw, &relResp); err != nil {
-		logger.Print("REL", fmt.Sprintf("release 响应解析失败: %v body=%s", err, string(raw)))
-		return
-	}
-	switch relResp.Type {
-	case "success":
-		logger.Print("REL", fmt.Sprintf("释放浏览器占用成功: profile_name=%s, 后端消息: %s", profileName, relResp.Message))
-	case "error":
-		logger.Print("REL", fmt.Sprintf("释放浏览器占用失败: profile_name=%s, 后端消息: %s", profileName, relResp.Message))
-	default:
-		logger.Print("REL", fmt.Sprintf("release 返回未知 type=%q message=%s", relResp.Type, relResp.Message))
-	}
 }
 
 // handleSendMessage POST /accounts/send_message 已移除(批量发送不再需要, 只保留单条发送)
@@ -1229,84 +1251,119 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 			req.WaitSeconds = accountDefaultWaitS
 		}
 
-		// 单条发送: 构造只含一个任务的切片, 复用批量发送的平台分发逻辑
-		tasks := []message.SendTask{{
-			TargetURL:      req.TargetURL,
-			AccountName:    req.AccountName,
-			MessageContent: req.MessageContent,
-			Passcode:       req.Passcode,
-		}}
-
 		target := req.TargetURL
 		if target == "" {
 			target = req.AccountName
 		}
-		logger.Print("MSG", fmt.Sprintf("收到单条私信请求: profile=%s, platform=%s, account_id=%d, target=%s", req.ProfileName, req.Platform, req.AccountID, target))
+		logger.Print("MSG", fmt.Sprintf("收到单条私信请求: profile=%s, platform=%s, account_id=%d, target=%s, async=%v", req.ProfileName, req.Platform, req.AccountID, target, req.Async))
 
-		// 获取Profile操作锁(防止同一Profile的fetch/nurture/message并发执行导致浏览器混乱)
-		releaseLock := acquireProfileLock(req.ProfileName, logger)
-		defer releaseLock()
+		// execute 执行完整私信流程：并发额度 → profile锁 → 启动(带重试) → 发送 → 关闭。
+		// 返回 (status, info, resp)：status 为 success/failed；resp 为同步响应结构。
+		execute := func() (string, string, SendSingleMessageResponse) {
+			bgCtx := context.Background()
 
-		startRes, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-		if err != nil {
-			logger.Print("MSG", "启动Profile失败: "+err.Error())
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
+			// 构造只含一个任务的切片
+			tasks := []message.SendTask{{
+				TargetURL:      req.TargetURL,
+				AccountName:    req.AccountName,
+				MessageContent: req.MessageContent,
+				Passcode:       req.Passcode,
+			}}
 
-		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(r.Context(), startRes.Info.WebsocketLink, chromedp.NoModifyURL)
-		defer cancelAlloc()
+			// 获取全局并发额度（排队等待）
+			if err := acquireBrowserSlot(bgCtx); err != nil {
+				return "failed", "获取并发额度失败: " + err.Error(), SendSingleMessageResponse{Type: "error", AccountID: req.AccountID, ErrorInfo: "获取并发额度失败: " + err.Error()}
+			}
+			defer releaseBrowserSlot()
 
-		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
-			chromedp.WithLogf(func(string, ...interface{}) {}),
-			chromedp.WithErrorf(func(string, ...interface{}) {}),
-		)
-		defer cancelBrowser()
+			releaseLock := acquireProfileLock(req.ProfileName, logger)
+			defer releaseLock()
 
-		chromedputil.CleanExtraTabs(browserCtx, logger, "MSG")
+			startRes, err := startProfileByNameWithRetry(bgCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+			if err != nil {
+				logger.Print("MSG", "启动Profile失败: "+err.Error())
+				return "failed", err.Error(), SendSingleMessageResponse{Type: "error", AccountID: req.AccountID, ErrorInfo: err.Error()}
+			}
 
-		// 单条私信整体超时: 最长约5分钟
-		msgCtx, cancelMsg := context.WithTimeout(browserCtx, 5*time.Minute)
-		defer cancelMsg()
+			allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(bgCtx, startRes.Info.WebsocketLink, chromedp.NoModifyURL)
+			defer cancelAlloc()
+			browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
+				chromedp.WithLogf(func(string, ...interface{}) {}),
+				chromedp.WithErrorf(func(string, ...interface{}) {}),
+			)
+			defer cancelBrowser()
+			chromedputil.CleanExtraTabs(browserCtx, logger, "MSG")
 
-		sendRes, sendErr := sendMessageByPlatform(msgCtx, logger, req.Platform, tasks)
+			msgCtx, cancelMsg := context.WithTimeout(browserCtx, 5*time.Minute)
+			defer cancelMsg()
+			sendRes, sendErr := sendMessageByPlatform(msgCtx, logger, req.Platform, tasks)
 
-		for i := range sendRes.Results {
-			sendRes.Results[i].ErrorInfo = scraper.SanitizeString(sendRes.Results[i].ErrorInfo)
-			sendRes.Results[i].TargetURL = scraper.SanitizeString(sendRes.Results[i].TargetURL)
-		}
-		sendRes.ErrorInfo = scraper.SanitizeString(sendRes.ErrorInfo)
+			for i := range sendRes.Results {
+				sendRes.Results[i].ErrorInfo = scraper.SanitizeString(sendRes.Results[i].ErrorInfo)
+				sendRes.Results[i].TargetURL = scraper.SanitizeString(sendRes.Results[i].TargetURL)
+			}
+			sendRes.ErrorInfo = scraper.SanitizeString(sendRes.ErrorInfo)
 
-		stopProfileWithCleanup(context.Background(), logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+			stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
 
-		var outcome *message.SendOutcome
-		if len(sendRes.Results) > 0 {
-			o := sendRes.Results[0]
-			outcome = &o
-		}
+			var outcome *message.SendOutcome
+			if len(sendRes.Results) > 0 {
+				o := sendRes.Results[0]
+				outcome = &o
+			}
 
-		if sendErr != nil {
-			logger.Print("MSG", "单条私信流程失败: "+sendErr.Error())
-			writeJSON(w, http.StatusOK, SendSingleMessageResponse{
-				Type:      "error",
+			if sendErr != nil {
+				logger.Print("MSG", "单条私信流程失败: "+sendErr.Error())
+				return "failed", sendRes.ErrorInfo + " | " + sanitizeErr(sendErr), SendSingleMessageResponse{
+					Type:      "error",
+					ProfileID: startRes.ProfileID,
+					AccountID: req.AccountID,
+					Status:    sendRes.Status,
+					Result:    outcome,
+					ErrorInfo: sendRes.ErrorInfo + " | " + sanitizeErr(sendErr),
+				}
+			}
+
+			logger.Print("MSG", fmt.Sprintf("单条私信流程完成: profile=%s, platform=%s, account_id=%d, 状态=%s", req.ProfileName, req.Platform, req.AccountID, sendRes.Status))
+			return "success", sendRes.Status, SendSingleMessageResponse{
+				Type:      "success",
 				ProfileID: startRes.ProfileID,
 				AccountID: req.AccountID,
 				Status:    sendRes.Status,
 				Result:    outcome,
-				ErrorInfo: sendRes.ErrorInfo + " | " + sanitizeErr(sendErr),
-			})
+				ErrorInfo: sendRes.ErrorInfo,
+			}
+		}
+
+		// 异步：立即返回 task_id，后台执行，完成后回调
+		if req.Async {
+			taskID := newTaskID()
+			setTaskState(taskID, taskStatusQueued)
+			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			go func() {
+				setTaskState(taskID, taskStatusRunning)
+				status, info, resp := execute()
+				finalStatus := taskStatusSuccess
+				if status != "success" {
+					finalStatus = taskStatusFailed
+				}
+				setTaskState(taskID, finalStatus)
+				callbackTaskResult(context.Background(), logger, TaskResultPayload{
+					TaskID:      taskID,
+					ProfileName: req.ProfileName,
+					TaskType:    "send_message",
+					Ref:         req.Ref,
+					Status:      status,
+					Message:     info,
+					Result:      resp,
+				})
+			}()
 			return
 		}
 
-		logger.Print("MSG", fmt.Sprintf("单条私信流程完成: profile=%s, platform=%s, account_id=%d, 状态=%s", req.ProfileName, req.Platform, req.AccountID, sendRes.Status))
-		writeJSON(w, http.StatusOK, SendSingleMessageResponse{
-			Type:      "success",
-			ProfileID: startRes.ProfileID,
-			AccountID: req.AccountID,
-			Status:    sendRes.Status,
-			Result:    outcome,
-			ErrorInfo: sendRes.ErrorInfo,
-		})
+		// 同步：原地执行并返回
+		_, _, resp := execute()
+		writeJSON(w, http.StatusOK, resp)
 	}
 }
 
@@ -1347,53 +1404,75 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 		}
 
 		target := req.TargetURL
-		logger.Print("MSG", fmt.Sprintf("收到判断回复请求: profile=%s, platform=%s, account_id=%d, target=%s, since=%d",
-			req.ProfileName, req.Platform, req.AccountID, target, req.SinceIncomingCount))
+		logger.Print("MSG", fmt.Sprintf("收到判断回复请求: profile=%s, platform=%s, account_id=%d, target=%s, since=%d, async=%v",
+			req.ProfileName, req.Platform, req.AccountID, target, req.SinceIncomingCount, req.Async))
 
-		releaseLock := acquireProfileLock(req.ProfileName, logger)
-		defer releaseLock()
+		// execute 执行完整判断回复流程：并发额度 → profile锁 → 启动(带重试) → 检查 → 关闭。
+		// 返回 (status, info, resp)：status 为 success/failed；resp 为同步响应结构。
+		execute := func() (string, string, CheckReplyResponse) {
+			bgCtx := context.Background()
 
-		startRes, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-		if err != nil {
-			logger.Print("MSG", "启动Profile失败: "+err.Error())
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
+			if err := acquireBrowserSlot(bgCtx); err != nil {
+				return "failed", "获取并发额度失败: " + err.Error(), CheckReplyResponse{Type: "error", AccountID: req.AccountID, ErrorInfo: "获取并发额度失败: " + err.Error()}
+			}
+			defer releaseBrowserSlot()
 
-		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(r.Context(), startRes.Info.WebsocketLink, chromedp.NoModifyURL)
-		defer cancelAlloc()
+			releaseLock := acquireProfileLock(req.ProfileName, logger)
+			defer releaseLock()
 
-		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
-			chromedp.WithLogf(func(string, ...interface{}) {}),
-			chromedp.WithErrorf(func(string, ...interface{}) {}),
-		)
-		defer cancelBrowser()
+			startRes, err := startProfileByNameWithRetry(bgCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+			if err != nil {
+				logger.Print("MSG", "启动Profile失败: "+err.Error())
+				return "failed", err.Error(), CheckReplyResponse{Type: "error", AccountID: req.AccountID, ErrorInfo: err.Error()}
+			}
 
-		chromedputil.CleanExtraTabs(browserCtx, logger, "MSG")
+			allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(bgCtx, startRes.Info.WebsocketLink, chromedp.NoModifyURL)
+			defer cancelAlloc()
+			browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
+				chromedp.WithLogf(func(string, ...interface{}) {}),
+				chromedp.WithErrorf(func(string, ...interface{}) {}),
+			)
+			defer cancelBrowser()
+			chromedputil.CleanExtraTabs(browserCtx, logger, "MSG")
 
-		checkCtx, cancelCheck := context.WithTimeout(browserCtx, 5*time.Minute)
-		defer cancelCheck()
+			checkCtx, cancelCheck := context.WithTimeout(browserCtx, 5*time.Minute)
+			defer cancelCheck()
+			checkRes, checkErr := checkReplyByPlatform(checkCtx, logger, req.Platform, message.CheckReplyOptions{
+				TargetURL:          req.TargetURL,
+				AccountName:        req.AccountName,
+				Passcode:           req.Passcode,
+				SinceIncomingCount: req.SinceIncomingCount,
+			})
 
-		checkRes, checkErr := checkReplyByPlatform(checkCtx, logger, req.Platform, message.CheckReplyOptions{
-			TargetURL:          req.TargetURL,
-			AccountName:        req.AccountName,
-			Passcode:           req.Passcode,
-			SinceIncomingCount: req.SinceIncomingCount,
-		})
+			stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
 
-		stopProfileWithCleanup(context.Background(), logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+			for i := range checkRes.Replies {
+				checkRes.Replies[i].SenderName = scraper.SanitizeString(checkRes.Replies[i].SenderName)
+				checkRes.Replies[i].Content = scraper.SanitizeString(checkRes.Replies[i].Content)
+				checkRes.Replies[i].SentAt = scraper.SanitizeString(checkRes.Replies[i].SentAt)
+			}
+			checkRes.ErrorInfo = scraper.SanitizeString(checkRes.ErrorInfo)
 
-		for i := range checkRes.Replies {
-			checkRes.Replies[i].SenderName = scraper.SanitizeString(checkRes.Replies[i].SenderName)
-			checkRes.Replies[i].Content = scraper.SanitizeString(checkRes.Replies[i].Content)
-			checkRes.Replies[i].SentAt = scraper.SanitizeString(checkRes.Replies[i].SentAt)
-		}
-		checkRes.ErrorInfo = scraper.SanitizeString(checkRes.ErrorInfo)
+			if checkErr != nil {
+				logger.Print("MSG", "判断回复流程失败: "+checkErr.Error())
+				return "failed", checkRes.ErrorInfo + " | " + sanitizeErr(checkErr), CheckReplyResponse{
+					Type:        "error",
+					ProfileID:   startRes.ProfileID,
+					AccountID:   req.AccountID,
+					Status:      checkRes.Status,
+					ReplyStatus: checkRes.ReplyStatus,
+					HasReply:    checkRes.HasReply,
+					ReplyCount:  checkRes.ReplyCount,
+					Replies:     checkRes.Replies,
+					CheckedAt:   checkRes.CheckedAt,
+					ErrorInfo:   checkRes.ErrorInfo + " | " + sanitizeErr(checkErr),
+				}
+			}
 
-		if checkErr != nil {
-			logger.Print("MSG", "判断回复流程失败: "+checkErr.Error())
-			writeJSON(w, http.StatusOK, CheckReplyResponse{
-				Type:        "error",
+			logger.Print("MSG", fmt.Sprintf("判断回复完成: profile=%s, platform=%s, account_id=%d, 状态=%s, 回复状态=%s, 新回复=%d",
+				req.ProfileName, req.Platform, req.AccountID, checkRes.Status, checkRes.ReplyStatus, checkRes.ReplyCount))
+			return "success", checkRes.ReplyStatus, CheckReplyResponse{
+				Type:        "success",
 				ProfileID:   startRes.ProfileID,
 				AccountID:   req.AccountID,
 				Status:      checkRes.Status,
@@ -1402,25 +1481,39 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 				ReplyCount:  checkRes.ReplyCount,
 				Replies:     checkRes.Replies,
 				CheckedAt:   checkRes.CheckedAt,
-				ErrorInfo:   checkRes.ErrorInfo + " | " + sanitizeErr(checkErr),
-			})
+				ErrorInfo:   checkRes.ErrorInfo,
+			}
+		}
+
+		// 异步：立即返回 task_id，后台执行，完成后回调
+		if req.Async {
+			taskID := newTaskID()
+			setTaskState(taskID, taskStatusQueued)
+			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			go func() {
+				setTaskState(taskID, taskStatusRunning)
+				status, info, resp := execute()
+				finalStatus := taskStatusSuccess
+				if status != "success" {
+					finalStatus = taskStatusFailed
+				}
+				setTaskState(taskID, finalStatus)
+				callbackTaskResult(context.Background(), logger, TaskResultPayload{
+					TaskID:      taskID,
+					ProfileName: req.ProfileName,
+					TaskType:    "check_reply",
+					Ref:         req.Ref,
+					Status:      status,
+					Message:     info,
+					Result:      resp,
+				})
+			}()
 			return
 		}
 
-		logger.Print("MSG", fmt.Sprintf("判断回复完成: profile=%s, platform=%s, account_id=%d, 状态=%s, 回复状态=%s, 新回复=%d",
-			req.ProfileName, req.Platform, req.AccountID, checkRes.Status, checkRes.ReplyStatus, checkRes.ReplyCount))
-		writeJSON(w, http.StatusOK, CheckReplyResponse{
-			Type:        "success",
-			ProfileID:   startRes.ProfileID,
-			AccountID:   req.AccountID,
-			Status:      checkRes.Status,
-			ReplyStatus: checkRes.ReplyStatus,
-			HasReply:    checkRes.HasReply,
-			ReplyCount:  checkRes.ReplyCount,
-			Replies:     checkRes.Replies,
-			CheckedAt:   checkRes.CheckedAt,
-			ErrorInfo:   checkRes.ErrorInfo,
-		})
+		// 同步：原地执行并返回
+		_, _, resp := execute()
+		writeJSON(w, http.StatusOK, resp)
 	}
 }
 
@@ -1432,6 +1525,9 @@ func main() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+
+	// 任务状态查询（按 task_id 查询，作为回调失败/重启丢任务时的补充排查手段）
+	mux.HandleFunc("/tasks/", handleTaskQuery(logger))
 
 	mux.HandleFunc("/accounts/check_login_status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1501,6 +1597,8 @@ func main() {
 		Port             int    `json:"port"`
 		WaitSeconds      int    `json:"wait_seconds"`
 		UndetectablePath string `json:"undetectable_path"`
+		Async            bool   `json:"async"` // true 时立即返回 task_id、后台执行、完成后回调
+		Ref              string `json:"ref,omitempty"`
 	}
 
 	type NurtureResponse struct {
@@ -1540,72 +1638,94 @@ func main() {
 			req.WaitSeconds = accountDefaultWaitS
 		}
 
-		logger.Print("NURTURE", fmt.Sprintf("收到养号请求: profile=%s, platform=%s", req.ProfileName, req.Platform))
+		logger.Print("NURTURE", fmt.Sprintf("收到养号请求: profile=%s, platform=%s, async=%v", req.ProfileName, req.Platform, req.Async))
 
-		// 获取Profile操作锁(防止同一Profile的fetch和nurture并发执行导致浏览器混乱)
-		releaseLock := acquireProfileLock(req.ProfileName, logger)
-		defer releaseLock()
+		// execute 执行完整养号流程：并发额度 → profile锁 → 启动(带重试) → 养号 → 关闭+释放。
+		// 返回 (status, info)，status 为 success / error / failed。
+		execute := func() (string, string) {
+			bgCtx := context.Background()
 
-		res, err := startProfileByName(r.Context(), logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-		if err != nil {
-			logger.Print("E", "启动Profile失败: "+err.Error())
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
+			// 1. 获取全局并发额度（超出的任务在此排队等待）
+			if err := acquireBrowserSlot(bgCtx); err != nil {
+				return "failed", "获取并发额度失败: " + err.Error()
+			}
+			defer releaseBrowserSlot()
 
-		// 养号流程使用独立 context，不受 HTTP 请求断开影响
-		bgCtx := context.Background()
+			// 2. 获取 Profile 操作锁（同一浏览器串行，防止并发操作导致混乱）
+			releaseLock := acquireProfileLock(req.ProfileName, logger)
+			defer releaseLock()
 
-		allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(bgCtx, res.Info.WebsocketLink, chromedp.NoModifyURL)
-		defer cancelAlloc()
+			// 3. 启动浏览器（带重试）
+			res, err := startProfileByNameWithRetry(bgCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+			if err != nil {
+				logger.Print("E", "启动Profile失败: "+err.Error())
+				return "failed", err.Error()
+			}
 
-		browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
-			chromedp.WithLogf(func(string, ...interface{}) {}),
-			chromedp.WithErrorf(func(string, ...interface{}) {}),
-		)
-		defer cancelBrowser()
+			// 4. 建立 CDP 连接
+			allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(bgCtx, res.Info.WebsocketLink, chromedp.NoModifyURL)
+			defer cancelAlloc()
+			browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
+				chromedp.WithLogf(func(string, ...interface{}) {}),
+				chromedp.WithErrorf(func(string, ...interface{}) {}),
+			)
+			defer cancelBrowser()
+			chromedputil.CleanExtraTabs(browserCtx, logger, "NURTURE")
 
-		// 清理多余标签页
-		chromedputil.CleanExtraTabs(browserCtx, logger, "NURTURE")
-
-		nurtureCtx, cancelNurture := context.WithTimeout(browserCtx, 30*time.Minute)
-		defer cancelNurture()
-
-		nurtureRes, nurtureErr := nurtureByPlatform(nurtureCtx, logger, req.Platform, nurture.NurtureRequest{
-			ProfileName:      req.ProfileName,
-			Platform:         req.Platform,
-			Host:             req.Host,
-			Port:             req.Port,
-			WaitSeconds:      req.WaitSeconds,
-			UndetectablePath: req.UndetectablePath,
-		})
-
-		stopProfileWithCleanup(context.Background(), logger, browserCtx, res.Host, res.Port, res.ProfileID)
-		// 浏览器已彻底关闭，通知后端释放该浏览器占用
-		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
-
-		if nurtureErr != nil {
-			logger.Print("E", "养号流程失败: "+nurtureErr.Error())
-			writeJSON(w, http.StatusOK, NurtureResponse{
-				Status: "error",
-				Info:   nurtureRes.ErrorInfo + " | " + nurtureRes.ActionsPerformed,
+			// 5. 养号
+			nurtureCtx, cancelNurture := context.WithTimeout(browserCtx, 30*time.Minute)
+			defer cancelNurture()
+			nurtureRes, nurtureErr := nurtureByPlatform(nurtureCtx, logger, req.Platform, nurture.NurtureRequest{
+				ProfileName:      req.ProfileName,
+				Platform:         req.Platform,
+				Host:             req.Host,
+				Port:             req.Port,
+				WaitSeconds:      req.WaitSeconds,
+				UndetectablePath: req.UndetectablePath,
 			})
+
+			// 6. 关闭浏览器 + 释放占用
+			stopProfileWithCleanup(bgCtx, logger, browserCtx, res.Host, res.Port, res.ProfileID)
+
+			if nurtureErr != nil {
+				logger.Print("E", "养号流程失败: "+nurtureErr.Error())
+				return "error", nurtureRes.ErrorInfo + " | " + nurtureRes.ActionsPerformed
+			}
+			logger.Print("NURTURE", fmt.Sprintf("养号流程完成: profile=%s, platform=%s", req.ProfileName, req.Platform))
+			if nurtureRes.Status == "error" {
+				return "error", nurtureRes.ErrorInfo + " | " + nurtureRes.ActionsPerformed
+			}
+			return "success", nurtureRes.ActionsPerformed
+		}
+
+		// 异步：立即返回 task_id，后台执行，完成后回调
+		if req.Async {
+			taskID := newTaskID()
+			setTaskState(taskID, taskStatusQueued)
+			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			go func() {
+				setTaskState(taskID, taskStatusRunning)
+				status, info := execute()
+				finalStatus := taskStatusSuccess
+				if status != "success" {
+					finalStatus = taskStatusFailed
+				}
+				setTaskState(taskID, finalStatus)
+				callbackTaskResult(context.Background(), logger, TaskResultPayload{
+					TaskID:      taskID,
+					ProfileName: req.ProfileName,
+					TaskType:    "nurture",
+					Ref:         req.Ref,
+					Status:      status,
+					Message:     info,
+				})
+			}()
 			return
 		}
 
-		logger.Print("NURTURE", fmt.Sprintf("养号流程完成: profile=%s, platform=%s", req.ProfileName, req.Platform))
-		// 如果有错误但流程正常结束，也返回错误信息
-		if nurtureRes.Status == "error" {
-			writeJSON(w, http.StatusOK, NurtureResponse{
-				Status: "error",
-				Info:   nurtureRes.ErrorInfo + " | " + nurtureRes.ActionsPerformed,
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, NurtureResponse{
-			Status: "success",
-			Info:   nurtureRes.ActionsPerformed,
-		})
+		// 同步：原地执行并返回
+		status, info := execute()
+		writeJSON(w, http.StatusOK, NurtureResponse{Status: status, Info: info})
 	})
 
 	mux.HandleFunc("/undetectable/start", func(w http.ResponseWriter, r *http.Request) {
@@ -1658,6 +1778,8 @@ func main() {
 		Port             int    `json:"port"`
 		WaitSeconds      int    `json:"wait_seconds"`
 		UndetectablePath string `json:"undetectable_path"`
+		Async            bool   `json:"async"`
+		Ref              string `json:"ref,omitempty"`
 	}
 
 	type FacebookPublishResponse struct {
@@ -1699,71 +1821,107 @@ func main() {
 			return
 		}
 
-		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
-		// 导致 r.Context() 被取消、进而中断发布与收尾。
-		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
-		defer cancelPub()
+		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
+		// 返回 (status, info, res)：status 为 success/failed；res 为成功启动的浏览器信息（失败时零值）。
+		execute := func() (string, string, startByNameResult) {
+			pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+			defer cancelPub()
 
-		var absVideoPath string
-		if req.VideoOssURL != "" {
-			var err error
-			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
+			// 1. 获取全局并发额度
+			if err := acquireBrowserSlot(pubCtx); err != nil {
+				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
+			}
+			defer releaseBrowserSlot()
+
+			// 2. 获取 Profile 操作锁
+			releaseLock := acquireProfileLock(req.ProfileName, logger)
+			defer releaseLock()
+
+			// 3. 下载视频
+			var absVideoPath string
+			if req.VideoOssURL != "" {
+				var err error
+				absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
+				if err != nil {
+					return "failed", err.Error(), startByNameResult{}
+				}
+			} else {
+				var err error
+				absVideoPath, err = filepath.Abs(req.VideoPath)
+				if err != nil {
+					return "failed", "invalid video_path: " + err.Error(), startByNameResult{}
+				}
+				if _, err := os.Stat(absVideoPath); err != nil {
+					return "failed", "video_path file not found", startByNameResult{}
+				}
+			}
+			defer os.Remove(absVideoPath)
+
+			// 4. 启动浏览器（带重试）
+			res, err := startProfileByNameWithRetry(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-				return
+				logger.Print("E", err.Error())
+				return "failed", err.Error(), startByNameResult{}
 			}
-		} else {
-			var err error
-			absVideoPath, err = filepath.Abs(req.VideoPath)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid video_path: " + err.Error()})
-				return
+
+			var stopOnce sync.Once
+			stopProfile := func(reason string) {
+				stopOnce.Do(func() {
+					logger.Print("FB", "停止Profile: "+reason)
+					stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
+					_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
+					cancelStop()
+				})
 			}
-			if _, err := os.Stat(absVideoPath); err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path file not found"})
-				return
+			logger.Print("FB", "开始Facebook发布流程")
+			pubErr := facebook.PublishVideo(pubCtx, logger, facebook.PublishRequest{
+				WebsocketURL:     res.Info.WebsocketLink,
+				Title:            req.Title,
+				VideoPath:        absVideoPath,
+				UndetectableHost: res.Host,
+				UndetectablePort: res.Port,
+				ProfileID:        res.ProfileID,
+			})
+			if pubErr != nil {
+				logger.Print("E", pubErr.Error())
+				stopProfile("publish error")
+				return "failed", pubErr.Error(), startByNameResult{}
 			}
+			stopProfile("publish success")
+			return "success", "publish_triggered", res
 		}
 
-		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-		if err != nil {
-			logger.Print("E", err.Error())
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+		// 异步：立即返回 task_id，后台执行，完成后回调
+		if req.Async {
+			taskID := newTaskID()
+			setTaskState(taskID, taskStatusQueued)
+			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			go func() {
+				setTaskState(taskID, taskStatusRunning)
+				status, info, _ := execute()
+				finalStatus := taskStatusSuccess
+				if status != "success" {
+					finalStatus = taskStatusFailed
+				}
+				setTaskState(taskID, finalStatus)
+				callbackTaskResult(context.Background(), logger, TaskResultPayload{
+					TaskID:      taskID,
+					ProfileName: req.ProfileName,
+					TaskType:    "facebook_publish",
+					Ref:         req.Ref,
+					Status:      status,
+					Message:     info,
+				})
+			}()
 			return
 		}
-	var stopOnce sync.Once
-	stopProfile := func(reason string) {
-		stopOnce.Do(func() {
-			logger.Print("FB", "停止Profile: "+reason)
-			stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
-			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-			cancelStop()
-		})
-	}
-	logger.Print("FB", "开始Facebook发布流程")
-		pubErr := facebook.PublishVideo(pubCtx, logger, facebook.PublishRequest{
-			WebsocketURL:     res.Info.WebsocketLink,
-			Title:            req.Title,
-			VideoPath:        absVideoPath,
-			UndetectableHost: res.Host,
-			UndetectablePort: res.Port,
-			ProfileID:        res.ProfileID,
-		})
-		// 发布流程结束（无论成败），浏览器已由内部 defer 关闭，通知后端释放占用
-		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
-		if pubErr != nil {
-			logger.Print("E", pubErr.Error())
-			stopProfile("publish error")
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: pubErr.Error()})
+
+		// 同步：原地执行并返回
+		status, info, res := execute()
+		if status != "success" {
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return
 		}
-
-		// 成功后也关闭 Profile，释放浏览器
-		stopProfile("publish success")
-		_ = os.Remove(absVideoPath)
-
 		writeJSON(w, http.StatusOK, FacebookPublishResponse{
 			Type:             "success",
 			ProfileID:        res.ProfileID,
@@ -1790,6 +1948,8 @@ func main() {
 			Port             int    `json:"port"`
 			WaitSeconds      int    `json:"wait_seconds"`
 			UndetectablePath string `json:"undetectable_path"`
+			Async            bool   `json:"async"`
+			Ref              string `json:"ref,omitempty"`
 		}
 		type TwitterPublishResponse struct {
 			Type             string `json:"type"`
@@ -1823,67 +1983,100 @@ func main() {
 			return
 		}
 
-		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
-		// 导致 r.Context() 被取消、进而中断发布与收尾。
-		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
-		defer cancelPub()
+		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
+		execute := func() (string, string, startByNameResult) {
+			pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+			defer cancelPub()
 
-		var absVideoPath string
-		if req.VideoOssURL != "" {
-			var err error
-			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-				return
+			if err := acquireBrowserSlot(pubCtx); err != nil {
+				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
 			}
-		} else {
-			var err error
-			absVideoPath, err = filepath.Abs(req.VideoPath)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid video_path: " + err.Error()})
-				return
-			}
-			if _, err := os.Stat(absVideoPath); err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path file not found"})
-				return
-			}
-		}
+			defer releaseBrowserSlot()
 
-		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-		if err != nil {
-			logger.Print("E", err.Error())
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
-		logger.Print("TW", "开始Twitter发布流程")
-		textToUse := req.Text
-		if strings.TrimSpace(textToUse) == "" && strings.TrimSpace(req.Title) != "" {
-			textToUse = req.Title
-		}
-		pubErr := twitter.PublishVideo(pubCtx, logger, twitter.PublishRequest{
-			WebsocketURL:     res.Info.WebsocketLink,
-			Text:             textToUse,
-			VideoPath:        absVideoPath,
-			UndetectableHost: res.Host,
-			UndetectablePort: res.Port,
-			ProfileID:        res.ProfileID,
-		})
-		// 发布流程结束（无论成败），浏览器已由内部 defer 关闭，通知后端释放占用
-		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
-		if pubErr != nil {
-			logger.Print("E", pubErr.Error())
+			releaseLock := acquireProfileLock(req.ProfileName, logger)
+			defer releaseLock()
+
+			var absVideoPath string
+			if req.VideoOssURL != "" {
+				var err error
+				absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
+				if err != nil {
+					return "failed", err.Error(), startByNameResult{}
+				}
+			} else {
+				var err error
+				absVideoPath, err = filepath.Abs(req.VideoPath)
+				if err != nil {
+					return "failed", "invalid video_path: " + err.Error(), startByNameResult{}
+				}
+				if _, err := os.Stat(absVideoPath); err != nil {
+					return "failed", "video_path file not found", startByNameResult{}
+				}
+			}
+			defer os.Remove(absVideoPath)
+
+			res, err := startProfileByNameWithRetry(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+			if err != nil {
+				logger.Print("E", err.Error())
+				return "failed", err.Error(), startByNameResult{}
+			}
+			logger.Print("TW", "开始Twitter发布流程")
+			textToUse := req.Text
+			if strings.TrimSpace(textToUse) == "" && strings.TrimSpace(req.Title) != "" {
+				textToUse = req.Title
+			}
+			pubErr := twitter.PublishVideo(pubCtx, logger, twitter.PublishRequest{
+				WebsocketURL:     res.Info.WebsocketLink,
+				Text:             textToUse,
+				VideoPath:        absVideoPath,
+				UndetectableHost: res.Host,
+				UndetectablePort: res.Port,
+				ProfileID:        res.ProfileID,
+			})
+			if pubErr != nil {
+				logger.Print("E", pubErr.Error())
+				stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
+				_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
+				cancelStop()
+				return "failed", pubErr.Error(), startByNameResult{}
+			}
 			stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
 			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 			cancelStop()
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: pubErr.Error()})
+			return "success", "publish_triggered", res
+		}
+
+		// 异步：立即返回 task_id，后台执行，完成后回调
+		if req.Async {
+			taskID := newTaskID()
+			setTaskState(taskID, taskStatusQueued)
+			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			go func() {
+				setTaskState(taskID, taskStatusRunning)
+				status, info, _ := execute()
+				finalStatus := taskStatusSuccess
+				if status != "success" {
+					finalStatus = taskStatusFailed
+				}
+				setTaskState(taskID, finalStatus)
+				callbackTaskResult(context.Background(), logger, TaskResultPayload{
+					TaskID:      taskID,
+					ProfileName: req.ProfileName,
+					TaskType:    "twitter_publish",
+					Ref:         req.Ref,
+					Status:      status,
+					Message:     info,
+				})
+			}()
 			return
 		}
-		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
-		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-		cancelStop()
-		_ = os.Remove(absVideoPath)
+
+		// 同步：原地执行并返回
+		status, info, res := execute()
+		if status != "success" {
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
+			return
+		}
 		writeJSON(w, http.StatusOK, TwitterPublishResponse{
 			Type:             "success",
 			ProfileID:        res.ProfileID,
@@ -1910,6 +2103,8 @@ func main() {
 			Port             int    `json:"port"`
 			WaitSeconds      int    `json:"wait_seconds"`
 			UndetectablePath string `json:"undetectable_path"`
+			Async            bool   `json:"async"`
+			Ref              string `json:"ref,omitempty"`
 		}
 		type YouTubePublishResponse struct {
 			Type             string `json:"type"`
@@ -1943,66 +2138,99 @@ func main() {
 			return
 		}
 
-		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
-		// 导致 r.Context() 被取消、进而中断发布与收尾。
-		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
-		defer cancelPub()
+		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
+		execute := func() (string, string, startByNameResult) {
+			pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+			defer cancelPub()
 
-		var absVideoPath string
-		if req.VideoOssURL != "" {
-			var err error
-			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
+			if err := acquireBrowserSlot(pubCtx); err != nil {
+				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
+			}
+			defer releaseBrowserSlot()
+
+			releaseLock := acquireProfileLock(req.ProfileName, logger)
+			defer releaseLock()
+
+			var absVideoPath string
+			if req.VideoOssURL != "" {
+				var err error
+				absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
+				if err != nil {
+					return "failed", err.Error(), startByNameResult{}
+				}
+			} else {
+				var err error
+				absVideoPath, err = filepath.Abs(req.VideoPath)
+				if err != nil {
+					return "failed", "invalid video_path: " + err.Error(), startByNameResult{}
+				}
+				if _, err := os.Stat(absVideoPath); err != nil {
+					return "failed", "video_path file not found", startByNameResult{}
+				}
+			}
+			defer os.Remove(absVideoPath)
+
+			res, err := startProfileByNameWithRetry(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-				return
+				logger.Print("E", err.Error())
+				return "failed", err.Error(), startByNameResult{}
 			}
-		} else {
-			var err error
-			absVideoPath, err = filepath.Abs(req.VideoPath)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid video_path: " + err.Error()})
-				return
+			logger.Print("YT", "开始YouTube发布流程")
+			titleToUse := strings.TrimSpace(req.Title)
+			if titleToUse == "" && strings.TrimSpace(req.Text) != "" {
+				titleToUse = req.Text
 			}
-			if _, err := os.Stat(absVideoPath); err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path file not found"})
-				return
+			pubErr := youtube.PublishVideo(pubCtx, logger, youtube.PublishRequest{
+				WebsocketURL:     res.Info.WebsocketLink,
+				Title:            titleToUse,
+				Description:      req.Description,
+				VideoPath:        absVideoPath,
+				UndetectableHost: res.Host,
+				UndetectablePort: res.Port,
+				ProfileID:        res.ProfileID,
+			})
+			if pubErr != nil {
+				logger.Print("E", pubErr.Error())
+				return "failed", pubErr.Error(), startByNameResult{}
 			}
+			time.Sleep(8 * time.Second)
+			stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
+			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
+			cancelStop()
+			return "success", "publish_triggered", res
 		}
 
-		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-		if err != nil {
-			logger.Print("E", err.Error())
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+		// 异步：立即返回 task_id，后台执行，完成后回调
+		if req.Async {
+			taskID := newTaskID()
+			setTaskState(taskID, taskStatusQueued)
+			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			go func() {
+				setTaskState(taskID, taskStatusRunning)
+				status, info, _ := execute()
+				finalStatus := taskStatusSuccess
+				if status != "success" {
+					finalStatus = taskStatusFailed
+				}
+				setTaskState(taskID, finalStatus)
+				callbackTaskResult(context.Background(), logger, TaskResultPayload{
+					TaskID:      taskID,
+					ProfileName: req.ProfileName,
+					TaskType:    "youtube_publish",
+					Ref:         req.Ref,
+					Status:      status,
+					Message:     info,
+				})
+			}()
 			return
 		}
-		logger.Print("YT", "开始YouTube发布流程")
-		titleToUse := strings.TrimSpace(req.Title)
-		if titleToUse == "" && strings.TrimSpace(req.Text) != "" {
-			titleToUse = req.Text
-		}
-		pubErr := youtube.PublishVideo(pubCtx, logger, youtube.PublishRequest{
-			WebsocketURL:     res.Info.WebsocketLink,
-			Title:            titleToUse,
-			Description:      req.Description,
-			VideoPath:        absVideoPath,
-			UndetectableHost: res.Host,
-			UndetectablePort: res.Port,
-			ProfileID:        res.ProfileID,
-		})
-		// 发布流程结束（无论成败），浏览器已由内部 defer 关闭，通知后端释放占用
-		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
-		if pubErr != nil {
-			logger.Print("E", pubErr.Error())
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: pubErr.Error()})
+
+		// 同步：原地执行并返回
+		status, info, res := execute()
+		if status != "success" {
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return
 		}
-		time.Sleep(8 * time.Second)
-		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
-		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-		cancelStop()
-		_ = os.Remove(absVideoPath)
 		writeJSON(w, http.StatusOK, YouTubePublishResponse{
 			Type:             "success",
 			ProfileID:        res.ProfileID,
@@ -2028,6 +2256,8 @@ func main() {
 			Port             int    `json:"port"`
 			WaitSeconds      int    `json:"wait_seconds"`
 			UndetectablePath string `json:"undetectable_path"`
+			Async            bool   `json:"async"`
+			Ref              string `json:"ref,omitempty"`
 		}
 		type TikTokPublishResponse struct {
 			Type             string `json:"type"`
@@ -2061,65 +2291,98 @@ func main() {
 			return
 		}
 
-		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
-		// 导致 r.Context() 被取消、进而中断发布与收尾。
-		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
-		defer cancelPub()
+		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
+		execute := func() (string, string, startByNameResult) {
+			pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+			defer cancelPub()
 
-		var absVideoPath string
-		if req.VideoOssURL != "" {
-			var err error
-			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
+			if err := acquireBrowserSlot(pubCtx); err != nil {
+				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
+			}
+			defer releaseBrowserSlot()
+
+			releaseLock := acquireProfileLock(req.ProfileName, logger)
+			defer releaseLock()
+
+			var absVideoPath string
+			if req.VideoOssURL != "" {
+				var err error
+				absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
+				if err != nil {
+					return "failed", err.Error(), startByNameResult{}
+				}
+			} else {
+				var err error
+				absVideoPath, err = filepath.Abs(req.VideoPath)
+				if err != nil {
+					return "failed", "invalid video_path: " + err.Error(), startByNameResult{}
+				}
+				if _, err := os.Stat(absVideoPath); err != nil {
+					return "failed", "video_path file not found", startByNameResult{}
+				}
+			}
+			defer os.Remove(absVideoPath)
+
+			res, err := startProfileByNameWithRetry(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
 			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-				return
+				logger.Print("E", err.Error())
+				return "failed", err.Error(), startByNameResult{}
 			}
-		} else {
-			var err error
-			absVideoPath, err = filepath.Abs(req.VideoPath)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid video_path: " + err.Error()})
-				return
+			logger.Print("TT", "开始TikTok发布流程")
+			textToUse := strings.TrimSpace(req.Text)
+			if textToUse == "" && strings.TrimSpace(req.Title) != "" {
+				textToUse = req.Title
 			}
-			if _, err := os.Stat(absVideoPath); err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path file not found"})
-				return
+			pubErr := tiktok.PublishVideo(pubCtx, logger, tiktok.PublishRequest{
+				WebsocketURL:     res.Info.WebsocketLink,
+				Text:             textToUse,
+				VideoPath:        absVideoPath,
+				UndetectableHost: res.Host,
+				UndetectablePort: res.Port,
+				ProfileID:        res.ProfileID,
+			})
+			if pubErr != nil {
+				logger.Print("E", pubErr.Error())
+				return "failed", pubErr.Error(), startByNameResult{}
 			}
+			time.Sleep(8 * time.Second)
+			stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
+			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
+			cancelStop()
+			return "success", "publish_triggered", res
 		}
 
-		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-		if err != nil {
-			logger.Print("E", err.Error())
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
+		// 异步：立即返回 task_id，后台执行，完成后回调
+		if req.Async {
+			taskID := newTaskID()
+			setTaskState(taskID, taskStatusQueued)
+			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			go func() {
+				setTaskState(taskID, taskStatusRunning)
+				status, info, _ := execute()
+				finalStatus := taskStatusSuccess
+				if status != "success" {
+					finalStatus = taskStatusFailed
+				}
+				setTaskState(taskID, finalStatus)
+				callbackTaskResult(context.Background(), logger, TaskResultPayload{
+					TaskID:      taskID,
+					ProfileName: req.ProfileName,
+					TaskType:    "tiktok_publish",
+					Ref:         req.Ref,
+					Status:      status,
+					Message:     info,
+				})
+			}()
 			return
 		}
-		logger.Print("TT", "开始TikTok发布流程")
-		textToUse := strings.TrimSpace(req.Text)
-		if textToUse == "" && strings.TrimSpace(req.Title) != "" {
-			textToUse = req.Title
-		}
-		pubErr := tiktok.PublishVideo(pubCtx, logger, tiktok.PublishRequest{
-			WebsocketURL:     res.Info.WebsocketLink,
-			Text:             textToUse,
-			VideoPath:        absVideoPath,
-			UndetectableHost: res.Host,
-			UndetectablePort: res.Port,
-			ProfileID:        res.ProfileID,
-		})
-		// 发布流程结束（无论成败），浏览器已由内部 defer 关闭，通知后端释放占用
-		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
-		if pubErr != nil {
-			logger.Print("E", pubErr.Error())
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: pubErr.Error()})
+
+		// 同步：原地执行并返回
+		status, info, res := execute()
+		if status != "success" {
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return
 		}
-		time.Sleep(8 * time.Second)
-		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
-		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-		cancelStop()
-		_ = os.Remove(absVideoPath)
 		writeJSON(w, http.StatusOK, TikTokPublishResponse{
 			Type:             "success",
 			ProfileID:        res.ProfileID,
@@ -2146,6 +2409,8 @@ func main() {
 			Port             int    `json:"port"`
 			WaitSeconds      int    `json:"wait_seconds"`
 			UndetectablePath string `json:"undetectable_path"`
+			Async            bool   `json:"async"`
+			Ref              string `json:"ref,omitempty"`
 		}
 		type InstagramPublishResponse struct {
 			Type             string `json:"type"`
@@ -2179,67 +2444,100 @@ func main() {
 			return
 		}
 
-		// 发布流程耗时较长，使用独立的 background context，避免客户端/nginx 超时断开
-		// 导致 r.Context() 被取消、进而中断发布与收尾。
-		pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
-		defer cancelPub()
+		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
+		execute := func() (string, string, startByNameResult) {
+			pubCtx, cancelPub := context.WithTimeout(context.Background(), publishTimeout)
+			defer cancelPub()
 
-		var absVideoPath string
-		if req.VideoOssURL != "" {
-			var err error
-			absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-				return
+			if err := acquireBrowserSlot(pubCtx); err != nil {
+				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
 			}
-		} else {
-			var err error
-			absVideoPath, err = filepath.Abs(req.VideoPath)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid video_path: " + err.Error()})
-				return
-			}
-			if _, err := os.Stat(absVideoPath); err != nil {
-				writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "video_path file not found"})
-				return
-			}
-		}
+			defer releaseBrowserSlot()
 
-		res, err := startProfileByName(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-		if err != nil {
-			logger.Print("E", err.Error())
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: err.Error()})
-			return
-		}
-		logger.Print("IG", "开始Instagram发布流程")
-		textToUse := req.Text
-		if strings.TrimSpace(textToUse) == "" && strings.TrimSpace(req.Title) != "" {
-			textToUse = req.Title
-		}
-		pubErr := instagram.PublishVideo(pubCtx, logger, instagram.PublishRequest{
-			WebsocketURL:     res.Info.WebsocketLink,
-			Text:             textToUse,
-			VideoPath:        absVideoPath,
-			UndetectableHost: res.Host,
-			UndetectablePort: res.Port,
-			ProfileID:        res.ProfileID,
-		})
-		// 发布流程结束（无论成败），浏览器已由内部 defer 关闭，通知后端释放占用
-		releaseBrowserOccupation(context.Background(), logger, req.ProfileName)
-		if pubErr != nil {
-			logger.Print("E", pubErr.Error())
+			releaseLock := acquireProfileLock(req.ProfileName, logger)
+			defer releaseLock()
+
+			var absVideoPath string
+			if req.VideoOssURL != "" {
+				var err error
+				absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
+				if err != nil {
+					return "failed", err.Error(), startByNameResult{}
+				}
+			} else {
+				var err error
+				absVideoPath, err = filepath.Abs(req.VideoPath)
+				if err != nil {
+					return "failed", "invalid video_path: " + err.Error(), startByNameResult{}
+				}
+				if _, err := os.Stat(absVideoPath); err != nil {
+					return "failed", "video_path file not found", startByNameResult{}
+				}
+			}
+			defer os.Remove(absVideoPath)
+
+			res, err := startProfileByNameWithRetry(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+			if err != nil {
+				logger.Print("E", err.Error())
+				return "failed", err.Error(), startByNameResult{}
+			}
+			logger.Print("IG", "开始Instagram发布流程")
+			textToUse := req.Text
+			if strings.TrimSpace(textToUse) == "" && strings.TrimSpace(req.Title) != "" {
+				textToUse = req.Title
+			}
+			pubErr := instagram.PublishVideo(pubCtx, logger, instagram.PublishRequest{
+				WebsocketURL:     res.Info.WebsocketLink,
+				Text:             textToUse,
+				VideoPath:        absVideoPath,
+				UndetectableHost: res.Host,
+				UndetectablePort: res.Port,
+				ProfileID:        res.ProfileID,
+			})
+			if pubErr != nil {
+				logger.Print("E", pubErr.Error())
+				stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
+				_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
+				cancelStop()
+				return "failed", pubErr.Error(), startByNameResult{}
+			}
 			stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
 			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
 			cancelStop()
-			_ = os.Remove(absVideoPath)
-			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: pubErr.Error()})
+			return "success", "publish_triggered", res
+		}
+
+		// 异步：立即返回 task_id，后台执行，完成后回调
+		if req.Async {
+			taskID := newTaskID()
+			setTaskState(taskID, taskStatusQueued)
+			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			go func() {
+				setTaskState(taskID, taskStatusRunning)
+				status, info, _ := execute()
+				finalStatus := taskStatusSuccess
+				if status != "success" {
+					finalStatus = taskStatusFailed
+				}
+				setTaskState(taskID, finalStatus)
+				callbackTaskResult(context.Background(), logger, TaskResultPayload{
+					TaskID:      taskID,
+					ProfileName: req.ProfileName,
+					TaskType:    "instagram_publish",
+					Ref:         req.Ref,
+					Status:      status,
+					Message:     info,
+				})
+			}()
 			return
 		}
-		stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
-		_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-		cancelStop()
-		_ = os.Remove(absVideoPath)
+
+		// 同步：原地执行并返回
+		status, info, res := execute()
+		if status != "success" {
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
+			return
+		}
 		writeJSON(w, http.StatusOK, InstagramPublishResponse{
 			Type:             "success",
 			ProfileID:        res.ProfileID,
