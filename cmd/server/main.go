@@ -737,6 +737,15 @@ func isProfileLocked(errMsg string) bool {
 		strings.Contains(lower, "cannot lock profile")
 }
 
+// Undetectable 主程序拉起去重：多个并发任务都可能触发「探测失败→拉起」，
+// 若不限制会在短时间内反复 exec 拉起多个 Undetectable 实例抢端口/锁，反而加剧主程序崩溃。
+// 用冷却窗口保证一段时间内只真正拉起一次。
+var (
+	undetectableStartMu       sync.Mutex
+	undetectableStartAt       time.Time
+	undetectableStartCooldown = 15 * time.Second
+)
+
 func resolveUndetectablePath(explicit string) string {
 	if explicit != "" {
 		return explicit
@@ -747,23 +756,43 @@ func resolveUndetectablePath(explicit string) string {
 	return ""
 }
 
+// tryStartUndetectable 尝试拉起 Undetectable 主程序。
+// 距上次启动不足冷却期时跳过（返回 nil，不重复拉起），让调用方继续等待 API 自愈；
+// 真正执行启动失败时返回错误。
+func tryStartUndetectable(ctx context.Context, logger *logx.Logger, path string) error {
+	undetectableStartMu.Lock()
+	defer undetectableStartMu.Unlock()
+
+	if !undetectableStartAt.IsZero() && time.Since(undetectableStartAt) < undetectableStartCooldown {
+		logger.Print("BOOT", "距上次启动 Undetectable 不足 15 秒，跳过重复启动，等待其自愈")
+		return nil
+	}
+	undetectableStartAt = time.Now()
+
+	logger.Print("BOOT", "尝试启动Undetectable: "+path)
+	return undetectable.StartLocal(ctx, path)
+}
+
 func ensureAPIAndMaybeStart(ctx context.Context, logger *logx.Logger, host string, port int, waitSeconds int, explicitPath string) (*undetectable.Client, string, error) {
 	logger.Print("1", "检查本地API服务")
 	client := undetectable.NewClient(host, port)
 	localCtx, cancel := context.WithTimeout(ctx, time.Duration(waitSeconds+20)*time.Second)
 	defer cancel()
-	if err := client.Status(localCtx); err == nil {
+
+	err := client.Status(localCtx)
+	if err == nil {
 		logger.Print("1", "API服务正常")
 		return client, "", nil
 	}
+	// 记录失败原因，便于区分「主程序没起(connection refused)」「主程序卡死(timeout)」「状态异常(code≠0)」
+	logger.Print("1", "API服务不可用，原因: "+err.Error())
 
 	path := resolveUndetectablePath(explicitPath)
 	if path == "" {
 		return nil, "", fmt.Errorf("无法连接Undetectable API且未配置undetectable_path或UNDETECTABLE_EXE")
 	}
 
-	logger.Print("BOOT", "尝试启动Undetectable: "+path)
-	if err := undetectable.StartLocal(localCtx, path); err != nil {
+	if err := tryStartUndetectable(localCtx, logger, path); err != nil {
 		return nil, "", fmt.Errorf("启动Undetectable失败: %w", err)
 	}
 
