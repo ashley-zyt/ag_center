@@ -1845,14 +1845,16 @@ func main() {
 		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
 		var taskCtx context.Context = context.Background()
 		execute := func() (string, string, startByNameResult) {
-			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
-			defer cancelPub()
-
-			// 1. 获取全局并发额度
-			if err := acquireBrowserSlot(pubCtx); err != nil {
+			// 1. 获取全局并发额度（排队用无 deadline 的 taskCtx：排队等待不计入执行超时，
+			//    否则队列积压时后面的任务还没轮到就会报 context deadline exceeded）
+			if err := acquireBrowserSlot(taskCtx); err != nil {
 				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
 			}
 			defer releaseBrowserSlot()
+
+			// 2. 拿到槽位后才起执行超时：publishTimeout 只覆盖下载/启动/发布/关闭，不含排队
+			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
+			defer cancelPub()
 
 			// 2. 获取 Profile 操作锁
 			releaseLock := acquireProfileLock(req.ProfileName, logger)
@@ -2009,13 +2011,16 @@ func main() {
 		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
 		var taskCtx context.Context = context.Background()
 		execute := func() (string, string, startByNameResult) {
-			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
-			defer cancelPub()
-
-			if err := acquireBrowserSlot(pubCtx); err != nil {
+			// 1. 获取全局并发额度（排队用无 deadline 的 taskCtx：排队等待不计入执行超时，
+			//    否则队列积压时后面的任务还没轮到就会报 context deadline exceeded）
+			if err := acquireBrowserSlot(taskCtx); err != nil {
 				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
 			}
 			defer releaseBrowserSlot()
+
+			// 2. 拿到槽位后才起执行超时：publishTimeout 只覆盖下载/启动/发布/关闭，不含排队
+			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
+			defer cancelPub()
 
 			releaseLock := acquireProfileLock(req.ProfileName, logger)
 			defer releaseLock()
@@ -2167,13 +2172,16 @@ func main() {
 		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
 		var taskCtx context.Context = context.Background()
 		execute := func() (string, string, startByNameResult) {
-			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
-			defer cancelPub()
-
-			if err := acquireBrowserSlot(pubCtx); err != nil {
+			// 1. 获取全局并发额度（排队用无 deadline 的 taskCtx：排队等待不计入执行超时，
+			//    否则队列积压时后面的任务还没轮到就会报 context deadline exceeded）
+			if err := acquireBrowserSlot(taskCtx); err != nil {
 				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
 			}
 			defer releaseBrowserSlot()
+
+			// 2. 拿到槽位后才起执行超时：publishTimeout 只覆盖下载/启动/发布/关闭，不含排队
+			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
+			defer cancelPub()
 
 			releaseLock := acquireProfileLock(req.ProfileName, logger)
 			defer releaseLock()
@@ -2323,13 +2331,16 @@ func main() {
 		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
 		var taskCtx context.Context = context.Background()
 		execute := func() (string, string, startByNameResult) {
-			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
-			defer cancelPub()
-
-			if err := acquireBrowserSlot(pubCtx); err != nil {
+			// 1. 获取全局并发额度（排队用无 deadline 的 taskCtx：排队等待不计入执行超时，
+			//    否则队列积压时后面的任务还没轮到就会报 context deadline exceeded）
+			if err := acquireBrowserSlot(taskCtx); err != nil {
 				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
 			}
 			defer releaseBrowserSlot()
+
+			// 2. 拿到槽位后才起执行超时：publishTimeout 只覆盖下载/启动/发布/关闭，不含排队
+			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
+			defer cancelPub()
 
 			releaseLock := acquireProfileLock(req.ProfileName, logger)
 			defer releaseLock()
@@ -2479,13 +2490,16 @@ func main() {
 		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
 		var taskCtx context.Context = context.Background()
 		execute := func() (string, string, startByNameResult) {
-			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
-			defer cancelPub()
-
-			if err := acquireBrowserSlot(pubCtx); err != nil {
+			// 1. 获取全局并发额度（排队用无 deadline 的 taskCtx：排队等待不计入执行超时，
+			//    否则队列积压时后面的任务还没轮到就会报 context deadline exceeded）
+			if err := acquireBrowserSlot(taskCtx); err != nil {
 				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
 			}
 			defer releaseBrowserSlot()
+
+			// 2. 拿到槽位后才起执行超时：publishTimeout 只覆盖下载/启动/发布/关闭，不含排队
+			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
+			defer cancelPub()
 
 			releaseLock := acquireProfileLock(req.ProfileName, logger)
 			defer releaseLock()
