@@ -195,6 +195,8 @@ func isRetryableBrowserError(msg string) bool {
 		strings.Contains(lower, "cannot lock profile") ||
 		strings.Contains(lower, "all start attempts failed") ||
 		strings.Contains(lower, "websocket_url is required") ||
+		strings.Contains(lower, "websocket_link is empty") ||
+		strings.Contains(lower, "浏览器连接预检失败") ||
 		strings.Contains(lower, "无法连接undetectable") ||
 		strings.Contains(lower, "已尝试启动undetectable") ||
 		strings.Contains(lower, "wait profile started timeout") ||
@@ -205,6 +207,11 @@ func isRetryableBrowserError(msg string) bool {
 
 // taskResultURL 任务完成后的回调地址（已与 account_sys 确认）。
 const taskResultURL = "http://47.89.235.227:3366/api/v1/browser_tasks/result"
+
+// machineRestartedURL 「机器重启上报」地址（与任务回调指向同一台 account_sys）。
+// 本机进程启动时上报一次，account_sys 收到后会立即重置本机丢失的异步任务，
+// 不必再等 check_timeout_tasks 的 45 分钟兜底窗口。
+const machineRestartedURL = "http://47.89.235.227:3366/api/v1/browser_tasks/machine_restarted"
 
 // TaskResultPayload 任务完成回调的 payload。
 type TaskResultPayload struct {
@@ -251,6 +258,70 @@ func callbackTaskResult(ctx context.Context, logger *logx.Logger, payload TaskRe
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	logger.Print("TASK_CB", fmt.Sprintf("任务回调完成: status=%d body=%s", resp.StatusCode, string(raw)))
+}
+
+// ===== 机器重启上报 =====
+
+// notifyMachineRestarted 上报「本机进程已重启」。
+//
+// 背景：任务记录只存在内存里（taskRecords），进程一挂就全部丢失，重启后既没有恢复能力、
+// 也无法回答 account_sys 对旧 task_id 的查询（一律 404）。account_sys 侧的
+// TaskScheduler.check_timeout_tasks 虽然会用「查机器端 → 查不到就重置」兜底，
+// 但它的判定窗口是 45 分钟，导致重启后任务要拖很久才会被重置、再等平台分配窗口重跑。
+// 启动时主动上报一次，可把这段延迟从 45 分钟降到近乎为零。
+//
+// MACHINE_IP 环境变量（可选）：告知 account_sys 只处理本机上的登记记录。
+// 不设置时 account_sys 会全量扫描 —— 它只重置「机器端查不到」的任务，所以同样安全，
+// 只是会多打几个查询请求。建议设置。
+func notifyMachineRestarted(logger *logx.Logger) {
+	if machineRestartedURL == "" {
+		return
+	}
+
+	payload := map[string]string{}
+	if v := strings.TrimSpace(os.Getenv("MACHINE_IP")); v != "" {
+		payload["machine_ip"] = v
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		logger.Print("BOOT", "上报机器重启：构造请求体失败: "+err.Error())
+		return
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		reqCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, machineRestartedURL, bytes.NewReader(body))
+		if err != nil {
+			cancel()
+			logger.Print("BOOT", "上报机器重启：构建请求失败: "+err.Error())
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", accountCheckUA)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			cancel()
+			lastErr = err
+			logger.Print("BOOT", fmt.Sprintf("上报机器重启失败(第%d次): %v", attempt, err))
+		} else {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			cancel()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				logger.Print("BOOT", fmt.Sprintf("已上报机器重启(第%d次)，account_sys 响应: %s", attempt, strings.TrimSpace(string(raw))))
+				return
+			}
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+			logger.Print("BOOT", fmt.Sprintf("上报机器重启失败(第%d次): %v", attempt, lastErr))
+		}
+
+		if attempt < 3 {
+			time.Sleep(5 * time.Second)
+		}
+	}
+	logger.Print("BOOT", "上报机器重启最终失败（不影响服务，account_sys 仍会走 45 分钟兜底）: "+lastErr.Error())
 }
 
 // handleTaskQuery GET /tasks/{id} 查询单个任务状态（作为回调失败/重启丢任务时的补充排查手段）。

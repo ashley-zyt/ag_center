@@ -63,6 +63,9 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	logger.Print("TW1", "连接浏览器WebSocket")
 
 	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(ctx, req.WebsocketURL, chromedp.NoModifyURL)
+	// defer 顺序很关键：Go defer 后进先出，取消 allocator 必须先注册才能最后执行；
+	// 否则清理动作跑在 allocator 失效之后，标签页/浏览器关不掉，留下残留进程。
+	defer cancelAlloc()
 
 	tabCtx, _ := chromedp.NewContext(allocCtx,
 		chromedp.WithLogf(func(format string, v ...interface{}) {
@@ -74,10 +77,13 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	)
 
 	// 清理多余标签页
-	chromedputil.CleanExtraTabs(tabCtx, logger, "TW1")
+	if err := chromedputil.CleanExtraTabs(tabCtx, logger, "TW1"); err != nil {
+		// 连不上浏览器时必须立即返回：chromedp 首次分配已失败并留下不一致状态，
+		// 继续调用 chromedp.Run 会 panic(close of closed channel) 并终止整个进程。
+		return fmt.Errorf("TW1 %v", err)
+	}
 
-	defer chromedputil.CloseTabsAndStopProfile(ctx, tabCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "TW7")
-	defer cancelAlloc()
+	defer chromedputil.CloseTabsAndStopProfile(ctx, tabCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, req.WebsocketURL, "TW7")
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 4*time.Minute)
 	defer cancelTimeout()

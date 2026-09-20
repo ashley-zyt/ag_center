@@ -72,9 +72,13 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	defer cancelTab()
 
 	// 清理多余标签页
-	chromedputil.CleanExtraTabs(tabCtx, logger, "YTB1")
+	if err := chromedputil.CleanExtraTabs(tabCtx, logger, "YTB1"); err != nil {
+		// 连不上浏览器时必须立即返回：chromedp 首次分配已失败并留下不一致状态，
+		// 继续调用 chromedp.Run 会 panic(close of closed channel) 并终止整个进程。
+		return fmt.Errorf("YTB1 %v", err)
+	}
 
-	defer chromedputil.CloseTabsAndStopProfile(ctx, tabCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, "YTB12")
+	defer chromedputil.CloseTabsAndStopProfile(ctx, tabCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, req.WebsocketURL, "YTB12")
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 6*time.Minute)
 	defer cancelTimeout()

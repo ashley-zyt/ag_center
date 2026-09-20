@@ -199,16 +199,31 @@ func (c *Client) StartProfileBestEffort(ctx context.Context, profileID string) e
 	return fmt.Errorf("all start attempts failed:\n%s", strings.Join(errs, "\n"))
 }
 
+// WaitProfileStarted 等待 profile 进入「真正可连接」的状态。
+//
+// 注意：Undetectable 的 /list 中，status 变为 "Started" 与 websocket_link 的回写是两个阶段
+// （先拉起浏览器进程，再探测 CDP 端口并回填链接）。若只判断 status 就返回，会拿到一个
+// websocket_link 为空的 ProfileInfo，上层（各平台 PublishVideo、chromedp allocator）随即报
+// "websocket_url is required" —— 并发启动时主程序回填更慢，表现为偶发、成批出现。
+// 因此这里必须同时满足 status == "Started" 且 websocket_link 非空，才算就绪。
 func WaitProfileStarted(ctx context.Context, c *Client, profileID string, timeout time.Duration) (ProfileInfo, error) {
 	deadline := time.Now().Add(timeout)
+	var lastStatus string
+	startedButNoLink := false
 	for time.Now().Before(deadline) {
 		profiles, err := c.ListProfiles(ctx)
 		if err != nil {
 			return ProfileInfo{}, err
 		}
-		info, ok := profiles[profileID]
-		if ok && info.Status == "Started" {
-			return info, nil
+		if info, ok := profiles[profileID]; ok {
+			lastStatus = info.Status
+			if info.Status == "Started" {
+				if info.WebsocketLink != "" {
+					return info, nil
+				}
+				// 状态已就绪但链接尚未回写：继续轮询等待
+				startedButNoLink = true
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -216,7 +231,12 @@ func WaitProfileStarted(ctx context.Context, c *Client, profileID string, timeou
 		case <-time.After(1 * time.Second):
 		}
 	}
-	return ProfileInfo{}, fmt.Errorf("wait profile started timeout: %s", timeout)
+	if startedButNoLink {
+		// 状态长期停在 Started 却始终拿不到连接地址：通常是残留实例（主程序重启后链接丢失）
+		// 或主程序异常。错误文案固定，便于上层识别并触发重试。
+		return ProfileInfo{}, fmt.Errorf("websocket_link is empty after profile started: profile_id=%s timeout=%s", profileID, timeout)
+	}
+	return ProfileInfo{}, fmt.Errorf("wait profile started timeout: %s (last status=%q)", timeout, lastStatus)
 }
 
 func (c *Client) StopProfileBestEffort(ctx context.Context, profileID string) error {

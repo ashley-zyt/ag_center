@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/undetectable"
 
@@ -127,6 +128,10 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	if err != nil {
 		logger.Print("WX1", "初始化标签页失败: "+err.Error())
 		logCancelDiagnostics(httpBase, tabCtx, allocCtx, ctx, logger, "初始化标签页失败")
+		// 首次分配失败后必须立即返回：chromedp 内部 allocated 已 close 而 Browser 未记录，
+		// 继续调用任何 chromedp.Run 都会 panic(close of closed channel) 并终止整个进程。
+		// 此时下方清理 defer 尚未注册，直接 return 不会触发多余的 chromedp 调用。
+		return fmt.Errorf("WX1 初始化标签页失败: %w", err)
 	}
 	if tc := chromedp.FromContext(tabCtx); tc != nil && tc.Target != nil {
 		logger.Print("WX1", "已创建新标签页: "+string(tc.Target.TargetID))
@@ -180,10 +185,18 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 		}
 
 		if req.ProfileID != "" && req.UndetectableHost != "" && req.UndetectablePort != 0 {
-			stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
-			defer cancelStop()
-			_ = undetectable.NewClient(req.UndetectableHost, req.UndetectablePort).StopProfileBestEffort(stopCtx, req.ProfileID)
-			logger.Print("WX7", "已请求停止Undetectable Profile")
+			// 30 秒 + 失败兜底：原先只给 6 秒且丢弃错误，stop 稍慢就静默残留。
+			stopCtx, cancelStop := context.WithTimeout(context.Background(), 30*time.Second)
+			err := undetectable.NewClient(req.UndetectableHost, req.UndetectablePort).StopProfileBestEffort(stopCtx, req.ProfileID)
+			cancelStop()
+			if err != nil {
+				logger.Print("WX7", "停止 Undetectable Profile 失败: "+err.Error())
+				// 兜底 1：通过 CDP 关闭浏览器本体；兜底 2：按调试端口特征结束浏览器进程树
+				chromedputil.CloseBrowserViaCDP(tabCtx, logger, "WX7")
+				chromedputil.KillBrowserProcessesByHint(logger, chromedputil.RemoteDebugPortHint(req.WebsocketURL))
+			} else {
+				logger.Print("WX7", "已请求停止Undetectable Profile")
+			}
 		}
 		logger.Print("WX7", "资源清理完成")
 	}()

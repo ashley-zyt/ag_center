@@ -476,7 +476,7 @@ func checkAccountLogin(ctx context.Context, logger *logx.Logger, item AccountChe
 	// 清理多余标签页
 	chromedputil.CleanExtraTabs(tabCtx, logger, "CHECK")
 
-	defer stopProfileWithCleanup(context.Background(), logger, tabCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+	defer stopProfileWithCleanup(context.Background(), logger, tabCtx, startRes.Host, startRes.Port, startRes.ProfileID, startRes.Info.WebsocketLink)
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 30*time.Second)
 	defer cancelTimeout()
@@ -566,6 +566,10 @@ func startProfileByName(ctx context.Context, logger *logx.Logger, profileName st
 		// 先停止残留实例，再走下方正常启动流程，重新获取有效的连接信息。
 		logger.Print("4", "profile已在运行但 websocket_link 为空(疑似残留实例)，先停止再重新启动")
 		_ = client.StopProfileBestEffort(localCtx, profileID)
+		// 兜底：若 Undetectable 主程序曾崩溃/重启，它可能已「不认识」这个孤儿浏览器进程，
+		// stop 接口会返回成功但进程仍在运行。此时按该 profile 的调试端口特征结束进程树，
+		// 否则重新启动会复用脏实例，websocket_link 依旧为空。
+		chromedputil.KillBrowserProcessesByHint(logger, chromedputil.RemoteDebugPortHintFromPort(info.DebugPort))
 		time.Sleep(5 * time.Second)
 	}
 
@@ -607,6 +611,19 @@ func startProfileByName(ctx context.Context, logger *logx.Logger, profileName st
 	}
 	logger.Print("5", "已启动")
 
+	// 连接可用性预检：/list 报告 Started 且 websocket_link 非空，仍可能是刚刚崩掉的实例
+	// （记录还没刷新、端口已经释放）。这里用**不经过 chromedp** 的纯 HTTP 探测再确认一次，
+	// 从源头避免任务进入 chromedp 后踩到「首次分配失败 → 再次分配二次 close」的 panic 路径。
+	if err := chromedputil.ProbeBrowserAlive(localCtx, info.WebsocketLink, 10*time.Second); err != nil {
+		logger.Print("5", "浏览器连接预检失败(疑似刚崩溃/端口已释放): "+err.Error())
+		// 实例已不可用：先停掉，避免残留占用；再由上层重试重新拉起。
+		stopCtx, cancelPreStop := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = client.StopProfileBestEffort(stopCtx, profileID)
+		cancelPreStop()
+		return startByNameResult{}, fmt.Errorf("浏览器连接预检失败: %w", err)
+	}
+	logger.Print("5", "浏览器连接预检通过")
+
 	return startByNameResult{ProfileID: profileID, Info: info, Host: host, Port: port, Path: path}, nil
 }
 
@@ -634,7 +651,62 @@ func startProfileByNameWithRetry(ctx context.Context, logger *logx.Logger, profi
 	return startByNameResult{}, lastErr
 }
 
-func stopProfileWithCleanup(ctx context.Context, logger *logx.Logger, browserCtx context.Context, host string, port int, profileID string) {
+// ===== 任务执行 panic 隔离 =====
+//
+// 背景：chromedp 在「首次分配 Browser 失败」后会留下不一致状态 —— 内部 allocated channel
+// 已被 close，而 Browser 未记录（chromedp.go:299-305），此后任何 chromedp.Run 都会
+// panic: close of closed channel。goroutine 中未被 recover 的 panic 会直接终止**整个进程**，
+// 导致所有正在运行的任务一起中断、account_sys 永远收不到回调。
+//
+// 因此所有任务的 execute 闭包统一经下面三个包装函数执行：把任务内部的 panic 转成
+// 「该任务失败」，把影响范围限制在单个任务内。
+func guard[T any](logger *logx.Logger, fn func() (string, string, T)) func() (string, string, T) {
+	return func() (status string, info string, out T) {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Print("PANIC", fmt.Sprintf("任务执行发生 panic，已隔离(不影响其它任务): %v", r))
+				status = "failed"
+				info = fmt.Sprintf("任务异常中断(panic): %v", r)
+				var zero T
+				out = zero
+			}
+		}()
+		return fn()
+	}
+}
+
+// guardVoid 用于无附加返回值的任务（nurture）。
+func guardVoid(logger *logx.Logger, fn func() (string, string)) func() (string, string) {
+	return func() (status string, info string) {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Print("PANIC", fmt.Sprintf("任务执行发生 panic，已隔离(不影响其它任务): %v", r))
+				status = "failed"
+				info = fmt.Sprintf("任务异常中断(panic): %v", r)
+			}
+		}()
+		return fn()
+	}
+}
+
+// guardExtra 用于带两个附加返回值的任务（fetch：结果列表 + 错误信息）。
+func guardExtra[T any](logger *logx.Logger, fn func() (string, string, T, string)) func() (string, string, T, string) {
+	return func() (status string, info string, out T, extra string) {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Print("PANIC", fmt.Sprintf("任务执行发生 panic，已隔离(不影响其它任务): %v", r))
+				status = "failed"
+				info = fmt.Sprintf("任务异常中断(panic): %v", r)
+				var zero T
+				out = zero
+				extra = ""
+			}
+		}()
+		return fn()
+	}
+}
+
+func stopProfileWithCleanup(ctx context.Context, logger *logx.Logger, browserCtx context.Context, host string, port int, profileID string, websocketURL string) {
 	if browserCtx != nil {
 		closeCtx, cancelClose := context.WithTimeout(browserCtx, 10*time.Second)
 		_ = chromedputil.CloseAllTabsThenBrowser(closeCtx)
@@ -646,8 +718,11 @@ func stopProfileWithCleanup(ctx context.Context, logger *logx.Logger, browserCtx
 	cancelStop()
 	if err != nil {
 		logger.Print("E", "停止 Profile 失败(浏览器可能未彻底关闭): "+err.Error())
-		// 兜底：stop 接口失败时，直接通过 CDP 关闭浏览器本体，避免浏览器残留
+		// 兜底 1：通过 CDP 关闭浏览器本体
 		chromedputil.CloseBrowserViaCDP(browserCtx, logger, "STOP")
+		// 兜底 2：进程级清理。Undetectable 主程序崩溃/卡死时 stop 接口与 CDP 可能都失效，
+		// 此时按该 profile 的调试端口特征直接结束浏览器进程树，避免进程永久残留。
+		chromedputil.KillBrowserProcessesByHint(logger, chromedputil.RemoteDebugPortHint(websocketURL))
 	}
 }
 
@@ -1107,7 +1182,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 				tab.cancel()
 			}
 
-			stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+			stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID, startRes.Info.WebsocketLink)
 
 			normalCount := 0
 			for _, res := range results {
@@ -1118,9 +1193,12 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			return "success", fmt.Sprintf("采集完成 %d/%d 个账号", normalCount, len(results)), results, startRes.ProfileID
 		}
 
+		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
+		execute = guardExtra(logger, execute)
+
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-		taskID, tctx := registerTask("fetch", req.ProfileName, req.Ref)
+			taskID, tctx := registerTask("fetch", req.ProfileName, req.Ref)
 		taskCtx = tctx
 		writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 		go func() {
@@ -1310,7 +1388,7 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 			}
 			sendRes.ErrorInfo = scraper.SanitizeString(sendRes.ErrorInfo)
 
-			stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+			stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID, startRes.Info.WebsocketLink)
 
 			var outcome *message.SendOutcome
 			if len(sendRes.Results) > 0 {
@@ -1340,6 +1418,9 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 				ErrorInfo: sendRes.ErrorInfo,
 			}
 		}
+
+		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
+		execute = guard(logger, execute)
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
@@ -1453,7 +1534,7 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 				SinceIncomingCount: req.SinceIncomingCount,
 			})
 
-			stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID)
+			stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID, startRes.Info.WebsocketLink)
 
 			for i := range checkRes.Replies {
 				checkRes.Replies[i].SenderName = scraper.SanitizeString(checkRes.Replies[i].SenderName)
@@ -1493,6 +1574,9 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 				ErrorInfo:   checkRes.ErrorInfo,
 			}
 		}
+
+		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
+		execute = guard(logger, execute)
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
@@ -1703,7 +1787,7 @@ func main() {
 			})
 
 			// 6. 关闭浏览器 + 释放占用
-			stopProfileWithCleanup(bgCtx, logger, browserCtx, res.Host, res.Port, res.ProfileID)
+			stopProfileWithCleanup(bgCtx, logger, browserCtx, res.Host, res.Port, res.ProfileID, res.Info.WebsocketLink)
 
 			if nurtureErr != nil {
 				logger.Print("E", "养号流程失败: "+nurtureErr.Error())
@@ -1715,6 +1799,9 @@ func main() {
 			}
 			return "success", nurtureRes.ActionsPerformed
 		}
+
+		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
+		execute = guardVoid(logger, execute)
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
@@ -1914,6 +2001,9 @@ func main() {
 			return "success", "publish_triggered", res
 		}
 
+		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
+		execute = guard(logger, execute)
+
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
 			taskID, tctx := registerTask("facebook_publish", req.ProfileName, req.Ref)
@@ -2075,6 +2165,9 @@ func main() {
 			return "success", "publish_triggered", res
 		}
 
+		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
+		execute = guard(logger, execute)
+
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
 			taskID, tctx := registerTask("twitter_publish", req.ProfileName, req.Ref)
@@ -2235,6 +2328,9 @@ func main() {
 			return "success", "publish_triggered", res
 		}
 
+		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
+		execute = guard(logger, execute)
+
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
 			taskID, tctx := registerTask("youtube_publish", req.ProfileName, req.Ref)
@@ -2392,6 +2488,9 @@ func main() {
 			cancelStop()
 			return "success", "publish_triggered", res
 		}
+
+		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
+		execute = guard(logger, execute)
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
@@ -2554,6 +2653,9 @@ func main() {
 			return "success", "publish_triggered", res
 		}
 
+		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
+		execute = guard(logger, execute)
+
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
 			taskID, tctx := registerTask("instagram_publish", req.ProfileName, req.Ref)
@@ -2622,6 +2724,14 @@ func main() {
 	if addr == "" {
 		addr = "127.0.0.1:8080"
 	}
+	// 启动上报：告知 account_sys「本机已重启」，让它立即重置本机丢失的异步任务，
+	// 不必再等 check_timeout_tasks 的 45 分钟兜底窗口。延迟 3 秒等服务真正开始监听。
+	// Best Effort：上报失败不影响服务启动，account_sys 侧仍有 45 分钟兜底。
+	go func() {
+		time.Sleep(3 * time.Second)
+		notifyMachineRestarted(logger)
+	}()
+
 	logger.Print("BOOT", "listening on "+addr)
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		logger.Print("E", err.Error())

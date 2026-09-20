@@ -12,7 +12,6 @@ import (
 
 	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/logx"
-	"minimax_pro/internal/undetectable"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/dom"
@@ -74,8 +73,14 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	)
 
 	// 清理多余标签页
-	chromedputil.CleanExtraTabs(tabCtx, logger, "DY1")
+	if err := chromedputil.CleanExtraTabs(tabCtx, logger, "DY1"); err != nil {
+		// 连不上浏览器时必须立即返回：chromedp 首次分配已失败并留下不一致状态，
+		// 继续调用 chromedp.Run 会 panic(close of closed channel) 并终止整个进程。
+		return fmt.Errorf("DY1 %v", err)
+	}
 
+	// 与其它平台保持一致：统一走 CloseTabsAndStopProfile（30 秒停止超时 + CDP 兜底 + 进程级兜底）。
+	// 原先这里手写清理：stop 接口只给 6 秒、没有任何兜底、错误还被丢弃，是浏览器进程残留的主要来源。
 	defer func() {
 		logger.Print("DY7", "关闭标签页")
 		_ = chromedp.Run(tabCtx, chromedp.ActionFunc(func(ctx context.Context) error {
@@ -84,23 +89,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 			var result interface{}
 			return chromedp.Run(closeTabCtx, chromedp.Evaluate(`window.close()`, &result))
 		}))
-
-		logger.Print("DY7", "关闭所有标签页")
-		closeCtx, cancelClose := context.WithTimeout(tabCtx, 10*time.Second)
-		if err := chromedputil.CloseAllTabsThenBrowser(closeCtx); err != nil {
-			logger.Print("DY7", "关闭标签页失败: "+err.Error())
-		} else {
-			logger.Print("DY7", "已关闭所有标签页")
-		}
-		cancelClose()
-
-		if req.ProfileID != "" && req.UndetectableHost != "" && req.UndetectablePort != 0 {
-			stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
-			defer cancelStop()
-			_ = undetectable.NewClient(req.UndetectableHost, req.UndetectablePort).StopProfileBestEffort(stopCtx, req.ProfileID)
-			logger.Print("DY7", "已请求停止Undetectable Profile")
-		}
-		logger.Print("DY7", "资源清理完成")
+		chromedputil.CloseTabsAndStopProfile(ctx, tabCtx, logger, req.ProfileID, req.UndetectableHost, req.UndetectablePort, req.WebsocketURL, "DY7")
 	}()
 
 	// 整体超时 15 分钟：覆盖慢网速下的多次重新上传重试 + 验证码人工处理等待

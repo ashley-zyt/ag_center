@@ -4,6 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -78,21 +84,29 @@ func CloseAllTabsThenBrowser(ctx context.Context) error {
 
 // CleanExtraTabs 关闭多余的标签页，只保留第一个。
 // ctx 必须是 chromedp.NewContext 创建的浏览器上下文, 不能是 allocator 上下文。
-func CleanExtraTabs(ctx context.Context, logger *logx.Logger, platformTag string) {
+//
+// 返回的 error 语义很重要：本函数通常是任务里**第一个** chromedp.Run 调用。
+// 一旦返回错误（尤其"获取标签页列表失败"，即连不上浏览器），说明 chromedp 的
+// 「首次分配 Browser」已经失败 —— 而 chromedp 在失败前就已 close 掉内部的
+// allocated channel，失败后又不记录 Browser（chromedp.go:299-305）。此时若继续调用
+// 任何 chromedp.Run，会再次进入分配逻辑并对同一个 channel 二次 close，直接
+// panic: close of closed channel 并终止整个进程。
+// 因此调用方拿到 error 后必须立即 return，不得再执行任何 chromedp 操作。
+func CleanExtraTabs(ctx context.Context, logger *logx.Logger, platformTag string) error {
 	if ctx.Err() != nil {
 		logger.Print(platformTag, "CleanExtraTabs: context 已失效: "+ctx.Err().Error())
-		return
+		return ctx.Err()
 	}
 
 	pages, err := pageTargets(ctx)
 	if err != nil {
 		logger.Print(platformTag, "获取标签页列表失败: "+err.Error())
-		return
+		return fmt.Errorf("连接浏览器失败: %w", err)
 	}
 
 	// 如果只有一个或没有标签页，无需清理
 	if len(pages) <= 1 {
-		return
+		return nil
 	}
 
 	logger.Print(platformTag, fmt.Sprintf("发现 %d 个标签页，清理多余的 %d 个", len(pages), len(pages)-1))
@@ -100,7 +114,7 @@ func CleanExtraTabs(ctx context.Context, logger *logx.Logger, platformTag string
 	exec, err := browserExecutor(ctx)
 	if err != nil {
 		logger.Print(platformTag, err.Error())
-		return
+		return err
 	}
 
 	// 保留第一个，关闭其余的
@@ -111,6 +125,64 @@ func CleanExtraTabs(ctx context.Context, logger *logx.Logger, platformTag string
 	}
 
 	logger.Print(platformTag, "已清理多余标签页，保留1个")
+	return nil
+}
+
+// ProbeBrowserAlive 在**完全不触碰 chromedp 上下文**的前提下，探测浏览器调试端口是否可用。
+//
+// 为什么需要它：若浏览器已闪退/退出，chromedp 的首次分配会失败并留下"已 close 但未记录
+// Browser"的不一致状态，后续任意 chromedp.Run 都会 panic（详见 CleanExtraTabs 注释）。
+// 因此在创建 allocator 之前先做一次纯 HTTP 探测，连不上就直接返回，
+// 从源头避免进入那条会 panic 的路径。
+//
+// websocketURL 形如 ws://127.0.0.1:54913/devtools/browser/<id>，
+// 探测目标是同端口的 http://127.0.0.1:54913/json/version。
+func ProbeBrowserAlive(ctx context.Context, websocketURL string, timeout time.Duration) error {
+	hostPort := hostPortFromWebsocket(websocketURL)
+	if hostPort == "" {
+		return fmt.Errorf("无法从 websocket 地址解析调试端口: %q", websocketURL)
+	}
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+hostPort+"/json/version", nil)
+	if err != nil {
+		return err
+	}
+
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("浏览器调试端口不可达(%s): %w", hostPort, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("浏览器调试端口返回异常状态(%s): %d", hostPort, resp.StatusCode)
+	}
+	return nil
+}
+
+// hostPortFromWebsocket 从 websocket 地址中提取 "host:port"。
+func hostPortFromWebsocket(websocketURL string) string {
+	s := strings.TrimSpace(websocketURL)
+	if s == "" {
+		return ""
+	}
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexAny(s, "/?#"); i >= 0 {
+		s = s[:i]
+	}
+	if !strings.Contains(s, ":") {
+		return ""
+	}
+	return s
 }
 
 // PageLoadTimeout 打开页面后的加载超时时间：页面在该时长内未完成加载则终止流程。
@@ -132,8 +204,9 @@ func NavigateAndWaitBody(ctx context.Context, logger *logx.Logger, url, tag stri
 
 // CloseTabsAndStopProfile 关闭所有标签页, 并请求停止 Undetectable Profile。
 // browserCtx 必须是 chromedp.NewContext 创建的浏览器上下文。
+// websocketURL 为该 profile 的 CDP 地址，用于在 stop 接口失效时按调试端口定位浏览器进程做兜底清理。
 func CloseTabsAndStopProfile(ctx context.Context, browserCtx context.Context, logger *logx.Logger,
-	profileID, undetectableHost string, undetectablePort int, platformTag string) {
+	profileID, undetectableHost string, undetectablePort int, websocketURL string, platformTag string) {
 
 	if browserCtx != nil {
 		closeCtx, cancelClose := context.WithTimeout(browserCtx, 15*time.Second)
@@ -152,14 +225,121 @@ func CloseTabsAndStopProfile(ctx context.Context, browserCtx context.Context, lo
 
 		if err != nil {
 			logger.Print(platformTag, "请求停止 Undetectable Profile 失败: "+err.Error())
-			// 兜底：stop 接口失败时，直接通过 CDP 关闭浏览器本体，避免浏览器残留
+			// 兜底 1：通过 CDP 关闭浏览器本体
 			CloseBrowserViaCDP(browserCtx, logger, platformTag)
+			// 兜底 2：进程级清理。Undetectable 主程序崩溃/卡死时，stop 接口与 CDP 可能都失效，
+			// 此时按该 profile 的调试端口特征直接结束浏览器进程树，避免进程永久残留。
+			KillBrowserProcessesByHint(logger, RemoteDebugPortHint(websocketURL))
 		} else {
 			logger.Print(platformTag, "已成功请求停止 Undetectable Profile")
 			time.Sleep(3 * time.Second)
 			logger.Print(platformTag, "云端同步缓冲完成，配置安全关闭")
 		}
 	}
+}
+
+// ===== 进程级兜底清理 =====
+// 背景：正常清理依赖 Undetectable 的 stop HTTP 接口 + CDP Browser.close 两条软通道。
+// 一旦主程序崩溃/卡死，这两条通道都会失效，浏览器进程会变成孤儿进程永久残留（只能手工结束）。
+// 因此提供一个"最后手段"：按进程名 + 命令行特征直接结束进程树。
+
+// undetectedBrowserProcessName 兜底清理时匹配的浏览器进程名。
+// 可用环境变量 UNDETECTED_BROWSER_PROC 覆盖（若实际进程名不是 Undetected.exe）。
+var undetectedBrowserProcessName = "Undetected.exe"
+
+func init() {
+	if v := strings.TrimSpace(os.Getenv("UNDETECTED_BROWSER_PROC")); v != "" {
+		undetectedBrowserProcessName = v
+	}
+}
+
+// DebugPortFromWebsocket 从 CDP 的 websocket 地址解析调试端口。
+// 例："ws://127.0.0.1:45678/devtools/browser/xxx" -> "45678"。
+func DebugPortFromWebsocket(websocketURL string) string {
+	s := strings.TrimSpace(websocketURL)
+	if s == "" {
+		return ""
+	}
+	if u, err := url.Parse(s); err == nil && u.Port() != "" {
+		return u.Port()
+	}
+	// 兜底：手工从 "host:port" 里截取端口
+	hostPort := s
+	if i := strings.Index(hostPort, "://"); i >= 0 {
+		hostPort = hostPort[i+3:]
+	}
+	if i := strings.IndexAny(hostPort, "/?#"); i >= 0 {
+		hostPort = hostPort[:i]
+	}
+	if i := strings.LastIndex(hostPort, ":"); i >= 0 {
+		return hostPort[i+1:]
+	}
+	return ""
+}
+
+// RemoteDebugPortHint 由 websocket 地址生成浏览器命令行匹配特征
+// "--remote-debugging-port=<port>"；无法解析时返回空串。
+func RemoteDebugPortHint(websocketURL string) string {
+	if p := DebugPortFromWebsocket(websocketURL); p != "" {
+		return "--remote-debugging-port=" + p
+	}
+	return ""
+}
+
+// RemoteDebugPortHintFromPort 用「裸调试端口」（Undetectable /list 返回的 debug_port 字段）
+// 生成进程定位特征串。用于 websocket_link 已丢失、只能靠 debug_port 定位残留浏览器的场景。
+func RemoteDebugPortHintFromPort(port string) string {
+	p := strings.TrimSpace(port)
+	if p == "" || p == "0" {
+		return ""
+	}
+	return "--remote-debugging-port=" + p
+}
+
+// KillBrowserProcessesByHint 进程级兜底清理：按「浏览器进程名 + 命令行包含任一 hint」
+// 定位并强制结束进程树（taskkill /F /T）。
+//
+// hints 必须是能**唯一标识某个 profile** 的特征串，例如：
+//   - "--remote-debugging-port=45678"（该 profile 的调试端口）
+//   - profile 的 user-data-dir 路径
+//
+// 传空串会被忽略；若最终没有任何有效特征，函数直接跳过并记日志 —— 宁可残留也不误杀，
+// 因为盲目按进程名结束会杀掉其它并发任务正在使用的浏览器。
+//
+// 非 Windows 平台直接跳过（本项目部署在 Windows）。
+func KillBrowserProcessesByHint(logger *logx.Logger, hints ...string) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	var conds []string
+	for _, h := range hints {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		// PowerShell 单引号字符串内的单引号需转义为两个单引号
+		esc := strings.ReplaceAll(h, "'", "''")
+		conds = append(conds, fmt.Sprintf("($_.CommandLine -like '*%s*')", esc))
+	}
+	if len(conds) == 0 {
+		logger.Print("KILL", "无有效定位特征，跳过进程级兜底清理（避免误杀其它浏览器）")
+		return
+	}
+
+	script := fmt.Sprintf(`$ps = Get-CimInstance Win32_Process -Filter "Name='%s'" | Where-Object { %s }; `+
+		`if ($ps) { $ps | ForEach-Object { & taskkill /F /T /PID $_.ProcessId } } else { 'NO_MATCH' }`,
+		undetectedBrowserProcessName, strings.Join(conds, " -or "))
+
+	killCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(killCtx, "powershell", "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
+	result := strings.TrimSpace(string(out))
+	if err != nil {
+		logger.Print("KILL", fmt.Sprintf("进程级兜底清理执行失败: %v output=%s", err, result))
+		return
+	}
+	logger.Print("KILL", "进程级兜底清理结果: "+result)
 }
 
 // CloseBrowserViaCDP 通过 CDP 的 Browser.close 命令直接关闭浏览器本体。
