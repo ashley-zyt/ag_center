@@ -746,6 +746,37 @@ var (
 	undetectableStartCooldown = 15 * time.Second
 )
 
+// Undetectable 不可用熔断：主程序没启动/崩溃时，短时间内所有任务快速失败，
+// 避免每个任务都走一遍「探测超时 + 重试 3 次」的昂贵流程、还误报成任务执行失败。
+// 熔断期内任务入口直接返回「Undetectable 未启动」——该错误不在 isRetryableBrowserError
+// 名单里，因此不会被重试；冷却期过后下一个任务重新探测，恢复即自动解除熔断。
+var (
+	undetectableBrokenMu    sync.Mutex
+	undetectableBrokenUntil time.Time
+)
+
+// undetectableBreakCooldown 熔断持续时间：期间认为 Undetectable 不可用。
+const undetectableBreakCooldown = 30 * time.Second
+
+// isUndetectableBroken 是否处于熔断期（Undetectable 刚被确认不可用）。
+func isUndetectableBroken() bool {
+	undetectableBrokenMu.Lock()
+	defer undetectableBrokenMu.Unlock()
+	return time.Now().Before(undetectableBrokenUntil)
+}
+
+func markUndetectableBroken() {
+	undetectableBrokenMu.Lock()
+	undetectableBrokenUntil = time.Now().Add(undetectableBreakCooldown)
+	undetectableBrokenMu.Unlock()
+}
+
+func clearUndetectableBroken() {
+	undetectableBrokenMu.Lock()
+	undetectableBrokenUntil = time.Time{}
+	undetectableBrokenMu.Unlock()
+}
+
 func resolveUndetectablePath(explicit string) string {
 	if explicit != "" {
 		return explicit
@@ -774,6 +805,11 @@ func tryStartUndetectable(ctx context.Context, logger *logx.Logger, path string)
 }
 
 func ensureAPIAndMaybeStart(ctx context.Context, logger *logx.Logger, host string, port int, waitSeconds int, explicitPath string) (*undetectable.Client, string, error) {
+	// 熔断期：Undetectable 刚被确认不可用，直接快速失败，不再逐个探测/拉起。
+	if isUndetectableBroken() {
+		return nil, "", fmt.Errorf("Undetectable 未启动，任务暂停执行（熔断中，稍后自动恢复）")
+	}
+
 	logger.Print("1", "检查本地API服务")
 	client := undetectable.NewClient(host, port)
 	localCtx, cancel := context.WithTimeout(ctx, time.Duration(waitSeconds+20)*time.Second)
@@ -782,6 +818,7 @@ func ensureAPIAndMaybeStart(ctx context.Context, logger *logx.Logger, host strin
 	err := client.Status(localCtx)
 	if err == nil {
 		logger.Print("1", "API服务正常")
+		clearUndetectableBroken()
 		return client, "", nil
 	}
 	// 记录失败原因，便于区分「主程序没起(connection refused)」「主程序卡死(timeout)」「状态异常(code≠0)」
@@ -789,10 +826,12 @@ func ensureAPIAndMaybeStart(ctx context.Context, logger *logx.Logger, host strin
 
 	path := resolveUndetectablePath(explicitPath)
 	if path == "" {
-		return nil, "", fmt.Errorf("无法连接Undetectable API且未配置undetectable_path或UNDETECTABLE_EXE")
+		markUndetectableBroken()
+		return nil, "", fmt.Errorf("Undetectable 未启动（未配置 UNDETECTABLE_EXE 自动拉起），任务暂停执行")
 	}
 
 	if err := tryStartUndetectable(localCtx, logger, path); err != nil {
+		markUndetectableBroken()
 		return nil, "", fmt.Errorf("启动Undetectable失败: %w", err)
 	}
 
@@ -800,10 +839,12 @@ func ensureAPIAndMaybeStart(ctx context.Context, logger *logx.Logger, host strin
 	for time.Now().Before(deadline) {
 		if err := client.Status(localCtx); err == nil {
 			logger.Print("1", "Undetectable已启动，API服务正常")
+			clearUndetectableBroken()
 			return client, path, nil
 		}
 		time.Sleep(2 * time.Second)
 	}
+	markUndetectableBroken()
 	return nil, path, fmt.Errorf("已尝试启动Undetectable，但在超时时间内API仍不可用")
 }
 
