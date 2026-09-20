@@ -607,11 +607,26 @@ func startProfileByName(ctx context.Context, logger *logx.Logger, profileName st
 	info, waitErr := undetectable.WaitProfileStarted(localCtx, client, profileID, time.Duration(waitSeconds)*time.Second)
 	if waitErr != nil {
 		if startErr != nil {
+			// 假死信号：start 失败且 profile 最终也没起来。累计连续失败次数，
+			// 达到阈值才判定主程序假死（单个失败可能偶发，避免误判触发重启）。
+			if isUndetectableZombie(startErr.Error()) && noteUndetectableStartFailure() {
+				logger.Print("4", fmt.Sprintf("连续 %d 个 profile 启动失败，判定 Undetectable 主程序假死/退出，触发熔断并尝试重启", undetectableZombieThreshold))
+				markUndetectableBroken()
+				if path != "" {
+					go func() {
+						restartCtx, cancelRestart := context.WithTimeout(context.Background(), 30*time.Second)
+						defer cancelRestart()
+						_ = tryStartUndetectable(restartCtx, logger, path)
+					}()
+				}
+			}
 			return startByNameResult{}, startErr
 		}
 		return startByNameResult{}, waitErr
 	}
 	logger.Print("5", "已启动")
+	// profile 最终成功启动，清零连续失败计数（主程序没假死）
+	noteUndetectableStartSuccess()
 
 	// 连接可用性预检：/list 报告 Started 且 websocket_link 非空，仍可能是刚刚崩掉的实例
 	// （记录还没刷新、端口已经释放）。这里用**不经过 chromedp** 的纯 HTTP 探测再确认一次，
@@ -775,6 +790,46 @@ func clearUndetectableBroken() {
 	undetectableBrokenMu.Lock()
 	undetectableBrokenUntil = time.Time{}
 	undetectableBrokenMu.Unlock()
+}
+
+// isUndetectableZombie 判断错误是否暗示 Undetectable 主程序已「假死/退出」：
+// /status 探测通过了（才能走到启动 profile 这一步），但 profile 操作却报
+// Invalid profile id / 超时，说明主程序的 profile 管理已失效——仅靠 /status 识别不出来。
+// 这类错误应触发熔断 + 尝试重启主程序，而不是让任务重试 3 次后误报失败。
+func isUndetectableZombie(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "invalid profile id") ||
+		strings.Contains(lower, "context deadline exceeded")
+}
+
+// 连续假死信号失败计数：单个 profile start 失败可能是偶发，连续达到阈值才判定主程序假死，
+// 避免偶发误判触发不必要的熔断/重启。
+var (
+	undetectableZombieMu     sync.Mutex
+	undetectableZombieStreak int
+)
+
+// undetectableZombieThreshold 连续多少个 profile start 失败才判定主程序假死。
+const undetectableZombieThreshold = 10
+
+// noteUndetectableStartSuccess 记录一次 profile 最终启动成功，清零连续失败计数。
+func noteUndetectableStartSuccess() {
+	undetectableZombieMu.Lock()
+	undetectableZombieStreak = 0
+	undetectableZombieMu.Unlock()
+}
+
+// noteUndetectableStartFailure 记录一次假死信号失败，返回是否达到阈值（应判定假死）。
+// 达到阈值时自动清零计数，避免重复触发。
+func noteUndetectableStartFailure() bool {
+	undetectableZombieMu.Lock()
+	defer undetectableZombieMu.Unlock()
+	undetectableZombieStreak++
+	if undetectableZombieStreak >= undetectableZombieThreshold {
+		undetectableZombieStreak = 0
+		return true
+	}
+	return false
 }
 
 func resolveUndetectablePath(explicit string) string {
