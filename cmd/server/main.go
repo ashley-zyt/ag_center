@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -882,8 +884,9 @@ type SendSingleMessageRequest struct {
 	Port             int    `json:"port"`
 	WaitSeconds      int    `json:"wait_seconds"`
 	UndetectablePath string `json:"undetectable_path"`
-	Async            bool   `json:"async"`         // true 时立即返回 task_id、后台执行、完成后回调
-	Ref              string `json:"ref,omitempty"` // 业务标识，透传：提交时传入，回调时原样带回
+	Async            bool   `json:"async"`           // true 时立即返回 task_id、后台执行、完成后回调
+	Ref              string `json:"ref,omitempty"`   // 业务标识，透传：提交时传入，回调时原样带回
+	Batch            string `json:"batch,omitempty"` // 批次标识，透传：同一批下发填同一个值，便于对账
 }
 
 // SendSingleMessageResponse POST /accounts/send_single_message 响应
@@ -908,8 +911,9 @@ type CheckReplyRequest struct {
 	Port               int    `json:"port"`
 	WaitSeconds        int    `json:"wait_seconds"`
 	UndetectablePath   string `json:"undetectable_path"`
-	Async              bool   `json:"async"`         // true 时立即返回 task_id、后台执行、完成后回调
-	Ref                string `json:"ref,omitempty"` // 业务标识，透传：提交时传入，回调时原样带回
+	Async              bool   `json:"async"`           // true 时立即返回 task_id、后台执行、完成后回调
+	Ref                string `json:"ref,omitempty"`   // 业务标识，透传：提交时传入，回调时原样带回
+	Batch              string `json:"batch,omitempty"` // 批次标识，透传：同一批下发填同一个值
 }
 
 // CheckReplyResponse POST /accounts/check_reply 响应
@@ -946,6 +950,8 @@ type FetchPostsRequest struct {
 	Async bool `json:"async"`
 	// Ref 业务标识，透传：提交时传入，回调时原样带回（供 account_sys 精确关联任务）。
 	Ref string `json:"ref,omitempty"`
+	// Batch 批次标识，透传：同一批下发填同一个值，便于按批对账。
+	Batch string `json:"batch,omitempty"`
 }
 
 type FetchPostsAccountResult struct {
@@ -1198,17 +1204,17 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("fetch", req.ProfileName, req.Ref)
-		taskCtx = tctx
-		writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
-		go func() {
-			setTaskState(taskID, taskStatusRunning)
-			status, info, results, _ := execute()
-			finalStatus := taskStatusSuccess
-			if status != "success" {
-				finalStatus = taskStatusFailed
-			}
-			finishTask(taskID, finalStatus, info)
+			taskID, tctx := registerTask("fetch", req.ProfileName, req.Ref, req.Batch)
+			taskCtx = tctx
+			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			go func() {
+				setTaskState(taskID, taskStatusRunning)
+				status, info, results, _ := execute()
+				finalStatus := taskStatusSuccess
+				if status != "success" {
+					finalStatus = taskStatusFailed
+				}
+				finishTask(taskID, finalStatus, info)
 				callbackTaskResult(context.Background(), logger, TaskResultPayload{
 					TaskID:      taskID,
 					ProfileName: req.ProfileName,
@@ -1424,7 +1430,7 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("send_message", req.ProfileName, req.Ref)
+			taskID, tctx := registerTask("send_message", req.ProfileName, req.Ref, req.Batch)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -1580,7 +1586,7 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("check_reply", req.ProfileName, req.Ref)
+			taskID, tctx := registerTask("check_reply", req.ProfileName, req.Ref, req.Batch)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -1614,6 +1620,10 @@ func main() {
 	logger := logx.New(os.Stdout)
 	defer logger.Close()
 
+	// 先加载上次运行留下的任务记录（未跑完的任务会被标记为 interrupted），
+	// 这样重启后 /tasks 仍能查到历史进度，而不是一片空白。
+	loadTaskStore(logger)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -1621,10 +1631,12 @@ func main() {
 
 	// 任务状态查询（按 task_id 查询，作为回调失败/重启丢任务时的补充排查手段）
 	// 任务查询与清理：
-	//   GET  /tasks        任务总览与进度列表
-	//   GET  /tasks/{id}   单个任务详情
-	//   POST /tasks/clear  中断并清空所有任务
+	//   GET  /tasks          任务总览与进度列表
+	//   GET  /tasks/summary  任务统计（纯聚合，供 account_sys 看板使用，无明细）
+	//   GET  /tasks/{id}     单个任务详情
+	//   POST /tasks/clear    中断并清空所有任务
 	mux.HandleFunc("/tasks", handleTaskList(logger))
+	mux.HandleFunc("/tasks/summary", handleTaskSummary(logger))
 	mux.HandleFunc("/tasks/clear", handleTaskClear(logger))
 	mux.HandleFunc("/tasks/", handleTaskQuery(logger))
 
@@ -1698,6 +1710,7 @@ func main() {
 		UndetectablePath string `json:"undetectable_path"`
 		Async            bool   `json:"async"` // true 时立即返回 task_id、后台执行、完成后回调
 		Ref              string `json:"ref,omitempty"`
+		Batch            string `json:"batch,omitempty"`
 	}
 
 	type NurtureResponse struct {
@@ -1805,7 +1818,7 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("nurture", req.ProfileName, req.Ref)
+			taskID, tctx := registerTask("nurture", req.ProfileName, req.Ref, req.Batch)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -1885,6 +1898,7 @@ func main() {
 		UndetectablePath string `json:"undetectable_path"`
 		Async            bool   `json:"async"`
 		Ref              string `json:"ref,omitempty"`
+		Batch            string `json:"batch,omitempty"`
 	}
 
 	type FacebookPublishResponse struct {
@@ -2006,7 +2020,7 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("facebook_publish", req.ProfileName, req.Ref)
+			taskID, tctx := registerTask("facebook_publish", req.ProfileName, req.Ref, req.Batch)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -2063,6 +2077,7 @@ func main() {
 			UndetectablePath string `json:"undetectable_path"`
 			Async            bool   `json:"async"`
 			Ref              string `json:"ref,omitempty"`
+			Batch            string `json:"batch,omitempty"`
 		}
 		type TwitterPublishResponse struct {
 			Type             string `json:"type"`
@@ -2170,7 +2185,7 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("twitter_publish", req.ProfileName, req.Ref)
+			taskID, tctx := registerTask("twitter_publish", req.ProfileName, req.Ref, req.Batch)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -2227,6 +2242,7 @@ func main() {
 			UndetectablePath string `json:"undetectable_path"`
 			Async            bool   `json:"async"`
 			Ref              string `json:"ref,omitempty"`
+			Batch            string `json:"batch,omitempty"`
 		}
 		type YouTubePublishResponse struct {
 			Type             string `json:"type"`
@@ -2333,7 +2349,7 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("youtube_publish", req.ProfileName, req.Ref)
+			taskID, tctx := registerTask("youtube_publish", req.ProfileName, req.Ref, req.Batch)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -2389,6 +2405,7 @@ func main() {
 			UndetectablePath string `json:"undetectable_path"`
 			Async            bool   `json:"async"`
 			Ref              string `json:"ref,omitempty"`
+			Batch            string `json:"batch,omitempty"`
 		}
 		type TikTokPublishResponse struct {
 			Type             string `json:"type"`
@@ -2494,7 +2511,7 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("tiktok_publish", req.ProfileName, req.Ref)
+			taskID, tctx := registerTask("tiktok_publish", req.ProfileName, req.Ref, req.Batch)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -2551,6 +2568,7 @@ func main() {
 			UndetectablePath string `json:"undetectable_path"`
 			Async            bool   `json:"async"`
 			Ref              string `json:"ref,omitempty"`
+			Batch            string `json:"batch,omitempty"`
 		}
 		type InstagramPublishResponse struct {
 			Type             string `json:"type"`
@@ -2658,7 +2676,7 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("instagram_publish", req.ProfileName, req.Ref)
+			taskID, tctx := registerTask("instagram_publish", req.ProfileName, req.Ref, req.Batch)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -2724,6 +2742,21 @@ func main() {
 	if addr == "" {
 		addr = "127.0.0.1:8080"
 	}
+	// 任务快照：状态变更后合并写入本地 JSON，并按保留策略定期清理超期记录。
+	startTaskStoreWriter(logger)
+
+	// 优雅退出：收到 Ctrl+C / SIGTERM 时先把任务快照刷盘再退出，
+	// 避免最后那个合并窗口内的状态变更丢失（被强杀时靠 2 秒合并窗口兜底）。
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		<-sigCh
+		logger.Print("BOOT", "收到退出信号，正在保存任务快照…")
+		flushTaskStoreNow(logger)
+		logger.Close()
+		os.Exit(0)
+	}()
+
 	// 启动上报：告知 account_sys「本机已重启」，让它立即重置本机丢失的异步任务，
 	// 不必再等 check_timeout_tasks 的 45 分钟兜底窗口。延迟 3 秒等服务真正开始监听。
 	// Best Effort：上报失败不影响服务启动，account_sys 侧仍有 45 分钟兜底。

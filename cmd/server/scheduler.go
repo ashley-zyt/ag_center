@@ -66,14 +66,20 @@ const (
 	taskStatusRunning = "running"
 	taskStatusSuccess = "success"
 	taskStatusFailed  = "failed"
+	// taskStatusInterrupted 只出现在「重启后从快照加载出来的历史记录」上：
+	// 上次进程退出时任务还没跑完，执行它的 goroutine 已消失，不会有任何东西再推进它。
+	// 运行期不会主动写入这个状态。
+	taskStatusInterrupted = "interrupted"
 )
 
-// TaskRecord 单个任务在内存中的运行记录，用于查询进度。
+// TaskRecord 单个任务的运行记录，用于查询进度。
+// 常驻内存，并通过 task_store.go 落成本地 JSON 快照，服务重启后仍可查询。
 type TaskRecord struct {
 	TaskID      string    `json:"task_id"`
 	Type        string    `json:"type"`
 	ProfileName string    `json:"profile_name,omitempty"`
 	Ref         string    `json:"ref,omitempty"`
+	Batch       string    `json:"batch,omitempty"` // 批次标识，由调用方提交时指定（透传），用于对账「哪一批」
 	Status      string    `json:"status"`
 	Message     string    `json:"message,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -91,7 +97,10 @@ func newTaskID() string {
 
 // registerTask 登记一个新任务（状态 queued），返回 task_id 与该任务的可取消 context。
 // 调用方必须把返回的 ctx 作为任务执行的根 context，这样"清空任务队列"时才能中断它。
-func registerTask(taskType, profileName, ref string) (string, context.Context) {
+//
+// batch 为调用方指定的批次标识（可空）。同一批下发的任务带上同一个 batch，之后就能用
+// GET /tasks?batch=xxx 或 /tasks/summary 的 batches 聚合，精确回答"这批跑完没有"。
+func registerTask(taskType, profileName, ref, batch string) (string, context.Context) {
 	taskID := newTaskID()
 	ctx, cancel := context.WithCancel(context.Background())
 	now := time.Now()
@@ -101,23 +110,30 @@ func registerTask(taskType, profileName, ref string) (string, context.Context) {
 		Type:        taskType,
 		ProfileName: profileName,
 		Ref:         ref,
+		Batch:       strings.TrimSpace(batch),
 		Status:      taskStatusQueued,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
 	taskCancels[taskID] = cancel
 	taskRecordsMu.Unlock()
+	markTaskStoreDirty()
 	return taskID, ctx
 }
 
 // setTaskState 更新任务状态（message 保持不变）。
 func setTaskState(taskID, status string) {
 	taskRecordsMu.Lock()
-	if rec, ok := taskRecords[taskID]; ok {
+	changed := false
+	if rec, ok := taskRecords[taskID]; ok && rec.Status != status {
 		rec.Status = status
 		rec.UpdatedAt = time.Now()
+		changed = true
 	}
 	taskRecordsMu.Unlock()
+	if changed {
+		markTaskStoreDirty()
+	}
 }
 
 // finishTask 更新任务终态与结果信息，并释放该任务的 cancel 资源。
@@ -133,6 +149,7 @@ func finishTask(taskID, status, message string) {
 		delete(taskCancels, taskID)
 	}
 	taskRecordsMu.Unlock()
+	markTaskStoreDirty()
 }
 
 func getTaskState(taskID string) string {
@@ -167,6 +184,7 @@ func clearAllTasks() int {
 	clearedTasks = newCleared
 	taskCancels = make(map[string]context.CancelFunc)
 	taskRecords = make(map[string]*TaskRecord)
+	markTaskStoreDirty() // 清空也要落盘，否则重启后被清掉的记录又回来了
 	return n
 }
 
@@ -345,14 +363,13 @@ func handleTaskQuery(logger *logx.Logger) http.HandlerFunc {
 	}
 }
 
-// handleTaskList GET /tasks 查询任务汇总与进度。
-// 可选 query 参数：
-//   - status: queued | running | success | failed（按状态过滤列表）
-//   - type:   fetch | nurture | send_message | check_reply | *_publish（按类型过滤列表）
-//   - limit:  列表返回条数，默认 50，最大 500
+// handleTaskList GET /tasks 任务总览与进度列表。
 //
-// 返回：total（全局任务总数）、status_counts（全局各状态计数）、type_counts（全局各类型计数）、
-// matched（符合过滤条件的条数）、has_more（是否还有更多）、tasks（明细列表，按提交时间倒序）。
+// 过滤参数（见 task_stats.go::parseTaskFilter）：status / type / profile_name 支持逗号分隔多值，
+// ref_prefix 按前缀匹配（如 ref_prefix=Account:,WarmupTask: 只看本系统下发的任务）。
+//
+// 响应口径：status_counts / type_counts / type_status_counts 为**全局**统计（不受过滤影响），
+// tasks 明细受过滤影响，matched 为过滤命中的总条数（limit 截断前）。
 func handleTaskList(logger *logx.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -361,8 +378,7 @@ func handleTaskList(logger *logx.Logger) http.HandlerFunc {
 		}
 
 		q := r.URL.Query()
-		filterStatus := q.Get("status")
-		filterType := q.Get("type")
+		filter := parseTaskFilter(q)
 		limit := 50
 		if v := q.Get("limit"); v != "" {
 			if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -374,31 +390,23 @@ func handleTaskList(logger *logx.Logger) http.HandlerFunc {
 		}
 
 		taskRecordsMu.Lock()
-		totalAll := len(taskRecords)
-		statusCounts := map[string]int{
-			taskStatusQueued:  0,
-			taskStatusRunning: 0,
-			taskStatusSuccess: 0,
-			taskStatusFailed:  0,
-		}
-		typeCounts := map[string]int{}
-		var matched []*TaskRecord
+		global := newTaskCounters()
+		matched := make([]*TaskRecord, 0, len(taskRecords))
 		for _, rec := range taskRecords {
-			typeCounts[rec.Type]++
-			statusCounts[rec.Status]++
-			if filterStatus != "" && rec.Status != filterStatus {
-				continue
+			global.add(rec)
+			if filter.match(rec) {
+				matched = append(matched, rec)
 			}
-			if filterType != "" && rec.Type != filterType {
-				continue
-			}
-			matched = append(matched, rec)
 		}
 		taskRecordsMu.Unlock()
 
 		sort.Slice(matched, func(i, j int) bool {
 			return matched[i].CreatedAt.After(matched[j].CreatedAt)
 		})
+
+		// matched 表示「过滤后命中多少条」，在截断前统计 —— 调用方据此可判断真实堆积量
+		// （例如 ?status=queued&limit=1 时 matched 即为排队总数）。
+		matchedTotal := len(matched)
 
 		hasMore := false
 		if len(matched) > limit {
@@ -407,12 +415,15 @@ func handleTaskList(logger *logx.Logger) http.HandlerFunc {
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
-			"total":         totalAll,
-			"status_counts": statusCounts,
-			"type_counts":   typeCounts,
-			"matched":       len(matched),
-			"has_more":      hasMore,
-			"tasks":         matched,
+			"total":              global.Total,
+			"status_counts":      global.StatusCounts,
+			"type_counts":        global.TypeCounts,
+			"type_status_counts": global.TypeStatusCounts,
+			"matched":            matchedTotal,
+			"returned":           len(matched),
+			"has_more":           hasMore,
+			"store":              taskStoreStatus(),
+			"tasks":              matched,
 		})
 	}
 }
