@@ -152,6 +152,7 @@ func newTaskCounters() *taskCounters {
 			taskStatusSuccess:     0,
 			taskStatusFailed:      0,
 			taskStatusInterrupted: 0,
+			taskStatusPaused:      0,
 		},
 		TypeCounts:       make(map[string]int),
 		TypeStatusCounts: make(map[string]map[string]int),
@@ -205,6 +206,7 @@ type profileTaskStat struct {
 	Success     int    `json:"success"`
 	Failed      int    `json:"failed"`
 	Interrupted int    `json:"interrupted"`
+	Paused      int    `json:"paused"`
 	Total       int    `json:"total"`
 }
 
@@ -218,8 +220,9 @@ func (c *taskCounters) profileStats() []profileTaskStat {
 			Success:     counts[taskStatusSuccess],
 			Failed:      counts[taskStatusFailed],
 			Interrupted: counts[taskStatusInterrupted],
+			Paused:      counts[taskStatusPaused],
 		}
-		st.Total = st.Queued + st.Running + st.Success + st.Failed + st.Interrupted
+		st.Total = st.Queued + st.Running + st.Success + st.Failed + st.Interrupted + st.Paused
 		out = append(out, st)
 	}
 	// 堆积多的排前面（先按排队数，再按执行中，最后按 profile 名保证顺序稳定）
@@ -246,6 +249,7 @@ type batchTaskStat struct {
 	Success     int    `json:"success"`
 	Failed      int    `json:"failed"`
 	Interrupted int    `json:"interrupted"`
+	Paused      int    `json:"paused"`
 	Total       int    `json:"total"`
 	Pending     int    `json:"pending"`
 	Done        bool   `json:"done"`
@@ -266,9 +270,10 @@ func (c *taskCounters) batchStats(limit int) []batchTaskStat {
 			Success:     counts[taskStatusSuccess],
 			Failed:      counts[taskStatusFailed],
 			Interrupted: counts[taskStatusInterrupted],
+			Paused:      counts[taskStatusPaused],
 		}
-		st.Total = st.Queued + st.Running + st.Success + st.Failed + st.Interrupted
-		st.Pending = st.Queued + st.Running
+		st.Total = st.Queued + st.Running + st.Success + st.Failed + st.Interrupted + st.Paused
+		st.Pending = st.Queued + st.Running + st.Paused
 		st.Done = st.Pending == 0
 		if ts, ok := c.BatchFirstSeen[batch]; ok {
 			st.FirstSeen = ts.Format(time.RFC3339)

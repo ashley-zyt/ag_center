@@ -861,6 +861,21 @@ func tryStartUndetectable(ctx context.Context, logger *logx.Logger, path string)
 	return undetectable.StartLocal(ctx, path)
 }
 
+// isUndetectableNotStarted 判断错误是否属于「Undetectable 未启动」这一环境性问题
+// （而非任务本身的问题）。命中时任务应挂起(paused)等人工确认，而不是标 failed 回调。
+//
+// 覆盖 ensureAPIAndMaybeStart 返回的四类文案：
+//   - 熔断期：Undetectable 未启动，任务暂停执行（熔断中…）
+//   - 未配置自动拉起：Undetectable 未启动（未配置 UNDETECTABLE_EXE…）
+//   - 拉起失败：启动Undetectable失败: …
+//   - 拉起后仍不可用：已尝试启动Undetectable，但在超时时间内API仍不可用
+func isUndetectableNotStarted(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "undetectable 未启动") ||
+		strings.Contains(lower, "启动undetectable失败") ||
+		strings.Contains(lower, "已尝试启动undetectable")
+}
+
 func ensureAPIAndMaybeStart(ctx context.Context, logger *logx.Logger, host string, port int, waitSeconds int, explicitPath string) (*undetectable.Client, string, error) {
 	// 熔断期：Undetectable 刚被确认不可用，直接快速失败，不再逐个探测/拉起。
 	if isUndetectableBroken() {
@@ -1337,20 +1352,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			go func() {
 				setTaskState(taskID, taskStatusRunning)
 				status, info, results, _ := execute()
-				finalStatus := taskStatusSuccess
-				if status != "success" {
-					finalStatus = taskStatusFailed
-				}
-				finishTask(taskID, finalStatus, info)
-				callbackTaskResult(context.Background(), logger, TaskResultPayload{
-					TaskID:      taskID,
-					ProfileName: req.ProfileName,
-					TaskType:    "fetch",
-					Ref:         req.Ref,
-					Status:      status,
-					Message:     info,
-					Result:      results,
-				})
+				finalizeAsyncTask(logger, taskID, "fetch", req.ProfileName, req.Ref, status, info, results)
 			}()
 			return
 		}
@@ -1563,20 +1565,7 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 			go func() {
 				setTaskState(taskID, taskStatusRunning)
 				status, info, resp := execute()
-				finalStatus := taskStatusSuccess
-				if status != "success" {
-					finalStatus = taskStatusFailed
-				}
-				finishTask(taskID, finalStatus, info)
-				callbackTaskResult(context.Background(), logger, TaskResultPayload{
-					TaskID:      taskID,
-					ProfileName: req.ProfileName,
-					TaskType:    "send_message",
-					Ref:         req.Ref,
-					Status:      status,
-					Message:     info,
-					Result:      resp,
-				})
+				finalizeAsyncTask(logger, taskID, "send_message", req.ProfileName, req.Ref, status, info, resp)
 			}()
 			return
 		}
@@ -1719,20 +1708,7 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 			go func() {
 				setTaskState(taskID, taskStatusRunning)
 				status, info, resp := execute()
-				finalStatus := taskStatusSuccess
-				if status != "success" {
-					finalStatus = taskStatusFailed
-				}
-				finishTask(taskID, finalStatus, info)
-				callbackTaskResult(context.Background(), logger, TaskResultPayload{
-					TaskID:      taskID,
-					ProfileName: req.ProfileName,
-					TaskType:    "check_reply",
-					Ref:         req.Ref,
-					Status:      status,
-					Message:     info,
-					Result:      resp,
-				})
+				finalizeAsyncTask(logger, taskID, "check_reply", req.ProfileName, req.Ref, status, info, resp)
 			}()
 			return
 		}
@@ -1769,6 +1745,7 @@ func main() {
 	mux.HandleFunc("/tasks", handleTaskList(logger))
 	mux.HandleFunc("/tasks/summary", handleTaskSummary(logger))
 	mux.HandleFunc("/tasks/clear", handleTaskClear(logger))
+	mux.HandleFunc("/tasks/resume", handleTaskResume(logger))
 	mux.HandleFunc("/tasks/", handleTaskQuery(logger))
 
 	mux.HandleFunc("/accounts/check_login_status", func(w http.ResponseWriter, r *http.Request) {
@@ -1955,19 +1932,7 @@ func main() {
 			go func() {
 				setTaskState(taskID, taskStatusRunning)
 				status, info := execute()
-				finalStatus := taskStatusSuccess
-				if status != "success" {
-					finalStatus = taskStatusFailed
-				}
-				finishTask(taskID, finalStatus, info)
-				callbackTaskResult(context.Background(), logger, TaskResultPayload{
-					TaskID:      taskID,
-					ProfileName: req.ProfileName,
-					TaskType:    "nurture",
-					Ref:         req.Ref,
-					Status:      status,
-					Message:     info,
-				})
+				finalizeAsyncTask(logger, taskID, "nurture", req.ProfileName, req.Ref, status, info, nil)
 			}()
 			return
 		}

@@ -17,6 +17,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -330,24 +332,12 @@ func executeInstagramPublish(ctx context.Context, logger *logx.Logger, req Insta
 
 // ===== 异步执行包装（handler 与重启重放共用）=====
 
-// runAsyncPublish 异步执行一个发布任务：置 running → 执行 → finishTask → 回调。
+// runAsyncPublish 异步执行一个发布任务：置 running → 执行 → 统一收尾（finalizeAsyncTask）。
 func runAsyncPublish(ctx context.Context, logger *logx.Logger, taskID, taskType, profileName, ref string, exec func() (string, string, startByNameResult)) {
 	go func() {
 		setTaskState(taskID, taskStatusRunning)
 		status, info, _ := exec()
-		finalStatus := taskStatusSuccess
-		if status != "success" {
-			finalStatus = taskStatusFailed
-		}
-		finishTask(taskID, finalStatus, info)
-		callbackTaskResult(context.Background(), logger, TaskResultPayload{
-			TaskID:      taskID,
-			ProfileName: profileName,
-			TaskType:    taskType,
-			Ref:         ref,
-			Status:      status,
-			Message:     info,
-		})
+		finalizeAsyncTask(logger, taskID, taskType, profileName, ref, status, info, nil)
 	}()
 }
 
@@ -432,5 +422,66 @@ func resumeQueuedPublishTasks(logger *logx.Logger) {
 		}
 		logger.Print("RESUME", "重放排队中的发布任务: "+rec.TaskID+" type="+rec.Type+" profile="+rec.ProfileName)
 		runAsyncPublish(ctx, logger, rec.TaskID, rec.Type, rec.ProfileName, rec.Ref, exec)
+	}
+}
+
+// resumePausedPublishTasks 人工确认 Undetectable 已启动后，把 paused 的发布任务重新入队执行。
+// 只处理带 payload 的发布任务（能本机重放）；非发布类的 paused 任务无 payload、无法本机重放，
+// 保持 paused 不动，靠 account_sys 各自调度器兜底重发。
+func resumePausedPublishTasks(logger *logx.Logger) int {
+	taskRecordsMu.Lock()
+	toResume := make([]TaskRecord, 0)
+	for _, rec := range taskRecords {
+		if rec.Status == taskStatusPaused && rec.Payload != "" && strings.HasSuffix(rec.Type, "_publish") {
+			toResume = append(toResume, *rec)
+		}
+	}
+	taskRecordsMu.Unlock()
+
+	for _, rec := range toResume {
+		// 重新注册可取消 context，使 POST /tasks/clear 仍能中断重放的任务
+		ctx, cancel := context.WithCancel(context.Background())
+		taskRecordsMu.Lock()
+		taskCancels[rec.TaskID] = cancel
+		taskRecordsMu.Unlock()
+
+		exec, ok := buildPublishExecutor(ctx, rec.Type, rec.Payload, logger)
+		if !ok {
+			finishTask(rec.TaskID, taskStatusFailed, "恢复执行失败（无法解析任务参数）")
+			logger.Print("RESUME", "恢复失败（无法解析参数）: "+rec.TaskID)
+			continue
+		}
+		logger.Print("RESUME", "恢复暂停的发布任务: "+rec.TaskID+" type="+rec.Type+" profile="+rec.ProfileName)
+		runAsyncPublish(ctx, logger, rec.TaskID, rec.Type, rec.ProfileName, rec.Ref, exec)
+	}
+	return len(toResume)
+}
+
+// handleTaskResume POST /tasks/resume —— 人工确认 Undetectable 已启动后，恢复被暂停的任务。
+// 流程：清熔断 → 重新探测（必要时拉起）Undetectable → 成功则把 paused 发布任务重新入队。
+func handleTaskResume(logger *logx.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
+			return
+		}
+
+		// 清熔断，允许立即重新探测（人工点确认 = 明确表示 Undetectable 应已就绪）
+		clearUndetectableBroken()
+
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+		_, _, err := ensureAPIAndMaybeStart(ctx, logger, accountDefaultHost, accountDefaultPort, 20, "")
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+				Type:      "error",
+				ErrorInfo: "Undetectable 仍不可用，请先确认软件已启动再重试: " + err.Error(),
+			})
+			return
+		}
+
+		n := resumePausedPublishTasks(logger)
+		logger.Print("RESUME", fmt.Sprintf("人工确认启动，恢复 %d 个暂停的发布任务", n))
+		writeJSON(w, http.StatusOK, map[string]any{"type": "resumed", "count": n})
 	}
 }

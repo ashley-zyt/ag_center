@@ -286,9 +286,32 @@ func StartLocal(ctx context.Context, exePath string) error {
 		return fmt.Errorf("empty exePath")
 	}
 	// 不使用 CommandContext，因为 localCtx 会在函数返回后 cancel，导致进程被 kill
-	// 我们希望 Undetectable 独立运行
+	// 我们希望 Undetectable 独立运行。
 	cmd := exec.Command(exePath)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	return cmd.Start()
+
+	// 捕获 stdout/stderr：一旦进程秒退，能拿到真实原因（缺配置/端口被占/授权失败等），
+	// 避免「cmd.Start 成功但进程立刻退出」时静默失败、无从排查。
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("启动失败: %w", err)
+	}
+
+	// Start 成功不代表真的起来了：Undetectable 可能秒退。观察一个短暂窗口，
+	// 进程在此窗口内退出就把退出信息 + 输出一并返回。
+	exited := make(chan error, 1)
+	go func() {
+		exited <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-exited:
+		return fmt.Errorf("Undetectable 启动后立即退出(%v)，输出: %s", err, strings.TrimSpace(output.String()))
+	case <-ctx.Done():
+		return nil // 调用方超时取消，进程是否存活交给后续探测判断
+	case <-time.After(3 * time.Second):
+		return nil // 3 秒内未退出，视为启动成功
+	}
 }

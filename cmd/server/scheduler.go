@@ -70,6 +70,9 @@ const (
 	// 上次进程退出时任务还没跑完，执行它的 goroutine 已消失，不会有任何东西再推进它。
 	// 运行期不会主动写入这个状态。
 	taskStatusInterrupted = "interrupted"
+	// taskStatusPaused 任务因「Undetectable 未启动」被挂起：不回调 account_sys、不标失败，
+	// 只在本机记录，等人工确认启动后通过 POST /tasks/resume 恢复执行。
+	taskStatusPaused = "paused"
 )
 
 // TaskRecord 单个任务的运行记录，用于查询进度。
@@ -266,6 +269,34 @@ type TaskResultPayload struct {
 	Ref         string `json:"ref,omitempty"`
 	Message     string `json:"message,omitempty"`
 	Result      any    `json:"result,omitempty"`
+}
+
+// finalizeAsyncTask 统一异步任务的收尾：置终态 + 回调 account_sys。
+//
+// 特殊分支：任务因「Undetectable 未启动」失败时，不标 failed、也不回调 account_sys，
+// 而是标 paused 并只在本机记录 —— 等人工确认启动后通过 POST /tasks/resume 恢复执行。
+// 这样既不会污染 account_sys 的成功率/失败统计，也不会让「软件没起」被误记成「任务失败」。
+func finalizeAsyncTask(logger *logx.Logger, taskID, taskType, profileName, ref, status, info string, result any) {
+	if status != "success" && isUndetectableNotStarted(info) {
+		finishTask(taskID, taskStatusPaused, info)
+		logger.Print("TASK_PAUSE", "任务因 Undetectable 未启动而暂停，等待人工确认启动: "+taskID+" ("+info+")")
+		return
+	}
+
+	finalStatus := taskStatusSuccess
+	if status != "success" {
+		finalStatus = taskStatusFailed
+	}
+	finishTask(taskID, finalStatus, info)
+	callbackTaskResult(context.Background(), logger, TaskResultPayload{
+		TaskID:      taskID,
+		ProfileName: profileName,
+		TaskType:    taskType,
+		Ref:         ref,
+		Status:      status,
+		Message:     info,
+		Result:      result,
+	})
 }
 
 // callbackTaskResult 任务完成后回调 account_sys 通知结果（Best Effort：失败仅打日志）。
