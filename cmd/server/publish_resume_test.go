@@ -21,16 +21,16 @@ func TestBuildPublishExecutorParses(t *testing.T) {
 		{"instagram_publish", `{"profile_name":"ig001","text":"hi","video_oss_url":"http://x/v.mp4"}`},
 	}
 	for _, c := range cases {
-		exec, ok := buildPublishExecutor(context.Background(), c.taskType, c.payload, logger)
+		exec, ok := buildPublishExecutor(context.Background(), c.taskType, c.payload, logger, nil)
 		if !ok || exec == nil {
 			t.Fatalf("%s 应解析成功", c.taskType)
 		}
 	}
 
-	if _, ok := buildPublishExecutor(context.Background(), "unknown_type", "{}", logger); ok {
+	if _, ok := buildPublishExecutor(context.Background(), "unknown_type", "{}", logger, nil); ok {
 		t.Fatal("未知类型不应解析成功")
 	}
-	if _, ok := buildPublishExecutor(context.Background(), "facebook_publish", "{bad", logger); ok {
+	if _, ok := buildPublishExecutor(context.Background(), "facebook_publish", "{bad", logger, nil); ok {
 		t.Fatal("非法 JSON 不应解析成功")
 	}
 }

@@ -2027,14 +2027,14 @@ func main() {
 			taskID, tctx := registerTask("facebook_publish", req.ProfileName, req.Ref, req.Batch, raw, req.NotifyDingtalk)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			exec := guard(logger, func() (string, string, startByNameResult) {
-				return executeFacebookPublish(tctx, logger, req)
+				return executeFacebookPublish(tctx, logger, req, func() { setTaskState(taskID, taskStatusRunning) })
 			})
 			runAsyncPublish(tctx, logger, taskID, "facebook_publish", req.ProfileName, req.Ref, exec)
 			return
 		}
 
 		// 同步：原地执行并返回
-		status, info, res := executeFacebookPublish(context.Background(), logger, req)
+		status, info, res := executeFacebookPublish(context.Background(), logger, req, nil)
 		if status != "success" {
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return
@@ -2092,14 +2092,14 @@ func main() {
 			taskID, tctx := registerTask("twitter_publish", req.ProfileName, req.Ref, req.Batch, raw, req.NotifyDingtalk)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			exec := guard(logger, func() (string, string, startByNameResult) {
-				return executeTwitterPublish(tctx, logger, req)
+				return executeTwitterPublish(tctx, logger, req, func() { setTaskState(taskID, taskStatusRunning) })
 			})
 			runAsyncPublish(tctx, logger, taskID, "twitter_publish", req.ProfileName, req.Ref, exec)
 			return
 		}
 
 		// 同步：原地执行并返回
-		status, info, res := executeTwitterPublish(context.Background(), logger, req)
+		status, info, res := executeTwitterPublish(context.Background(), logger, req, nil)
 		if status != "success" {
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return
@@ -2156,14 +2156,14 @@ func main() {
 			taskID, tctx := registerTask("youtube_publish", req.ProfileName, req.Ref, req.Batch, raw, req.NotifyDingtalk)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			exec := guard(logger, func() (string, string, startByNameResult) {
-				return executeYoutubePublish(tctx, logger, req)
+				return executeYoutubePublish(tctx, logger, req, func() { setTaskState(taskID, taskStatusRunning) })
 			})
 			runAsyncPublish(tctx, logger, taskID, "youtube_publish", req.ProfileName, req.Ref, exec)
 			return
 		}
 
 		// 同步：原地执行并返回
-		status, info, res := executeYoutubePublish(context.Background(), logger, req)
+		status, info, res := executeYoutubePublish(context.Background(), logger, req, nil)
 		if status != "success" {
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return
@@ -2220,14 +2220,14 @@ func main() {
 			taskID, tctx := registerTask("tiktok_publish", req.ProfileName, req.Ref, req.Batch, raw, req.NotifyDingtalk)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			exec := guard(logger, func() (string, string, startByNameResult) {
-				return executeTiktokPublish(tctx, logger, req)
+				return executeTiktokPublish(tctx, logger, req, func() { setTaskState(taskID, taskStatusRunning) })
 			})
 			runAsyncPublish(tctx, logger, taskID, "tiktok_publish", req.ProfileName, req.Ref, exec)
 			return
 		}
 
 		// 同步：原地执行并返回
-		status, info, res := executeTiktokPublish(context.Background(), logger, req)
+		status, info, res := executeTiktokPublish(context.Background(), logger, req, nil)
 		if status != "success" {
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return
@@ -2285,14 +2285,14 @@ func main() {
 			taskID, tctx := registerTask("instagram_publish", req.ProfileName, req.Ref, req.Batch, raw, req.NotifyDingtalk)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			exec := guard(logger, func() (string, string, startByNameResult) {
-				return executeInstagramPublish(tctx, logger, req)
+				return executeInstagramPublish(tctx, logger, req, func() { setTaskState(taskID, taskStatusRunning) })
 			})
 			runAsyncPublish(tctx, logger, taskID, "instagram_publish", req.ProfileName, req.Ref, exec)
 			return
 		}
 
 		// 同步：原地执行并返回
-		status, info, res := executeInstagramPublish(context.Background(), logger, req)
+		status, info, res := executeInstagramPublish(context.Background(), logger, req, nil)
 		if status != "success" {
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return

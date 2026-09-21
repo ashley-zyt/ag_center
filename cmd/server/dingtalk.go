@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,24 +30,29 @@ var publishTypeLabels = map[string]string{
 	"instagram_publish": "Instagram",
 }
 
+// notifiedBatches 已发过汇总通知的批次，防止同一批多任务并发终态时重复发汇总。
+// 读写都在 taskRecordsMu 锁内进行，无需单独加锁。
+var notifiedBatches = make(map[string]bool)
+
 // sendDingtalkMarkdown 发送 markdown 消息到钉钉群。
-// keyword 非空时，若标题不含该关键词会自动补齐，满足钉钉「自定义关键词」安全设置。
+// keyword 非空时，若正文不含该关键词会自动补齐，满足钉钉「自定义关键词」安全设置。
+// text 直接透传 content，不再拼「## 标题」大字号，保持消息紧凑。
 func sendDingtalkMarkdown(logger *logx.Logger, webhook, keyword, title, content string) error {
 	webhook = strings.TrimSpace(webhook)
 	if webhook == "" {
 		return fmt.Errorf("webhook 为空")
 	}
 
-	safeTitle := title
-	if kw := strings.TrimSpace(keyword); kw != "" && !strings.Contains(safeTitle, kw) {
-		safeTitle = kw + "：" + safeTitle
+	safeText := content
+	if kw := strings.TrimSpace(keyword); kw != "" && !strings.Contains(safeText, kw) {
+		safeText = kw + "：" + safeText
 	}
 
 	body := map[string]any{
 		"msgtype": "markdown",
 		"markdown": map[string]any{
-			"title": safeTitle,
-			"text":  "## " + safeTitle + "\n\n" + content,
+			"title": title,
+			"text":  safeText,
 		},
 	}
 	payload, err := json.Marshal(body)
@@ -83,12 +89,14 @@ func sendDingtalkMarkdown(logger *logx.Logger, webhook, keyword, title, content 
 
 // notifyDingtalkResult 任务进入终态后，若该任务带了钉钉通知配置，则把结果异步推送到对应群。
 // 仅 success/failed 会走到这里（paused 分支在 finalizeAsyncTask 里已提前返回，不通知）。
-func notifyDingtalkResult(logger *logx.Logger, taskID, taskType, profileName, ref, status, info string) {
+func notifyDingtalkResult(logger *logx.Logger, taskID, taskType, profileName, status, info string) {
 	taskRecordsMu.Lock()
+	batch := ""
 	webhook := ""
 	keyword := ""
 	owner := ""
 	if rec, ok := taskRecords[taskID]; ok {
+		batch = rec.Batch
 		webhook = rec.DingtalkWebhook
 		keyword = rec.DingtalkKeyword
 		owner = rec.DingtalkOwner
@@ -99,6 +107,18 @@ func notifyDingtalkResult(logger *logx.Logger, taskID, taskType, profileName, re
 		return
 	}
 
+	// 带 batch = 同一批任务：等整批全部终态后汇总发一条，避免每个任务各发一条刷屏
+	if batch != "" {
+		maybeSendBatchSummary(logger, batch)
+		return
+	}
+
+	// 单任务：直接单发
+	sendSingleResult(logger, webhook, keyword, owner, taskType, profileName, taskID, status, info)
+}
+
+// sendSingleResult 发送单条任务结果（无 batch 时用）。
+func sendSingleResult(logger *logx.Logger, webhook, keyword, owner, taskType, profileName, taskID, status, info string) {
 	label := publishTypeLabels[taskType]
 	if label == "" {
 		label = strings.TrimSuffix(taskType, "_publish")
@@ -107,37 +127,156 @@ func notifyDingtalkResult(logger *logx.Logger, taskID, taskType, profileName, re
 	if status != "success" {
 		statusLabel = "失败"
 	}
-	title := fmt.Sprintf("[发布结果] %s发布 · %s", label, statusLabel)
+	title := fmt.Sprintf("发布结果 %s · %s", label, statusLabel)
 
-	// 正文：负责人 @ + 加粗；结果状态加粗，方便对应的人一眼看到
 	var b strings.Builder
+	b.WriteString("发布结果")
 	if owner != "" {
-		b.WriteString("@")
+		b.WriteString(" **@")
 		b.WriteString(owner)
-		b.WriteString("\n\n**负责人：")
-		b.WriteString(owner)
-		b.WriteString("**\n\n")
+		b.WriteString("**")
 	}
-	b.WriteString("- 任务：")
-	b.WriteString(taskID)
-	b.WriteString("\n- 浏览器：")
+	b.WriteString(" -- ")
 	b.WriteString(profileName)
-	b.WriteString("\n- 业务标识：")
-	b.WriteString(ref)
-	b.WriteString("\n- 结果：**")
+	b.WriteString("\n- ")
+	b.WriteString(label)
+	b.WriteString(": **")
 	b.WriteString(statusLabel)
-	b.WriteString("**\n- 详情：")
-	b.WriteString(info)
-	b.WriteString("\n- 时间：")
+	b.WriteString("**\n")
+	b.WriteString(taskID)
+	b.WriteString(" [")
 	b.WriteString(time.Now().Format("2006-01-02 15:04"))
+	b.WriteString("]")
+	if status != "success" {
+		b.WriteString("\n原因：")
+		b.WriteString(info)
+	}
 	content := b.String()
 
-	// 异步发送，不阻塞任务收尾
 	go func() {
 		if err := sendDingtalkMarkdown(logger, webhook, keyword, title, content); err != nil {
 			logger.Print("DINGTALK", "钉钉通知失败: "+err.Error())
 		} else {
 			logger.Print("DINGTALK", "钉钉通知已发送: "+taskID)
+		}
+	}()
+}
+
+// maybeSendBatchSummary 当某批任务全部进入终态时，汇总发一条钉钉（成功/失败统计 + 失败任务 ID 列表）。
+func maybeSendBatchSummary(logger *logx.Logger, batch string) {
+	taskRecordsMu.Lock()
+	if notifiedBatches[batch] {
+		taskRecordsMu.Unlock()
+		return
+	}
+
+	var recs []*TaskRecord
+	for _, rec := range taskRecords {
+		if rec.Batch == batch {
+			recs = append(recs, rec)
+		}
+	}
+	if len(recs) == 0 {
+		taskRecordsMu.Unlock()
+		return
+	}
+	allDone := true
+	for _, rec := range recs {
+		if rec.Status != taskStatusSuccess && rec.Status != taskStatusFailed &&
+			rec.Status != taskStatusPaused && rec.Status != taskStatusInterrupted {
+			allDone = false
+			break
+		}
+	}
+	if !allDone {
+		taskRecordsMu.Unlock()
+		return
+	}
+
+	notifiedBatches[batch] = true
+	webhook := recs[0].DingtalkWebhook
+	keyword := recs[0].DingtalkKeyword
+	owner := recs[0].DingtalkOwner
+
+	// 浏览器名（去重排序，通常同批同浏览器）
+	profileSet := make(map[string]struct{})
+	// 按平台聚合成功/失败，platformOrder 保持平台首次出现顺序
+	type platformAgg struct {
+		success int
+		failed  int
+	}
+	platformOrder := make([]string, 0)
+	agg := make(map[string]*platformAgg)
+	for _, rec := range recs {
+		if rec.ProfileName != "" {
+			profileSet[rec.ProfileName] = struct{}{}
+		}
+		label := publishTypeLabels[rec.Type]
+		if label == "" {
+			label = strings.TrimSuffix(rec.Type, "_publish")
+		}
+		a := agg[label]
+		if a == nil {
+			a = &platformAgg{}
+			agg[label] = a
+			platformOrder = append(platformOrder, label)
+		}
+		if rec.Status == taskStatusSuccess {
+			a.success++
+		} else {
+			a.failed++
+		}
+	}
+	profiles := make([]string, 0, len(profileSet))
+	for p := range profileSet {
+		profiles = append(profiles, p)
+	}
+	sort.Strings(profiles)
+	profileLabel := strings.Join(profiles, ",")
+	taskRecordsMu.Unlock()
+
+	title := "发布结果 批次汇总"
+	var b strings.Builder
+	b.WriteString("发布结果")
+	if owner != "" {
+		b.WriteString(" **@")
+		b.WriteString(owner)
+		b.WriteString("**")
+	}
+	b.WriteString(" -- ")
+	b.WriteString(profileLabel)
+	b.WriteString(" [**")
+	b.WriteString(batch)
+	b.WriteString("**]\n")
+	for i, label := range platformOrder {
+		if i == 0 {
+			b.WriteString("- ")
+		} else {
+			b.WriteString("；")
+		}
+		a := agg[label]
+		var status string
+		switch {
+		case a.failed == 0:
+			status = "**成功**"
+		case a.success == 0:
+			status = "**失败**"
+		default:
+			status = fmt.Sprintf("**成功 %d / 失败 %d**", a.success, a.failed)
+		}
+		b.WriteString(label)
+		b.WriteString(": ")
+		b.WriteString(status)
+	}
+	b.WriteString("\n")
+	b.WriteString(time.Now().Format("2006-01-02 15:04"))
+	content := b.String()
+
+	go func() {
+		if err := sendDingtalkMarkdown(logger, webhook, keyword, title, content); err != nil {
+			logger.Print("DINGTALK", "钉钉批次汇总通知失败: "+err.Error())
+		} else {
+			logger.Print("DINGTALK", "钉钉批次汇总已发送: batch="+batch)
 		}
 	}()
 }

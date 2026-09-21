@@ -143,12 +143,18 @@ type publishRunner func(pubCtx context.Context, logger *logx.Logger, res startBy
 
 // runPublish 通用发布流程：并发额度 → 执行超时 → profile 锁 → 下载视频 → 启动浏览器 → 平台发布。
 // 平台差异（发布函数、参数、停止时机、成功后 sleep）由 run 回调承担。
-func runPublish(ctx context.Context, logger *logx.Logger, job publishJob, run publishRunner) (string, string, startByNameResult) {
+func runPublish(ctx context.Context, logger *logx.Logger, job publishJob, run publishRunner, onStart func()) (string, string, startByNameResult) {
 	// 1. 获取全局并发额度（排队用无 deadline 的 ctx：排队等待不计入执行超时）
 	if err := acquireBrowserSlot(ctx); err != nil {
 		return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
 	}
 	defer releaseBrowserSlot()
+
+	// 拿到槽位、任务真正开始执行时才置 running；排队等待期间保持 queued，
+	// 这样重启后「排队中」的任务仍是 queued，能被 resumeQueuedPublishTasks 自动重放。
+	if onStart != nil {
+		onStart()
+	}
 
 	// 2. 拿到槽位后才起执行超时：publishTimeout 只覆盖下载/启动/发布/关闭，不含排队
 	pubCtx, cancelPub := context.WithTimeout(ctx, publishTimeout)
@@ -199,7 +205,7 @@ func stopProfileBestEffort(ctx context.Context, res startByNameResult) {
 
 // ===== 各平台发布执行函数 =====
 
-func executeFacebookPublish(ctx context.Context, logger *logx.Logger, req FacebookPublishRequest) (string, string, startByNameResult) {
+func executeFacebookPublish(ctx context.Context, logger *logx.Logger, req FacebookPublishRequest, onStart func()) (string, string, startByNameResult) {
 	return runPublish(ctx, logger, publishJob{
 		ProfileName: req.ProfileName, VideoOssURL: req.VideoOssURL, VideoPath: req.VideoPath,
 		Host: req.Host, Port: req.Port, WaitSeconds: req.WaitSeconds, UndetectablePath: req.UndetectablePath,
@@ -227,10 +233,10 @@ func executeFacebookPublish(ctx context.Context, logger *logx.Logger, req Facebo
 		}
 		stopProfile("publish success")
 		return "success", "publish_triggered"
-	})
+	}, onStart)
 }
 
-func executeTwitterPublish(ctx context.Context, logger *logx.Logger, req TwitterPublishRequest) (string, string, startByNameResult) {
+func executeTwitterPublish(ctx context.Context, logger *logx.Logger, req TwitterPublishRequest, onStart func()) (string, string, startByNameResult) {
 	return runPublish(ctx, logger, publishJob{
 		ProfileName: req.ProfileName, VideoOssURL: req.VideoOssURL, VideoPath: req.VideoPath,
 		Host: req.Host, Port: req.Port, WaitSeconds: req.WaitSeconds, UndetectablePath: req.UndetectablePath,
@@ -255,10 +261,10 @@ func executeTwitterPublish(ctx context.Context, logger *logx.Logger, req Twitter
 		}
 		stopProfileBestEffort(pubCtx, res)
 		return "success", "publish_triggered"
-	})
+	}, onStart)
 }
 
-func executeYoutubePublish(ctx context.Context, logger *logx.Logger, req YouTubePublishRequest) (string, string, startByNameResult) {
+func executeYoutubePublish(ctx context.Context, logger *logx.Logger, req YouTubePublishRequest, onStart func()) (string, string, startByNameResult) {
 	return runPublish(ctx, logger, publishJob{
 		ProfileName: req.ProfileName, VideoOssURL: req.VideoOssURL, VideoPath: req.VideoPath,
 		Host: req.Host, Port: req.Port, WaitSeconds: req.WaitSeconds, UndetectablePath: req.UndetectablePath,
@@ -284,10 +290,10 @@ func executeYoutubePublish(ctx context.Context, logger *logx.Logger, req YouTube
 		time.Sleep(8 * time.Second)
 		stopProfileBestEffort(pubCtx, res)
 		return "success", "publish_triggered"
-	})
+	}, onStart)
 }
 
-func executeTiktokPublish(ctx context.Context, logger *logx.Logger, req TikTokPublishRequest) (string, string, startByNameResult) {
+func executeTiktokPublish(ctx context.Context, logger *logx.Logger, req TikTokPublishRequest, onStart func()) (string, string, startByNameResult) {
 	return runPublish(ctx, logger, publishJob{
 		ProfileName: req.ProfileName, VideoOssURL: req.VideoOssURL, VideoPath: req.VideoPath,
 		Host: req.Host, Port: req.Port, WaitSeconds: req.WaitSeconds, UndetectablePath: req.UndetectablePath,
@@ -312,10 +318,10 @@ func executeTiktokPublish(ctx context.Context, logger *logx.Logger, req TikTokPu
 		time.Sleep(8 * time.Second)
 		stopProfileBestEffort(pubCtx, res)
 		return "success", "publish_triggered"
-	})
+	}, onStart)
 }
 
-func executeInstagramPublish(ctx context.Context, logger *logx.Logger, req InstagramPublishRequest) (string, string, startByNameResult) {
+func executeInstagramPublish(ctx context.Context, logger *logx.Logger, req InstagramPublishRequest, onStart func()) (string, string, startByNameResult) {
 	return runPublish(ctx, logger, publishJob{
 		ProfileName: req.ProfileName, VideoOssURL: req.VideoOssURL, VideoPath: req.VideoPath,
 		Host: req.Host, Port: req.Port, WaitSeconds: req.WaitSeconds, UndetectablePath: req.UndetectablePath,
@@ -340,15 +346,16 @@ func executeInstagramPublish(ctx context.Context, logger *logx.Logger, req Insta
 		}
 		stopProfileBestEffort(pubCtx, res)
 		return "success", "publish_triggered"
-	})
+	}, onStart)
 }
 
 // ===== 异步执行包装（handler 与重启重放共用）=====
 
-// runAsyncPublish 异步执行一个发布任务：置 running → 执行 → 统一收尾（finalizeAsyncTask）。
+// runAsyncPublish 异步执行一个发布任务：执行 → 统一收尾（finalizeAsyncTask）。
+// 状态置 running 的时机已下沉到执行链内部（runPublish 拿到并发槽位后经 onStart 回调触发），
+// 这样排队等待槽位的任务保持 queued，重启后能被 resumeQueuedPublishTasks 自动重放。
 func runAsyncPublish(ctx context.Context, logger *logx.Logger, taskID, taskType, profileName, ref string, exec func() (string, string, startByNameResult)) {
 	go func() {
-		setTaskState(taskID, taskStatusRunning)
 		status, info, _ := exec()
 		finalizeAsyncTask(logger, taskID, taskType, profileName, ref, status, info, nil)
 	}()
@@ -358,7 +365,7 @@ func runAsyncPublish(ctx context.Context, logger *logx.Logger, taskID, taskType,
 
 // buildPublishExecutor 根据任务类型与原始请求体 payload，构建可执行的发布闭包。
 // 返回 (exec, true) 表示解析成功；解析失败返回 (nil, false)。
-func buildPublishExecutor(ctx context.Context, taskType, payload string, logger *logx.Logger) (func() (string, string, startByNameResult), bool) {
+func buildPublishExecutor(ctx context.Context, taskType, payload string, logger *logx.Logger, onStart func()) (func() (string, string, startByNameResult), bool) {
 	switch taskType {
 	case "facebook_publish":
 		var req FacebookPublishRequest
@@ -366,7 +373,7 @@ func buildPublishExecutor(ctx context.Context, taskType, payload string, logger 
 			return nil, false
 		}
 		return guard(logger, func() (string, string, startByNameResult) {
-			return executeFacebookPublish(ctx, logger, req)
+			return executeFacebookPublish(ctx, logger, req, onStart)
 		}), true
 	case "twitter_publish":
 		var req TwitterPublishRequest
@@ -374,7 +381,7 @@ func buildPublishExecutor(ctx context.Context, taskType, payload string, logger 
 			return nil, false
 		}
 		return guard(logger, func() (string, string, startByNameResult) {
-			return executeTwitterPublish(ctx, logger, req)
+			return executeTwitterPublish(ctx, logger, req, onStart)
 		}), true
 	case "youtube_publish":
 		var req YouTubePublishRequest
@@ -382,7 +389,7 @@ func buildPublishExecutor(ctx context.Context, taskType, payload string, logger 
 			return nil, false
 		}
 		return guard(logger, func() (string, string, startByNameResult) {
-			return executeYoutubePublish(ctx, logger, req)
+			return executeYoutubePublish(ctx, logger, req, onStart)
 		}), true
 	case "tiktok_publish":
 		var req TikTokPublishRequest
@@ -390,7 +397,7 @@ func buildPublishExecutor(ctx context.Context, taskType, payload string, logger 
 			return nil, false
 		}
 		return guard(logger, func() (string, string, startByNameResult) {
-			return executeTiktokPublish(ctx, logger, req)
+			return executeTiktokPublish(ctx, logger, req, onStart)
 		}), true
 	case "instagram_publish":
 		var req InstagramPublishRequest
@@ -398,7 +405,7 @@ func buildPublishExecutor(ctx context.Context, taskType, payload string, logger 
 			return nil, false
 		}
 		return guard(logger, func() (string, string, startByNameResult) {
-			return executeInstagramPublish(ctx, logger, req)
+			return executeInstagramPublish(ctx, logger, req, onStart)
 		}), true
 	}
 	return nil, false
@@ -427,7 +434,9 @@ func resumeQueuedPublishTasks(logger *logx.Logger) {
 		taskCancels[rec.TaskID] = cancel
 		taskRecordsMu.Unlock()
 
-		exec, ok := buildPublishExecutor(ctx, rec.Type, rec.Payload, logger)
+		// taskID 单独拷贝，避免闭包捕获循环变量（go1.21 for-range 变量复用）
+		taskID := rec.TaskID
+		exec, ok := buildPublishExecutor(ctx, rec.Type, rec.Payload, logger, func() { setTaskState(taskID, taskStatusRunning) })
 		if !ok {
 			finishTask(rec.TaskID, taskStatusInterrupted, "服务重启中断（无法解析任务参数）")
 			logger.Print("RESUME", "重放失败（无法解析参数）: "+rec.TaskID)
@@ -458,7 +467,9 @@ func resumePausedPublishTasks(logger *logx.Logger) int {
 		taskCancels[rec.TaskID] = cancel
 		taskRecordsMu.Unlock()
 
-		exec, ok := buildPublishExecutor(ctx, rec.Type, rec.Payload, logger)
+		// taskID 单独拷贝，避免闭包捕获循环变量（go1.21 for-range 变量复用）
+		taskID := rec.TaskID
+		exec, ok := buildPublishExecutor(ctx, rec.Type, rec.Payload, logger, func() { setTaskState(taskID, taskStatusRunning) })
 		if !ok {
 			finishTask(rec.TaskID, taskStatusFailed, "恢复执行失败（无法解析任务参数）")
 			logger.Print("RESUME", "恢复失败（无法解析参数）: "+rec.TaskID)

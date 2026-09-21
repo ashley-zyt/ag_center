@@ -315,7 +315,7 @@ func finalizeAsyncTask(logger *logx.Logger, taskID, taskType, profileName, ref, 
 		Result:      result,
 	})
 	// 钉钉通知（仅人工/外部调用带配置的任务，best effort）
-	notifyDingtalkResult(logger, taskID, taskType, profileName, ref, status, info)
+	notifyDingtalkResult(logger, taskID, taskType, profileName, status, info)
 }
 
 // callbackTaskResult 任务完成后回调 account_sys 通知结果（Best Effort：失败仅打日志）。
@@ -358,10 +358,13 @@ func callbackTaskResult(ctx context.Context, logger *logx.Logger, payload TaskRe
 
 // notifyMachineRestarted 上报「本机进程已重启」。
 //
-// 背景：任务记录只存在内存里（taskRecords），进程一挂就全部丢失，重启后既没有恢复能力、
-// 也无法回答 account_sys 对旧 task_id 的查询（一律 404）。account_sys 侧的
-// TaskScheduler.check_timeout_tasks 虽然会用「查机器端 → 查不到就重置」兜底，
-// 但它的判定窗口是 45 分钟，导致重启后任务要拖很久才会被重置、再等平台分配窗口重跑。
+// 背景：任务记录已用 SQLite 持久化，重启后历史记录能恢复，但未完成任务会按规则改写：
+//
+//	running 与「非发布的 queued」会被标记 interrupted（进程已死、不可幂等续跑），
+//	只有排队中的发布任务（带 payload）会由 resumeQueuedPublishTasks 自动重放。
+//
+// 被标 interrupted 的任务在 account_sys 侧需要尽快重置重发，而 TaskScheduler.check_timeout_tasks
+// 的判定窗口是 45 分钟，会导致重启后这些任务拖很久才被重置、再等平台分配窗口重跑。
 // 启动时主动上报一次，可把这段延迟从 45 分钟降到近乎为零。
 //
 // MACHINE_IP 环境变量（可选）：告知 account_sys 只处理本机上的登记记录。
