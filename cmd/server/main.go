@@ -1331,7 +1331,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("fetch", req.ProfileName, req.Ref, req.Batch)
+			taskID, tctx := registerTask("fetch", req.ProfileName, req.Ref, req.Batch, "")
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -1557,7 +1557,7 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("send_message", req.ProfileName, req.Ref, req.Batch)
+			taskID, tctx := registerTask("send_message", req.ProfileName, req.Ref, req.Batch, "")
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -1713,7 +1713,7 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("check_reply", req.ProfileName, req.Ref, req.Batch)
+			taskID, tctx := registerTask("check_reply", req.ProfileName, req.Ref, req.Batch, "")
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -1750,6 +1750,10 @@ func main() {
 	// 先加载上次运行留下的任务记录（未跑完的任务会被标记为 interrupted），
 	// 这样重启后 /tasks 仍能查到历史进度，而不是一片空白。
 	loadTaskStore(logger)
+
+	// 重启后自动重放排队中的发布任务：把上次没轮到执行、且参数完整的发布任务重新入队，
+	// 让它们接着跑（一个账号发完继续下一个），不必等 account_sys 重新下发。
+	resumeQueuedPublishTasks(logger)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -1945,7 +1949,7 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("nurture", req.ProfileName, req.Ref, req.Batch)
+			taskID, tctx := registerTask("nurture", req.ProfileName, req.Ref, req.Batch, "")
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -2014,20 +2018,6 @@ func main() {
 		})
 	})
 
-	type FacebookPublishRequest struct {
-		ProfileName      string `json:"profile_name"`
-		Title            string `json:"title"`
-		VideoOssURL      string `json:"video_oss_url"`
-		VideoPath        string `json:"video_path"`
-		Host             string `json:"host"`
-		Port             int    `json:"port"`
-		WaitSeconds      int    `json:"wait_seconds"`
-		UndetectablePath string `json:"undetectable_path"`
-		Async            bool   `json:"async"`
-		Ref              string `json:"ref,omitempty"`
-		Batch            string `json:"batch,omitempty"`
-	}
-
 	type FacebookPublishResponse struct {
 		Type             string `json:"type"`
 		ProfileID        string `json:"profile_id"`
@@ -2067,111 +2057,19 @@ func main() {
 			return
 		}
 
-		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
-		// 返回 (status, info, res)：status 为 success/failed；res 为成功启动的浏览器信息（失败时零值）。
-		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
-		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
-		var taskCtx context.Context = context.Background()
-		execute := func() (string, string, startByNameResult) {
-			// 1. 获取全局并发额度（排队用无 deadline 的 taskCtx：排队等待不计入执行超时，
-			//    否则队列积压时后面的任务还没轮到就会报 context deadline exceeded）
-			if err := acquireBrowserSlot(taskCtx); err != nil {
-				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
-			}
-			defer releaseBrowserSlot()
-
-			// 2. 拿到槽位后才起执行超时：publishTimeout 只覆盖下载/启动/发布/关闭，不含排队
-			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
-			defer cancelPub()
-
-			// 2. 获取 Profile 操作锁
-			releaseLock := acquireProfileLock(req.ProfileName, logger)
-			defer releaseLock()
-
-			// 3. 下载视频
-			var absVideoPath string
-			if req.VideoOssURL != "" {
-				var err error
-				absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
-				if err != nil {
-					return "failed", err.Error(), startByNameResult{}
-				}
-			} else {
-				var err error
-				absVideoPath, err = filepath.Abs(req.VideoPath)
-				if err != nil {
-					return "failed", "invalid video_path: " + err.Error(), startByNameResult{}
-				}
-				if _, err := os.Stat(absVideoPath); err != nil {
-					return "failed", "video_path file not found", startByNameResult{}
-				}
-			}
-			defer os.Remove(absVideoPath)
-
-			// 4. 启动浏览器（带重试）
-			res, err := startProfileByNameWithRetry(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-			if err != nil {
-				logger.Print("E", err.Error())
-				return "failed", err.Error(), startByNameResult{}
-			}
-
-			var stopOnce sync.Once
-			stopProfile := func(reason string) {
-				stopOnce.Do(func() {
-					logger.Print("FB", "停止Profile: "+reason)
-					stopCtx, cancelStop := context.WithTimeout(context.Background(), 6*time.Second)
-					_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-					cancelStop()
-				})
-			}
-			logger.Print("FB", "开始Facebook发布流程")
-			pubErr := facebook.PublishVideo(pubCtx, logger, facebook.PublishRequest{
-				WebsocketURL:     res.Info.WebsocketLink,
-				Title:            req.Title,
-				VideoPath:        absVideoPath,
-				UndetectableHost: res.Host,
-				UndetectablePort: res.Port,
-				ProfileID:        res.ProfileID,
-			})
-			if pubErr != nil {
-				logger.Print("E", pubErr.Error())
-				stopProfile("publish error")
-				return "failed", pubErr.Error(), startByNameResult{}
-			}
-			stopProfile("publish success")
-			return "success", "publish_triggered", res
-		}
-
-		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
-		execute = guard(logger, execute)
-
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("facebook_publish", req.ProfileName, req.Ref, req.Batch)
-			taskCtx = tctx
+			taskID, tctx := registerTask("facebook_publish", req.ProfileName, req.Ref, req.Batch, raw)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
-			go func() {
-				setTaskState(taskID, taskStatusRunning)
-				status, info, _ := execute()
-				finalStatus := taskStatusSuccess
-				if status != "success" {
-					finalStatus = taskStatusFailed
-				}
-				finishTask(taskID, finalStatus, info)
-				callbackTaskResult(context.Background(), logger, TaskResultPayload{
-					TaskID:      taskID,
-					ProfileName: req.ProfileName,
-					TaskType:    "facebook_publish",
-					Ref:         req.Ref,
-					Status:      status,
-					Message:     info,
-				})
-			}()
+			exec := guard(logger, func() (string, string, startByNameResult) {
+				return executeFacebookPublish(tctx, logger, req)
+			})
+			runAsyncPublish(tctx, logger, taskID, "facebook_publish", req.ProfileName, req.Ref, exec)
 			return
 		}
 
 		// 同步：原地执行并返回
-		status, info, res := execute()
+		status, info, res := executeFacebookPublish(context.Background(), logger, req)
 		if status != "success" {
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return
@@ -2191,20 +2089,6 @@ func main() {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
 			return
-		}
-		type TwitterPublishRequest struct {
-			ProfileName      string `json:"profile_name"`
-			Text             string `json:"text"`
-			Title            string `json:"title"`
-			VideoOssURL      string `json:"video_oss_url"`
-			VideoPath        string `json:"video_path"`
-			Host             string `json:"host"`
-			Port             int    `json:"port"`
-			WaitSeconds      int    `json:"wait_seconds"`
-			UndetectablePath string `json:"undetectable_path"`
-			Async            bool   `json:"async"`
-			Ref              string `json:"ref,omitempty"`
-			Batch            string `json:"batch,omitempty"`
 		}
 		type TwitterPublishResponse struct {
 			Type             string `json:"type"`
@@ -2238,105 +2122,19 @@ func main() {
 			return
 		}
 
-		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
-		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
-		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
-		var taskCtx context.Context = context.Background()
-		execute := func() (string, string, startByNameResult) {
-			// 1. 获取全局并发额度（排队用无 deadline 的 taskCtx：排队等待不计入执行超时，
-			//    否则队列积压时后面的任务还没轮到就会报 context deadline exceeded）
-			if err := acquireBrowserSlot(taskCtx); err != nil {
-				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
-			}
-			defer releaseBrowserSlot()
-
-			// 2. 拿到槽位后才起执行超时：publishTimeout 只覆盖下载/启动/发布/关闭，不含排队
-			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
-			defer cancelPub()
-
-			releaseLock := acquireProfileLock(req.ProfileName, logger)
-			defer releaseLock()
-
-			var absVideoPath string
-			if req.VideoOssURL != "" {
-				var err error
-				absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
-				if err != nil {
-					return "failed", err.Error(), startByNameResult{}
-				}
-			} else {
-				var err error
-				absVideoPath, err = filepath.Abs(req.VideoPath)
-				if err != nil {
-					return "failed", "invalid video_path: " + err.Error(), startByNameResult{}
-				}
-				if _, err := os.Stat(absVideoPath); err != nil {
-					return "failed", "video_path file not found", startByNameResult{}
-				}
-			}
-			defer os.Remove(absVideoPath)
-
-			res, err := startProfileByNameWithRetry(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-			if err != nil {
-				logger.Print("E", err.Error())
-				return "failed", err.Error(), startByNameResult{}
-			}
-			logger.Print("TW", "开始Twitter发布流程")
-			textToUse := req.Text
-			if strings.TrimSpace(textToUse) == "" && strings.TrimSpace(req.Title) != "" {
-				textToUse = req.Title
-			}
-			pubErr := twitter.PublishVideo(pubCtx, logger, twitter.PublishRequest{
-				WebsocketURL:     res.Info.WebsocketLink,
-				Text:             textToUse,
-				VideoPath:        absVideoPath,
-				UndetectableHost: res.Host,
-				UndetectablePort: res.Port,
-				ProfileID:        res.ProfileID,
-			})
-			if pubErr != nil {
-				logger.Print("E", pubErr.Error())
-				stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
-				_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-				cancelStop()
-				return "failed", pubErr.Error(), startByNameResult{}
-			}
-			stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
-			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-			cancelStop()
-			return "success", "publish_triggered", res
-		}
-
-		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
-		execute = guard(logger, execute)
-
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("twitter_publish", req.ProfileName, req.Ref, req.Batch)
-			taskCtx = tctx
+			taskID, tctx := registerTask("twitter_publish", req.ProfileName, req.Ref, req.Batch, raw)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
-			go func() {
-				setTaskState(taskID, taskStatusRunning)
-				status, info, _ := execute()
-				finalStatus := taskStatusSuccess
-				if status != "success" {
-					finalStatus = taskStatusFailed
-				}
-				finishTask(taskID, finalStatus, info)
-				callbackTaskResult(context.Background(), logger, TaskResultPayload{
-					TaskID:      taskID,
-					ProfileName: req.ProfileName,
-					TaskType:    "twitter_publish",
-					Ref:         req.Ref,
-					Status:      status,
-					Message:     info,
-				})
-			}()
+			exec := guard(logger, func() (string, string, startByNameResult) {
+				return executeTwitterPublish(tctx, logger, req)
+			})
+			runAsyncPublish(tctx, logger, taskID, "twitter_publish", req.ProfileName, req.Ref, exec)
 			return
 		}
 
 		// 同步：原地执行并返回
-		status, info, res := execute()
+		status, info, res := executeTwitterPublish(context.Background(), logger, req)
 		if status != "success" {
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return
@@ -2355,21 +2153,6 @@ func main() {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
 			return
-		}
-		type YouTubePublishRequest struct {
-			ProfileName      string `json:"profile_name"`
-			Text             string `json:"text"`
-			Title            string `json:"title"`
-			Description      string `json:"description"`
-			VideoOssURL      string `json:"video_oss_url"`
-			VideoPath        string `json:"video_path"`
-			Host             string `json:"host"`
-			Port             int    `json:"port"`
-			WaitSeconds      int    `json:"wait_seconds"`
-			UndetectablePath string `json:"undetectable_path"`
-			Async            bool   `json:"async"`
-			Ref              string `json:"ref,omitempty"`
-			Batch            string `json:"batch,omitempty"`
 		}
 		type YouTubePublishResponse struct {
 			Type             string `json:"type"`
@@ -2403,104 +2186,19 @@ func main() {
 			return
 		}
 
-		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
-		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
-		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
-		var taskCtx context.Context = context.Background()
-		execute := func() (string, string, startByNameResult) {
-			// 1. 获取全局并发额度（排队用无 deadline 的 taskCtx：排队等待不计入执行超时，
-			//    否则队列积压时后面的任务还没轮到就会报 context deadline exceeded）
-			if err := acquireBrowserSlot(taskCtx); err != nil {
-				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
-			}
-			defer releaseBrowserSlot()
-
-			// 2. 拿到槽位后才起执行超时：publishTimeout 只覆盖下载/启动/发布/关闭，不含排队
-			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
-			defer cancelPub()
-
-			releaseLock := acquireProfileLock(req.ProfileName, logger)
-			defer releaseLock()
-
-			var absVideoPath string
-			if req.VideoOssURL != "" {
-				var err error
-				absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
-				if err != nil {
-					return "failed", err.Error(), startByNameResult{}
-				}
-			} else {
-				var err error
-				absVideoPath, err = filepath.Abs(req.VideoPath)
-				if err != nil {
-					return "failed", "invalid video_path: " + err.Error(), startByNameResult{}
-				}
-				if _, err := os.Stat(absVideoPath); err != nil {
-					return "failed", "video_path file not found", startByNameResult{}
-				}
-			}
-			defer os.Remove(absVideoPath)
-
-			res, err := startProfileByNameWithRetry(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-			if err != nil {
-				logger.Print("E", err.Error())
-				return "failed", err.Error(), startByNameResult{}
-			}
-			logger.Print("YT", "开始YouTube发布流程")
-			titleToUse := strings.TrimSpace(req.Title)
-			if titleToUse == "" && strings.TrimSpace(req.Text) != "" {
-				titleToUse = req.Text
-			}
-			pubErr := youtube.PublishVideo(pubCtx, logger, youtube.PublishRequest{
-				WebsocketURL:     res.Info.WebsocketLink,
-				Title:            titleToUse,
-				Description:      req.Description,
-				VideoPath:        absVideoPath,
-				UndetectableHost: res.Host,
-				UndetectablePort: res.Port,
-				ProfileID:        res.ProfileID,
-			})
-			if pubErr != nil {
-				logger.Print("E", pubErr.Error())
-				return "failed", pubErr.Error(), startByNameResult{}
-			}
-			time.Sleep(8 * time.Second)
-			stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
-			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-			cancelStop()
-			return "success", "publish_triggered", res
-		}
-
-		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
-		execute = guard(logger, execute)
-
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("youtube_publish", req.ProfileName, req.Ref, req.Batch)
-			taskCtx = tctx
+			taskID, tctx := registerTask("youtube_publish", req.ProfileName, req.Ref, req.Batch, raw)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
-			go func() {
-				setTaskState(taskID, taskStatusRunning)
-				status, info, _ := execute()
-				finalStatus := taskStatusSuccess
-				if status != "success" {
-					finalStatus = taskStatusFailed
-				}
-				finishTask(taskID, finalStatus, info)
-				callbackTaskResult(context.Background(), logger, TaskResultPayload{
-					TaskID:      taskID,
-					ProfileName: req.ProfileName,
-					TaskType:    "youtube_publish",
-					Ref:         req.Ref,
-					Status:      status,
-					Message:     info,
-				})
-			}()
+			exec := guard(logger, func() (string, string, startByNameResult) {
+				return executeYoutubePublish(tctx, logger, req)
+			})
+			runAsyncPublish(tctx, logger, taskID, "youtube_publish", req.ProfileName, req.Ref, exec)
 			return
 		}
 
 		// 同步：原地执行并返回
-		status, info, res := execute()
+		status, info, res := executeYoutubePublish(context.Background(), logger, req)
 		if status != "success" {
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return
@@ -2519,20 +2217,6 @@ func main() {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
 			return
-		}
-		type TikTokPublishRequest struct {
-			ProfileName      string `json:"profile_name"`
-			Text             string `json:"text"`
-			Title            string `json:"title"`
-			VideoOssURL      string `json:"video_oss_url"`
-			VideoPath        string `json:"video_path"`
-			Host             string `json:"host"`
-			Port             int    `json:"port"`
-			WaitSeconds      int    `json:"wait_seconds"`
-			UndetectablePath string `json:"undetectable_path"`
-			Async            bool   `json:"async"`
-			Ref              string `json:"ref,omitempty"`
-			Batch            string `json:"batch,omitempty"`
 		}
 		type TikTokPublishResponse struct {
 			Type             string `json:"type"`
@@ -2566,103 +2250,19 @@ func main() {
 			return
 		}
 
-		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
-		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
-		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
-		var taskCtx context.Context = context.Background()
-		execute := func() (string, string, startByNameResult) {
-			// 1. 获取全局并发额度（排队用无 deadline 的 taskCtx：排队等待不计入执行超时，
-			//    否则队列积压时后面的任务还没轮到就会报 context deadline exceeded）
-			if err := acquireBrowserSlot(taskCtx); err != nil {
-				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
-			}
-			defer releaseBrowserSlot()
-
-			// 2. 拿到槽位后才起执行超时：publishTimeout 只覆盖下载/启动/发布/关闭，不含排队
-			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
-			defer cancelPub()
-
-			releaseLock := acquireProfileLock(req.ProfileName, logger)
-			defer releaseLock()
-
-			var absVideoPath string
-			if req.VideoOssURL != "" {
-				var err error
-				absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
-				if err != nil {
-					return "failed", err.Error(), startByNameResult{}
-				}
-			} else {
-				var err error
-				absVideoPath, err = filepath.Abs(req.VideoPath)
-				if err != nil {
-					return "failed", "invalid video_path: " + err.Error(), startByNameResult{}
-				}
-				if _, err := os.Stat(absVideoPath); err != nil {
-					return "failed", "video_path file not found", startByNameResult{}
-				}
-			}
-			defer os.Remove(absVideoPath)
-
-			res, err := startProfileByNameWithRetry(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-			if err != nil {
-				logger.Print("E", err.Error())
-				return "failed", err.Error(), startByNameResult{}
-			}
-			logger.Print("TT", "开始TikTok发布流程")
-			textToUse := strings.TrimSpace(req.Text)
-			if textToUse == "" && strings.TrimSpace(req.Title) != "" {
-				textToUse = req.Title
-			}
-			pubErr := tiktok.PublishVideo(pubCtx, logger, tiktok.PublishRequest{
-				WebsocketURL:     res.Info.WebsocketLink,
-				Text:             textToUse,
-				VideoPath:        absVideoPath,
-				UndetectableHost: res.Host,
-				UndetectablePort: res.Port,
-				ProfileID:        res.ProfileID,
-			})
-			if pubErr != nil {
-				logger.Print("E", pubErr.Error())
-				return "failed", pubErr.Error(), startByNameResult{}
-			}
-			time.Sleep(8 * time.Second)
-			stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
-			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-			cancelStop()
-			return "success", "publish_triggered", res
-		}
-
-		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
-		execute = guard(logger, execute)
-
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("tiktok_publish", req.ProfileName, req.Ref, req.Batch)
-			taskCtx = tctx
+			taskID, tctx := registerTask("tiktok_publish", req.ProfileName, req.Ref, req.Batch, raw)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
-			go func() {
-				setTaskState(taskID, taskStatusRunning)
-				status, info, _ := execute()
-				finalStatus := taskStatusSuccess
-				if status != "success" {
-					finalStatus = taskStatusFailed
-				}
-				finishTask(taskID, finalStatus, info)
-				callbackTaskResult(context.Background(), logger, TaskResultPayload{
-					TaskID:      taskID,
-					ProfileName: req.ProfileName,
-					TaskType:    "tiktok_publish",
-					Ref:         req.Ref,
-					Status:      status,
-					Message:     info,
-				})
-			}()
+			exec := guard(logger, func() (string, string, startByNameResult) {
+				return executeTiktokPublish(tctx, logger, req)
+			})
+			runAsyncPublish(tctx, logger, taskID, "tiktok_publish", req.ProfileName, req.Ref, exec)
 			return
 		}
 
 		// 同步：原地执行并返回
-		status, info, res := execute()
+		status, info, res := executeTiktokPublish(context.Background(), logger, req)
 		if status != "success" {
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return
@@ -2682,20 +2282,6 @@ func main() {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
 			return
-		}
-		type InstagramPublishRequest struct {
-			ProfileName      string `json:"profile_name"`
-			Text             string `json:"text"`
-			Title            string `json:"title"`
-			VideoOssURL      string `json:"video_oss_url"`
-			VideoPath        string `json:"video_path"`
-			Host             string `json:"host"`
-			Port             int    `json:"port"`
-			WaitSeconds      int    `json:"wait_seconds"`
-			UndetectablePath string `json:"undetectable_path"`
-			Async            bool   `json:"async"`
-			Ref              string `json:"ref,omitempty"`
-			Batch            string `json:"batch,omitempty"`
 		}
 		type InstagramPublishResponse struct {
 			Type             string `json:"type"`
@@ -2729,105 +2315,19 @@ func main() {
 			return
 		}
 
-		// execute 执行完整发布流程：并发额度 → profile锁 → 下载视频 → 启动(带重试) → 发布 → 关闭释放。
-		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
-		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
-		var taskCtx context.Context = context.Background()
-		execute := func() (string, string, startByNameResult) {
-			// 1. 获取全局并发额度（排队用无 deadline 的 taskCtx：排队等待不计入执行超时，
-			//    否则队列积压时后面的任务还没轮到就会报 context deadline exceeded）
-			if err := acquireBrowserSlot(taskCtx); err != nil {
-				return "failed", "获取并发额度失败: " + err.Error(), startByNameResult{}
-			}
-			defer releaseBrowserSlot()
-
-			// 2. 拿到槽位后才起执行超时：publishTimeout 只覆盖下载/启动/发布/关闭，不含排队
-			pubCtx, cancelPub := context.WithTimeout(taskCtx, publishTimeout)
-			defer cancelPub()
-
-			releaseLock := acquireProfileLock(req.ProfileName, logger)
-			defer releaseLock()
-
-			var absVideoPath string
-			if req.VideoOssURL != "" {
-				var err error
-				absVideoPath, err = downloadVideoFromOss(pubCtx, logger, req.VideoOssURL)
-				if err != nil {
-					return "failed", err.Error(), startByNameResult{}
-				}
-			} else {
-				var err error
-				absVideoPath, err = filepath.Abs(req.VideoPath)
-				if err != nil {
-					return "failed", "invalid video_path: " + err.Error(), startByNameResult{}
-				}
-				if _, err := os.Stat(absVideoPath); err != nil {
-					return "failed", "video_path file not found", startByNameResult{}
-				}
-			}
-			defer os.Remove(absVideoPath)
-
-			res, err := startProfileByNameWithRetry(pubCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-			if err != nil {
-				logger.Print("E", err.Error())
-				return "failed", err.Error(), startByNameResult{}
-			}
-			logger.Print("IG", "开始Instagram发布流程")
-			textToUse := req.Text
-			if strings.TrimSpace(textToUse) == "" && strings.TrimSpace(req.Title) != "" {
-				textToUse = req.Title
-			}
-			pubErr := instagram.PublishVideo(pubCtx, logger, instagram.PublishRequest{
-				WebsocketURL:     res.Info.WebsocketLink,
-				Text:             textToUse,
-				VideoPath:        absVideoPath,
-				UndetectableHost: res.Host,
-				UndetectablePort: res.Port,
-				ProfileID:        res.ProfileID,
-			})
-			if pubErr != nil {
-				logger.Print("E", pubErr.Error())
-				stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
-				_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-				cancelStop()
-				return "failed", pubErr.Error(), startByNameResult{}
-			}
-			stopCtx, cancelStop := context.WithTimeout(pubCtx, 6*time.Second)
-			_ = undetectable.NewClient(res.Host, res.Port).StopProfileBestEffort(stopCtx, res.ProfileID)
-			cancelStop()
-			return "success", "publish_triggered", res
-		}
-
-		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
-		execute = guard(logger, execute)
-
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("instagram_publish", req.ProfileName, req.Ref, req.Batch)
-			taskCtx = tctx
+			taskID, tctx := registerTask("instagram_publish", req.ProfileName, req.Ref, req.Batch, raw)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
-			go func() {
-				setTaskState(taskID, taskStatusRunning)
-				status, info, _ := execute()
-				finalStatus := taskStatusSuccess
-				if status != "success" {
-					finalStatus = taskStatusFailed
-				}
-				finishTask(taskID, finalStatus, info)
-				callbackTaskResult(context.Background(), logger, TaskResultPayload{
-					TaskID:      taskID,
-					ProfileName: req.ProfileName,
-					TaskType:    "instagram_publish",
-					Ref:         req.Ref,
-					Status:      status,
-					Message:     info,
-				})
-			}()
+			exec := guard(logger, func() (string, string, startByNameResult) {
+				return executeInstagramPublish(tctx, logger, req)
+			})
+			runAsyncPublish(tctx, logger, taskID, "instagram_publish", req.ProfileName, req.Ref, exec)
 			return
 		}
 
 		// 同步：原地执行并返回
-		status, info, res := execute()
+		status, info, res := executeInstagramPublish(context.Background(), logger, req)
 		if status != "success" {
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return

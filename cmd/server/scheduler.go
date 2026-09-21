@@ -73,13 +73,14 @@ const (
 )
 
 // TaskRecord 单个任务的运行记录，用于查询进度。
-// 常驻内存，并通过 task_store.go 落成本地 JSON 快照，服务重启后仍可查询。
+// 常驻内存，并通过 task_store.go 落成本地 SQLite 数据库，服务重启后仍可查询。
 type TaskRecord struct {
 	TaskID      string    `json:"task_id"`
 	Type        string    `json:"type"`
 	ProfileName string    `json:"profile_name,omitempty"`
 	Ref         string    `json:"ref,omitempty"`
-	Batch       string    `json:"batch,omitempty"` // 批次标识，由调用方提交时指定（透传），用于对账「哪一批」
+	Batch       string    `json:"batch,omitempty"`   // 批次标识，由调用方提交时指定（透传），用于对账「哪一批」
+	Payload     string    `json:"payload,omitempty"` // 原始请求体 JSON，供服务重启后重放 queued 的发布任务
 	Status      string    `json:"status"`
 	Message     string    `json:"message,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -100,7 +101,8 @@ func newTaskID() string {
 //
 // batch 为调用方指定的批次标识（可空）。同一批下发的任务带上同一个 batch，之后就能用
 // GET /tasks?batch=xxx 或 /tasks/summary 的 batches 聚合，精确回答"这批跑完没有"。
-func registerTask(taskType, profileName, ref, batch string) (string, context.Context) {
+// payload 为原始请求体 JSON（可空），供服务重启后重放 queued 的发布任务（其余类型暂不重放）。
+func registerTask(taskType, profileName, ref, batch, payload string) (string, context.Context) {
 	taskID := newTaskID()
 	ctx, cancel := context.WithCancel(context.Background())
 	now := time.Now()
@@ -111,6 +113,7 @@ func registerTask(taskType, profileName, ref, batch string) (string, context.Con
 		ProfileName: profileName,
 		Ref:         ref,
 		Batch:       strings.TrimSpace(batch),
+		Payload:     payload,
 		Status:      taskStatusQueued,
 		CreatedAt:   now,
 		UpdatedAt:   now,

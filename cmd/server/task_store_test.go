@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -38,24 +36,16 @@ func isolateTaskStore(t *testing.T) {
 	t.Helper()
 
 	oldEnabled, oldDir, oldPath := taskStoreEnabled, taskStoreDir, taskStorePath
-	oldArchiveDir, oldBackupDir := taskArchiveDir, taskBackupDir
-	oldRetention, oldArchive, oldBackup, oldMax := taskRetentionDays, taskArchiveDays, taskBackupKeep, taskMaxRecords
+	oldRetention, oldMax := taskRetentionDays, taskMaxRecords
 	oldRecords, oldCancels := taskRecords, taskCancels
 	oldCleared := clearedTasks
-	oldSig := archiveSignature
-	oldLastBackup := lastBackupAt
+	oldDB := taskStoreDB
 
 	taskStoreEnabled = true
 	taskStoreDir = t.TempDir()
 	taskStorePath = filepath.Join(taskStoreDir, taskStoreFileName)
-	taskArchiveDir = filepath.Join(taskStoreDir, "archive")
-	taskBackupDir = filepath.Join(taskStoreDir, "backups")
 	taskRetentionDays = 30
-	taskArchiveDays = 7
-	taskBackupKeep = 5
 	taskMaxRecords = 0
-	archiveSignature = ""
-	lastBackupAt = time.Time{}
 
 	taskRecordsMu.Lock()
 	taskRecords = make(map[string]*TaskRecord)
@@ -63,14 +53,22 @@ func isolateTaskStore(t *testing.T) {
 	clearedTasks = make(map[string]bool)
 	taskRecordsMu.Unlock()
 
+	taskStoreDBMu.Lock()
+	taskStoreDB = nil
+	taskStoreDBMu.Unlock()
+
 	atomic.StoreInt32(&taskStoreDirty, 0)
 
 	t.Cleanup(func() {
+		taskStoreDBMu.Lock()
+		if taskStoreDB != nil {
+			_ = taskStoreDB.Close()
+		}
+		taskStoreDB = oldDB
+		taskStoreDBMu.Unlock()
+
 		taskStoreEnabled, taskStoreDir, taskStorePath = oldEnabled, oldDir, oldPath
-		taskArchiveDir, taskBackupDir = oldArchiveDir, oldBackupDir
-		taskRetentionDays, taskArchiveDays, taskBackupKeep, taskMaxRecords = oldRetention, oldArchive, oldBackup, oldMax
-		archiveSignature = oldSig
-		lastBackupAt = oldLastBackup
+		taskRetentionDays, taskMaxRecords = oldRetention, oldMax
 
 		taskRecordsMu.Lock()
 		taskRecords, taskCancels, clearedTasks = oldRecords, oldCancels, oldCleared
@@ -107,11 +105,12 @@ func TestTaskStoreRoundTrip(t *testing.T) {
 			CreatedAt: now.Add(-10 * time.Minute), UpdatedAt: now.Add(-10 * time.Minute)},
 	)
 
+	loadTaskStore(logger)
 	if err := saveTaskStore(); err != nil {
 		t.Fatalf("saveTaskStore 失败: %v", err)
 	}
 	if _, err := os.Stat(taskStorePath); err != nil {
-		t.Fatalf("快照文件未生成: %v", err)
+		t.Fatalf("数据库文件未生成: %v", err)
 	}
 
 	// 模拟重启：清空内存后重新加载
@@ -145,34 +144,34 @@ func TestTaskStoreRoundTrip(t *testing.T) {
 	}
 }
 
-// TestTaskStoreFirstBootWritesSnapshot 首次启动（无历史文件）也应安排落盘，生成空快照。
+// TestTaskStoreFirstBootWritesSnapshot 首次启动（无历史文件）也应安排落盘，生成空数据库。
 func TestTaskStoreFirstBootWritesSnapshot(t *testing.T) {
 	isolateTaskStore(t)
 	logger := newTestLogger(t)
 
 	if _, err := os.Stat(taskStorePath); !os.IsNotExist(err) {
-		t.Fatalf("测试前置条件错误，快照文件不应存在: %v", err)
+		t.Fatalf("测试前置条件错误，数据库文件不应存在: %v", err)
 	}
 
 	loadTaskStore(logger)
 
 	if atomic.LoadInt32(&taskStoreDirty) != 1 {
-		t.Fatal("首次加载后应置脏标记，等待写出空快照")
+		t.Fatal("首次加载后应置脏标记，等待写出空库")
 	}
 	if err := saveTaskStore(); err != nil {
 		t.Fatalf("saveTaskStore: %v", err)
 	}
 	if _, err := os.Stat(taskStorePath); err != nil {
-		t.Fatalf("首次启动应生成快照文件: %v", err)
+		t.Fatalf("首次启动应生成数据库文件: %v", err)
 	}
 
-	// 空快照应能再次正常加载，不产生多余记录
+	// 空库应能再次正常加载，不产生多余记录
 	loadTaskStore(logger)
 	taskRecordsMu.Lock()
 	n := len(taskRecords)
 	taskRecordsMu.Unlock()
 	if n != 0 {
-		t.Fatalf("空快照不应加载出记录，实际 %d 条", n)
+		t.Fatalf("空库不应加载出记录，实际 %d 条", n)
 	}
 }
 
@@ -182,23 +181,21 @@ func TestTaskStoreDropsExpired(t *testing.T) {
 	logger := newTestLogger(t)
 	taskRetentionDays = 30
 
-	payload := taskStoreFile{
-		Schema:  taskStoreSchema,
-		SavedAt: time.Now(),
-		Tasks: []*TaskRecord{
-			{TaskID: "old", Type: "fetch", Status: taskStatusSuccess,
-				CreatedAt: time.Now().AddDate(0, 0, -40), UpdatedAt: time.Now().AddDate(0, 0, -40)},
-			{TaskID: "fresh", Type: "fetch", Status: taskStatusSuccess,
-				CreatedAt: time.Now().Add(-2 * time.Hour), UpdatedAt: time.Now().Add(-2 * time.Hour)},
-		},
-	}
-	data, err := json.Marshal(&payload)
+	// 直接往数据库里塞一条超期记录和一条新鲜记录，绕过 saveTaskStore 的过滤
+	db, err := openTaskStoreDB()
 	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		t.Fatalf("openTaskStoreDB: %v", err)
 	}
-	if err := os.WriteFile(taskStorePath, data, 0o644); err != nil {
-		t.Fatalf("write snapshot: %v", err)
+	insert := func(id string, ms int64) {
+		_, err := db.Exec(`INSERT INTO tasks (task_id, type, profile_name, ref, status, message, created_at, updated_at)
+			VALUES (?, 'fetch', '', '', 'success', '', ?, ?)`, id, ms, ms)
+		if err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
 	}
+	insert("old", time.Now().AddDate(0, 0, -40).UnixMilli())
+	insert("fresh", time.Now().Add(-2*time.Hour).UnixMilli())
+	_ = db.Close()
 
 	loadTaskStore(logger)
 
@@ -219,7 +216,7 @@ func TestTaskStoreRetentionZeroKeepsAll(t *testing.T) {
 	putRecords(&TaskRecord{TaskID: "ancient", Type: "fetch", Status: taskStatusSuccess,
 		CreatedAt: time.Now().AddDate(-1, 0, 0), UpdatedAt: time.Now().AddDate(-1, 0, 0)})
 
-	loadTaskStore(logger) // 空文件路径 → 直接返回
+	loadTaskStore(logger)
 	if err := saveTaskStore(); err != nil {
 		t.Fatalf("saveTaskStore: %v", err)
 	}
@@ -231,26 +228,6 @@ func TestTaskStoreRetentionZeroKeepsAll(t *testing.T) {
 
 	if getTaskRecord("ancient") == nil {
 		t.Fatal("保留天数为 0 时应永久保留")
-	}
-}
-
-// TestTaskStoreCorruptFileIsQuarantined 损坏的快照应被备份而不是让服务起不来。
-func TestTaskStoreCorruptFileIsQuarantined(t *testing.T) {
-	isolateTaskStore(t)
-	logger := newTestLogger(t)
-
-	if err := os.WriteFile(taskStorePath, []byte("{not-json"), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	loadTaskStore(logger)
-
-	if _, err := os.Stat(taskStorePath); !os.IsNotExist(err) {
-		t.Fatalf("损坏文件应被移走，实际 stat err=%v", err)
-	}
-	matches, _ := filepath.Glob(taskStorePath + ".corrupt.*")
-	if len(matches) == 0 {
-		t.Fatal("未生成损坏文件的备份")
 	}
 }
 
@@ -304,134 +281,6 @@ func TestPruneTaskRecordsClearsMemory(t *testing.T) {
 	}
 	if atomic.LoadInt32(&taskStoreDirty) != 1 {
 		t.Fatal("清理后应置脏标记等待落盘")
-	}
-}
-
-// TestTaskStoreArchiveSplitsOldTerminal 老终态记录应进入归档文件、离开主快照，重启后仍能恢复。
-func TestTaskStoreArchiveSplitsOldTerminal(t *testing.T) {
-	isolateTaskStore(t)
-	logger := newTestLogger(t)
-	taskArchiveDays = 7
-	now := time.Now()
-
-	putRecords(
-		&TaskRecord{TaskID: "t-old", Type: "facebook_publish", Status: taskStatusSuccess,
-			CreatedAt: now.AddDate(0, 0, -10), UpdatedAt: now.AddDate(0, 0, -9)},
-		&TaskRecord{TaskID: "t-new", Type: "facebook_publish", Status: taskStatusSuccess,
-			CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now.Add(-30 * time.Minute)},
-	)
-
-	if err := saveTaskStore(); err != nil {
-		t.Fatalf("saveTaskStore: %v", err)
-	}
-
-	// 主快照应只含 t-new
-	raw, err := os.ReadFile(taskStorePath)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	var f taskStoreFile
-	if err := json.Unmarshal(raw, &f); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(f.Tasks) != 1 || f.Tasks[0].TaskID != "t-new" {
-		t.Fatalf("主快照应只含 t-new，实际 %d 条", len(f.Tasks))
-	}
-
-	// 归档文件应含 t-old
-	month := archiveMonth(now.AddDate(0, 0, -9))
-	araw, err := os.ReadFile(archiveFilePath(month))
-	if err != nil {
-		t.Fatalf("读归档文件失败: %v", err)
-	}
-	var af taskStoreFile
-	if err := json.Unmarshal(araw, &af); err != nil {
-		t.Fatalf("unmarshal archive: %v", err)
-	}
-	found := false
-	for _, rec := range af.Tasks {
-		if rec.TaskID == "t-old" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("t-old 未进入归档文件")
-	}
-
-	// 重启后两条都应恢复
-	taskRecordsMu.Lock()
-	taskRecords = make(map[string]*TaskRecord)
-	taskRecordsMu.Unlock()
-	loadTaskStore(logger)
-	if getTaskRecord("t-old") == nil {
-		t.Fatal("重启后归档中的 t-old 未恢复")
-	}
-	if getTaskRecord("t-new") == nil {
-		t.Fatal("重启后主快照中的 t-new 未恢复")
-	}
-}
-
-// TestTaskStoreChecksumDetectsTamper 主快照被篡改后，加载应检测到校验和失配并隔离。
-func TestTaskStoreChecksumDetectsTamper(t *testing.T) {
-	isolateTaskStore(t)
-	logger := newTestLogger(t)
-
-	putRecords(&TaskRecord{TaskID: "t1", Type: "fetch", Status: taskStatusSuccess,
-		CreatedAt: time.Now().Add(-time.Hour), UpdatedAt: time.Now().Add(-time.Hour)})
-	if err := saveTaskStore(); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-
-	// 篡改主快照内容（把 task_id 里的 t1 改成 t2，破坏校验和）
-	raw, _ := os.ReadFile(taskStorePath)
-	tampered := append([]byte{}, raw...)
-	if i := bytes.Index(tampered, []byte("t1")); i >= 0 {
-		tampered[i+1] = '2'
-	}
-	if err := os.WriteFile(taskStorePath, tampered, 0o644); err != nil {
-		t.Fatalf("write tampered: %v", err)
-	}
-
-	loadTaskStore(logger)
-
-	// 被篡改的文件应被隔离（rename 成 .corrupt）
-	if _, err := os.Stat(taskStorePath); !os.IsNotExist(err) {
-		t.Fatalf("被篡改的文件应被隔离，实际 stat err=%v", err)
-	}
-	matches, _ := filepath.Glob(taskStorePath + ".corrupt.*")
-	if len(matches) == 0 {
-		t.Fatal("未生成被篡改文件的隔离备份")
-	}
-}
-
-// TestTaskStoreBackupRestores 主快照损坏但存在滚动备份时，加载应从备份恢复。
-func TestTaskStoreBackupRestores(t *testing.T) {
-	isolateTaskStore(t)
-	logger := newTestLogger(t)
-	taskBackupKeep = 3
-
-	putRecords(&TaskRecord{TaskID: "t1", Type: "fetch", Status: taskStatusSuccess,
-		CreatedAt: time.Now().Add(-time.Hour), UpdatedAt: time.Now().Add(-time.Hour)})
-	if err := saveTaskStore(); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-
-	// 做一次滚动备份（isolateTaskStore 已把 lastBackupAt 归零，首次调用会执行）
-	rotateBackup(logger)
-
-	// 破坏主快照
-	if err := os.WriteFile(taskStorePath, []byte("{broken"), 0o644); err != nil {
-		t.Fatalf("write broken: %v", err)
-	}
-
-	loadTaskStore(logger)
-
-	// 应从备份恢复，t1 还在，主快照文件也应恢复为合法内容
-	if getTaskRecord("t1") == nil {
-		t.Fatal("损坏后未从备份恢复")
-	}
-	if _, err := os.Stat(taskStorePath); err != nil {
-		t.Fatalf("主快照未恢复: %v", err)
 	}
 }
 
