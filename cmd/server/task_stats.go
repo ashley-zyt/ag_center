@@ -130,10 +130,25 @@ func (f taskFilter) match(rec *TaskRecord) bool {
 
 // ===== 计数 =====
 
+// 任务来源标记：用于在统计里区分「account_sys 下发」和「人工/外部直接调 API」。
+const (
+	sourceAccountSys = "account_sys" // account_sys 下发（不带钉钉通知）
+	sourceManual     = "manual"      // 人工/外部直接调 API（带 notify_dingtalk）
+)
+
+// taskSource 判定任务来源：带钉钉通知配置（notify_dingtalk.webhook 非空）即视为人工/外部调用。
+func taskSource(rec *TaskRecord) string {
+	if rec.DingtalkWebhook != "" {
+		return sourceManual
+	}
+	return sourceAccountSys
+}
+
 // taskCounters 任务计数容器。
 type taskCounters struct {
 	Total            int
 	StatusCounts     map[string]int            // 各状态数量
+	SourceCounts     map[string]int            // 来源数量（account_sys / manual）
 	TypeCounts       map[string]int            // 各类型数量
 	TypeStatusCounts map[string]map[string]int // 类型 × 状态 交叉（进度与堆积的核心视图）
 	ProfileCounts    map[string]map[string]int // profile_name × 状态（堆积落在哪个浏览器）
@@ -154,6 +169,10 @@ func newTaskCounters() *taskCounters {
 			taskStatusInterrupted: 0,
 			taskStatusPaused:      0,
 		},
+		SourceCounts: map[string]int{
+			sourceAccountSys: 0,
+			sourceManual:     0,
+		},
 		TypeCounts:       make(map[string]int),
 		TypeStatusCounts: make(map[string]map[string]int),
 		ProfileCounts:    make(map[string]map[string]int),
@@ -166,6 +185,7 @@ func newTaskCounters() *taskCounters {
 func (c *taskCounters) add(rec *TaskRecord) {
 	c.Total++
 	c.StatusCounts[rec.Status]++
+	c.SourceCounts[taskSource(rec)]++
 	c.TypeCounts[rec.Type]++
 
 	if c.TypeStatusCounts[rec.Type] == nil {
@@ -347,6 +367,7 @@ func handleTaskSummary(logger *logx.Logger) http.HandlerFunc {
 			"total":              all.Total, // 本机累计接收的任务总数（内存口径）
 			"matched":            matched.Total,
 			"status_counts":      matched.StatusCounts,
+			"source_counts":      matched.SourceCounts,
 			"type_counts":        matched.TypeCounts,
 			"type_status_counts": matched.TypeStatusCounts,
 			"profiles":           matched.profileStats(),

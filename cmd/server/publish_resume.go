@@ -36,79 +36,92 @@ import (
 
 // ===== 各平台发布请求结构体（从 handler 内提为包级，供重放解析 payload 使用）=====
 
+// DingtalkNotify 任务完成后的钉钉通知配置（可选）。
+// 请求里带它 = 人工/外部调用（区别于 account_sys 下发），任务完成后把结果推送到对应钉钉群。
+type DingtalkNotify struct {
+	Webhook string `json:"webhook"`           // 钉钉机器人 webhook 完整地址
+	Keyword string `json:"keyword,omitempty"` // 机器人「自定义关键词」，消息不含时自动补齐（可选）
+	Owner   string `json:"owner,omitempty"`   // 负责人名：消息里加粗显示并 @，方便对应的人直接看到（可选）
+}
+
 type FacebookPublishRequest struct {
-	ProfileName      string `json:"profile_name"`
-	Title            string `json:"title"`
-	VideoOssURL      string `json:"video_oss_url"`
-	VideoPath        string `json:"video_path"`
-	Host             string `json:"host"`
-	Port             int    `json:"port"`
-	WaitSeconds      int    `json:"wait_seconds"`
-	UndetectablePath string `json:"undetectable_path"`
-	Async            bool   `json:"async"`
-	Ref              string `json:"ref,omitempty"`
-	Batch            string `json:"batch,omitempty"`
+	ProfileName      string          `json:"profile_name"`
+	Title            string          `json:"title"`
+	VideoOssURL      string          `json:"video_oss_url"`
+	VideoPath        string          `json:"video_path"`
+	Host             string          `json:"host"`
+	Port             int             `json:"port"`
+	WaitSeconds      int             `json:"wait_seconds"`
+	UndetectablePath string          `json:"undetectable_path"`
+	Async            bool            `json:"async"`
+	Ref              string          `json:"ref,omitempty"`
+	Batch            string          `json:"batch,omitempty"`
+	NotifyDingtalk   *DingtalkNotify `json:"notify_dingtalk,omitempty"`
 }
 
 type TwitterPublishRequest struct {
-	ProfileName      string `json:"profile_name"`
-	Text             string `json:"text"`
-	Title            string `json:"title"`
-	VideoOssURL      string `json:"video_oss_url"`
-	VideoPath        string `json:"video_path"`
-	Host             string `json:"host"`
-	Port             int    `json:"port"`
-	WaitSeconds      int    `json:"wait_seconds"`
-	UndetectablePath string `json:"undetectable_path"`
-	Async            bool   `json:"async"`
-	Ref              string `json:"ref,omitempty"`
-	Batch            string `json:"batch,omitempty"`
+	ProfileName      string          `json:"profile_name"`
+	Text             string          `json:"text"`
+	Title            string          `json:"title"`
+	VideoOssURL      string          `json:"video_oss_url"`
+	VideoPath        string          `json:"video_path"`
+	Host             string          `json:"host"`
+	Port             int             `json:"port"`
+	WaitSeconds      int             `json:"wait_seconds"`
+	UndetectablePath string          `json:"undetectable_path"`
+	Async            bool            `json:"async"`
+	Ref              string          `json:"ref,omitempty"`
+	Batch            string          `json:"batch,omitempty"`
+	NotifyDingtalk   *DingtalkNotify `json:"notify_dingtalk,omitempty"`
 }
 
 type YouTubePublishRequest struct {
-	ProfileName      string `json:"profile_name"`
-	Text             string `json:"text"`
-	Title            string `json:"title"`
-	Description      string `json:"description"`
-	VideoOssURL      string `json:"video_oss_url"`
-	VideoPath        string `json:"video_path"`
-	Host             string `json:"host"`
-	Port             int    `json:"port"`
-	WaitSeconds      int    `json:"wait_seconds"`
-	UndetectablePath string `json:"undetectable_path"`
-	Async            bool   `json:"async"`
-	Ref              string `json:"ref,omitempty"`
-	Batch            string `json:"batch,omitempty"`
+	ProfileName      string          `json:"profile_name"`
+	Text             string          `json:"text"`
+	Title            string          `json:"title"`
+	Description      string          `json:"description"`
+	VideoOssURL      string          `json:"video_oss_url"`
+	VideoPath        string          `json:"video_path"`
+	Host             string          `json:"host"`
+	Port             int             `json:"port"`
+	WaitSeconds      int             `json:"wait_seconds"`
+	UndetectablePath string          `json:"undetectable_path"`
+	Async            bool            `json:"async"`
+	Ref              string          `json:"ref,omitempty"`
+	Batch            string          `json:"batch,omitempty"`
+	NotifyDingtalk   *DingtalkNotify `json:"notify_dingtalk,omitempty"`
 }
 
 type TikTokPublishRequest struct {
-	ProfileName      string `json:"profile_name"`
-	Text             string `json:"text"`
-	Title            string `json:"title"`
-	VideoOssURL      string `json:"video_oss_url"`
-	VideoPath        string `json:"video_path"`
-	Host             string `json:"host"`
-	Port             int    `json:"port"`
-	WaitSeconds      int    `json:"wait_seconds"`
-	UndetectablePath string `json:"undetectable_path"`
-	Async            bool   `json:"async"`
-	Ref              string `json:"ref,omitempty"`
-	Batch            string `json:"batch,omitempty"`
+	ProfileName      string          `json:"profile_name"`
+	Text             string          `json:"text"`
+	Title            string          `json:"title"`
+	VideoOssURL      string          `json:"video_oss_url"`
+	VideoPath        string          `json:"video_path"`
+	Host             string          `json:"host"`
+	Port             int             `json:"port"`
+	WaitSeconds      int             `json:"wait_seconds"`
+	UndetectablePath string          `json:"undetectable_path"`
+	Async            bool            `json:"async"`
+	Ref              string          `json:"ref,omitempty"`
+	Batch            string          `json:"batch,omitempty"`
+	NotifyDingtalk   *DingtalkNotify `json:"notify_dingtalk,omitempty"`
 }
 
 type InstagramPublishRequest struct {
-	ProfileName      string `json:"profile_name"`
-	Text             string `json:"text"`
-	Title            string `json:"title"`
-	VideoOssURL      string `json:"video_oss_url"`
-	VideoPath        string `json:"video_path"`
-	Host             string `json:"host"`
-	Port             int    `json:"port"`
-	WaitSeconds      int    `json:"wait_seconds"`
-	UndetectablePath string `json:"undetectable_path"`
-	Async            bool   `json:"async"`
-	Ref              string `json:"ref,omitempty"`
-	Batch            string `json:"batch,omitempty"`
+	ProfileName      string          `json:"profile_name"`
+	Text             string          `json:"text"`
+	Title            string          `json:"title"`
+	VideoOssURL      string          `json:"video_oss_url"`
+	VideoPath        string          `json:"video_path"`
+	Host             string          `json:"host"`
+	Port             int             `json:"port"`
+	WaitSeconds      int             `json:"wait_seconds"`
+	UndetectablePath string          `json:"undetectable_path"`
+	Async            bool            `json:"async"`
+	Ref              string          `json:"ref,omitempty"`
+	Batch            string          `json:"batch,omitempty"`
+	NotifyDingtalk   *DingtalkNotify `json:"notify_dingtalk,omitempty"`
 }
 
 // ===== 通用发布流程 =====

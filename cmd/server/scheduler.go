@@ -88,6 +88,11 @@ type TaskRecord struct {
 	Message     string    `json:"message,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+	// 钉钉通知目标（可选）：仅人工/外部调用的任务会带，account_sys 下发的为空。
+	// 任务进入终态（success/failed）后，若 webhook 非空则把结果推送到对应钉钉群。
+	DingtalkWebhook string `json:"dingtalk_webhook,omitempty"`
+	DingtalkKeyword string `json:"dingtalk_keyword,omitempty"`
+	DingtalkOwner   string `json:"dingtalk_owner,omitempty"`
 }
 
 // newTaskID 生成一个唯一任务 ID。
@@ -105,21 +110,33 @@ func newTaskID() string {
 // batch 为调用方指定的批次标识（可空）。同一批下发的任务带上同一个 batch，之后就能用
 // GET /tasks?batch=xxx 或 /tasks/summary 的 batches 聚合，精确回答"这批跑完没有"。
 // payload 为原始请求体 JSON（可空），供服务重启后重放 queued 的发布任务（其余类型暂不重放）。
-func registerTask(taskType, profileName, ref, batch, payload string) (string, context.Context) {
+// notify 为钉钉通知目标（可空）：非空表示人工/外部调用，任务终态后发结果到对应钉钉群。
+func registerTask(taskType, profileName, ref, batch, payload string, notify *DingtalkNotify) (string, context.Context) {
 	taskID := newTaskID()
 	ctx, cancel := context.WithCancel(context.Background())
 	now := time.Now()
+
+	var webhook, keyword, owner string
+	if notify != nil {
+		webhook = strings.TrimSpace(notify.Webhook)
+		keyword = strings.TrimSpace(notify.Keyword)
+		owner = strings.TrimSpace(notify.Owner)
+	}
+
 	taskRecordsMu.Lock()
 	taskRecords[taskID] = &TaskRecord{
-		TaskID:      taskID,
-		Type:        taskType,
-		ProfileName: profileName,
-		Ref:         ref,
-		Batch:       strings.TrimSpace(batch),
-		Payload:     payload,
-		Status:      taskStatusQueued,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		TaskID:          taskID,
+		Type:            taskType,
+		ProfileName:     profileName,
+		Ref:             ref,
+		Batch:           strings.TrimSpace(batch),
+		Payload:         payload,
+		Status:          taskStatusQueued,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		DingtalkWebhook: webhook,
+		DingtalkKeyword: keyword,
+		DingtalkOwner:   owner,
 	}
 	taskCancels[taskID] = cancel
 	taskRecordsMu.Unlock()
@@ -297,6 +314,8 @@ func finalizeAsyncTask(logger *logx.Logger, taskID, taskType, profileName, ref, 
 		Message:     info,
 		Result:      result,
 	})
+	// 钉钉通知（仅人工/外部调用带配置的任务，best effort）
+	notifyDingtalkResult(logger, taskID, taskType, profileName, ref, status, info)
 }
 
 // callbackTaskResult 任务完成后回调 account_sys 通知结果（Best Effort：失败仅打日志）。
@@ -474,6 +493,7 @@ func handleTaskList(logger *logx.Logger) http.HandlerFunc {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"total":              global.Total,
 			"status_counts":      global.StatusCounts,
+			"source_counts":      global.SourceCounts,
 			"type_counts":        global.TypeCounts,
 			"type_status_counts": global.TypeStatusCounts,
 			"matched":            matchedTotal,

@@ -120,7 +120,10 @@ func openTaskStoreDB() (*sql.DB, error) {
 			status       TEXT NOT NULL,
 			message      TEXT NOT NULL DEFAULT '',
 			created_at   INTEGER NOT NULL,
-			updated_at   INTEGER NOT NULL
+			updated_at   INTEGER NOT NULL,
+			dingtalk_webhook TEXT NOT NULL DEFAULT '',
+			dingtalk_keyword TEXT NOT NULL DEFAULT '',
+			dingtalk_owner TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_type ON tasks(type)`,
@@ -131,10 +134,13 @@ func openTaskStoreDB() (*sql.DB, error) {
 			return nil, fmt.Errorf("初始化表结构失败: %w", err)
 		}
 	}
-	// 兼容旧库（此前建表漏了 batch、后来又加 payload）：缺列则补上。
+	// 兼容旧库（此前建表漏了 batch、后来又加 payload、再加钉钉列）：缺列则补上。
 	for _, col := range []struct{ name, decl string }{
 		{"batch", "batch TEXT NOT NULL DEFAULT ''"},
 		{"payload", "payload TEXT NOT NULL DEFAULT ''"},
+		{"dingtalk_webhook", "dingtalk_webhook TEXT NOT NULL DEFAULT ''"},
+		{"dingtalk_keyword", "dingtalk_keyword TEXT NOT NULL DEFAULT ''"},
+		{"dingtalk_owner", "dingtalk_owner TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := ensureColumn(db, "tasks", col.name, col.decl); err != nil {
 			db.Close()
@@ -254,7 +260,7 @@ func loadTaskStore(logger *logx.Logger) {
 	// 加载到孤儿任务时则负责把 interrupted 状态与超期裁剪写回库。
 	defer markTaskStoreDirty()
 
-	rows, err := db.Query(`SELECT task_id, type, profile_name, ref, batch, payload, status, message, created_at, updated_at
+	rows, err := db.Query(`SELECT task_id, type, profile_name, ref, batch, payload, status, message, created_at, updated_at, dingtalk_webhook, dingtalk_keyword, dingtalk_owner
 	                       FROM tasks ORDER BY created_at ASC`)
 	if err != nil {
 		logger.Print("TASK_STORE", "查询任务记录失败: "+err.Error())
@@ -270,7 +276,8 @@ func loadTaskStore(logger *logx.Logger) {
 		var rec TaskRecord
 		var createdMS, updatedMS int64
 		if err := rows.Scan(&rec.TaskID, &rec.Type, &rec.ProfileName, &rec.Ref,
-			&rec.Batch, &rec.Payload, &rec.Status, &rec.Message, &createdMS, &updatedMS); err != nil {
+			&rec.Batch, &rec.Payload, &rec.Status, &rec.Message, &createdMS, &updatedMS,
+			&rec.DingtalkWebhook, &rec.DingtalkKeyword, &rec.DingtalkOwner); err != nil {
 			continue
 		}
 		rec.CreatedAt = time.UnixMilli(createdMS)
@@ -343,8 +350,8 @@ func saveTaskStore() error {
 	}
 
 	stmt, err := tx.Prepare(`INSERT INTO tasks
-		(task_id, type, profile_name, ref, batch, payload, status, message, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		(task_id, type, profile_name, ref, batch, payload, status, message, created_at, updated_at, dingtalk_webhook, dingtalk_keyword, dingtalk_owner)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("准备插入语句失败: %w", err)
 	}
@@ -352,7 +359,8 @@ func saveTaskStore() error {
 
 	for _, rec := range tasks {
 		if _, err := stmt.Exec(rec.TaskID, rec.Type, rec.ProfileName, rec.Ref, rec.Batch, rec.Payload,
-			rec.Status, rec.Message, rec.CreatedAt.UnixMilli(), rec.UpdatedAt.UnixMilli()); err != nil {
+			rec.Status, rec.Message, rec.CreatedAt.UnixMilli(), rec.UpdatedAt.UnixMilli(),
+			rec.DingtalkWebhook, rec.DingtalkKeyword, rec.DingtalkOwner); err != nil {
 			return fmt.Errorf("写入任务 %s 失败: %w", rec.TaskID, err)
 		}
 	}
