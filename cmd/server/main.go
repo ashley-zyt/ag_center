@@ -833,11 +833,13 @@ func noteUndetectableStartFailure() bool {
 }
 
 func resolveUndetectablePath(explicit string) string {
-	if explicit != "" {
-		return explicit
+	// 对路径做 TrimSpace：环境变量/请求里常会带上行尾换行或首尾空格，
+	// 若不剥掉，exec 会因文件名末尾的 \n 而报 "file does not exist"。
+	if p := strings.TrimSpace(explicit); p != "" {
+		return p
 	}
-	if v := os.Getenv("UNDETECTABLE_EXE"); v != "" {
-		return v
+	if p := strings.TrimSpace(os.Getenv("UNDETECTABLE_EXE")); p != "" {
+		return p
 	}
 	return ""
 }

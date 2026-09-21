@@ -170,22 +170,45 @@ func getTaskRecord(taskID string) *TaskRecord {
 // clearAllTasks 中断所有任务（排队中与正在运行的全部取消），清空任务记录，
 // 并把这些任务标记为「已清除」以抑制回调，返回被清理的任务数。
 func clearAllTasks() int {
+	return clearTasks(nil, nil)
+}
+
+// clearTasks 中断并清空任务。types / statuses 为 nil 时清空全部；
+// 否则只清类型命中 types 且状态命中 statuses 的任务（用于「只中断某类执行中/排队中的任务」，
+// 保留 success/failed 历史）。
+// 被清除的任务会记入 clearedTasks 以抑制回调（异步 goroutine 结束回调前先查这个标记）。
+func clearTasks(types, statuses map[string]struct{}) int {
 	taskRecordsMu.Lock()
 	defer taskRecordsMu.Unlock()
-	n := len(taskRecords)
-	newCleared := make(map[string]bool, n)
-	for id, cancel := range taskCancels {
-		cancel()
-		newCleared[id] = true
+
+	toClear := make(map[string]bool)
+	for id, rec := range taskRecords {
+		if types != nil {
+			if _, ok := types[rec.Type]; !ok {
+				continue
+			}
+		}
+		if statuses != nil {
+			if _, ok := statuses[rec.Status]; !ok {
+				continue
+			}
+		}
+		toClear[id] = true
 	}
-	for id := range taskRecords {
-		newCleared[id] = true
+
+	for id := range toClear {
+		if cancel, ok := taskCancels[id]; ok {
+			cancel()
+			delete(taskCancels, id)
+		}
+		clearedTasks[id] = true
+		delete(taskRecords, id)
 	}
-	clearedTasks = newCleared
-	taskCancels = make(map[string]context.CancelFunc)
-	taskRecords = make(map[string]*TaskRecord)
-	markTaskStoreDirty() // 清空也要落盘，否则重启后被清掉的记录又回来了
-	return n
+
+	if len(toClear) > 0 {
+		markTaskStoreDirty() // 清空也要落盘，否则重启后被清掉的记录又回来了
+	}
+	return len(toClear)
 }
 
 // isTaskCleared 判断任务是否已被手动清除（用于抑制回调）。
@@ -428,7 +451,12 @@ func handleTaskList(logger *logx.Logger) http.HandlerFunc {
 	}
 }
 
-// handleTaskClear POST /tasks/clear 中断并清空所有任务。
+// handleTaskClear POST /tasks/clear 中断并清空任务。
+// 可选参数（query 或 JSON body，均逗号分隔多值）：
+//   - type:   只清指定类型的任务，如 ?type=tiktok_publish
+//   - status: 只清指定状态的任务，如 ?status=running,queued（中断执行中/排队中，保留 success/failed）
+//
+// 两者可组合；都不传则清空全部。
 // 排队中(queued)的任务会被取消、不再执行；正在运行(running)的任务会被中断（对应浏览器可能
 // 来不及正常收尾而残留，需自行确认）；被清除的任务不再回调 account_sys。
 func handleTaskClear(logger *logx.Logger) http.HandlerFunc {
@@ -437,8 +465,45 @@ func handleTaskClear(logger *logx.Logger) http.HandlerFunc {
 			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
 			return
 		}
-		n := clearAllTasks()
-		logger.Print("TASK_CLEAR", fmt.Sprintf("已清除全部任务: %d 个", n))
+
+		typeParam := r.URL.Query().Get("type")
+		statusParam := r.URL.Query().Get("status")
+		if r.Body != nil {
+			if data, err := io.ReadAll(r.Body); err == nil && len(data) > 0 {
+				var body struct {
+					Type   string `json:"type"`
+					Status string `json:"status"`
+				}
+				if json.Unmarshal(data, &body) == nil {
+					if typeParam == "" {
+						typeParam = body.Type
+					}
+					if statusParam == "" {
+						statusParam = body.Status
+					}
+				}
+			}
+		}
+
+		types := parseCSVSet(typeParam)
+		statuses := parseCSVSet(statusParam)
+
+		n := clearTasks(types, statuses)
+		filter := ""
+		if types != nil {
+			filter += "类型:" + typeParam
+		}
+		if statuses != nil {
+			if filter != "" {
+				filter += " "
+			}
+			filter += "状态:" + statusParam
+		}
+		if filter != "" {
+			logger.Print("TASK_CLEAR", fmt.Sprintf("已清除任务: %d 个（%s）", n, filter))
+		} else {
+			logger.Print("TASK_CLEAR", fmt.Sprintf("已清除全部任务: %d 个", n))
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"type": "cleared", "count": n})
 	}
 }
