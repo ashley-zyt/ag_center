@@ -8,6 +8,39 @@ import (
 	"minimax_pro/internal/logx"
 )
 
+// TestResolveUndetectablePathFallback 锁住「自愈入口不再依赖环境变量」这个修复：
+// 任务入口解析出的路径必须被记住，随后 /tasks/resume 那类只传空串的调用方也能拿到它。
+// 否则 resume 会直接判「未配置自动拉起」并熔断，paused 任务永远恢复不了。
+func TestResolveUndetectablePathFallback(t *testing.T) {
+	// 隔离全局态与环境变量，避免影响其它用例
+	t.Setenv("UNDETECTABLE_EXE", "")
+	undetectablePathMu.Lock()
+	oldKnown := undetectablePathKnown
+	undetectablePathKnown = ""
+	undetectablePathMu.Unlock()
+	defer func() {
+		undetectablePathMu.Lock()
+		undetectablePathKnown = oldKnown
+		undetectablePathMu.Unlock()
+	}()
+
+	// 未见过任何路径时，空入参应返回空（保持原有语义）
+	if got := resolveUndetectablePath(""); got != "" {
+		t.Fatalf("无任何来源时应返回空串，实际 %q", got)
+	}
+
+	// 任务入口传明确路径 → 应被记住
+	if got := resolveUndetectablePath("  C:\\Undetectable\\Undetectable.exe  "); got != "C:\\Undetectable\\Undetectable.exe" {
+		t.Fatalf("显式路径应被 TrimSpace 后返回，实际 %q", got)
+	}
+
+	// 自愈入口传空串（explicitPath == ""）→ 应回落到记住的路径，而不是空
+	if got := resolveUndetectablePath(""); got != "C:\\Undetectable\\Undetectable.exe" {
+		t.Fatalf("空入参应回落到已记住的路径，实际 %q", got)
+	}
+}
+
+// TestIsUndetectableNotStarted 验证「Undetectable 未启动」文案识别。
 func TestIsUndetectableNotStarted(t *testing.T) {
 	cases := []struct {
 		msg  string

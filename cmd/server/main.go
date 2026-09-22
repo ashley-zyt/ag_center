@@ -832,16 +832,49 @@ func noteUndetectableStartFailure() bool {
 	return false
 }
 
+// undetectablePathMu / undetectablePathKnown 记录「本进程内见过一次的有效
+// Undetectable 可执行文件路径」，作为环境变量之外的兜底来源。
+//
+// 背景（修复）：POST /tasks/resume 这条自愈入口调用 ensureAPIAndMaybeStart 时
+// explicitPath 传的是空串，而 resolveUndetectablePath("") 只回落到环境变量
+// UNDETECTABLE_EXE。若进程启动时没设该变量（路径实际由各任务请求体带进来），
+// resume 会直接判定「未配置自动拉起」并熔断 —— account_sys 的 MachinePauseMonitor
+// 每 5 分钟的自动恢复恒失败（503），paused 任务永久挂起，只能靠人工重启进程绕过。
+// 任务入口每解析出一个非空路径就记下来，自愈入口即可复用，不再依赖环境变量。
+var (
+	undetectablePathMu    sync.Mutex
+	undetectablePathKnown string
+)
+
+// rememberUndetectablePath 记住一个非空的 Undetectable 路径，供自愈入口兜底复用。
+func rememberUndetectablePath(p string) {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return
+	}
+	undetectablePathMu.Lock()
+	undetectablePathKnown = p
+	undetectablePathMu.Unlock()
+}
+
+// resolveUndetectablePath 解析 Undetectable 可执行文件路径。
+//
+// 优先级：显式传入 > 环境变量 UNDETECTABLE_EXE > 本进程曾成功使用过的路径。
+// 最后一级是关键兜底：让「探测/自愈」入口与「任务入口」共用同一套来源。
 func resolveUndetectablePath(explicit string) string {
 	// 对路径做 TrimSpace：环境变量/请求里常会带上行尾换行或首尾空格，
 	// 若不剥掉，exec 会因文件名末尾的 \n 而报 "file does not exist"。
 	if p := strings.TrimSpace(explicit); p != "" {
+		rememberUndetectablePath(p)
 		return p
 	}
 	if p := strings.TrimSpace(os.Getenv("UNDETECTABLE_EXE")); p != "" {
+		rememberUndetectablePath(p)
 		return p
 	}
-	return ""
+	undetectablePathMu.Lock()
+	defer undetectablePathMu.Unlock()
+	return undetectablePathKnown
 }
 
 // tryStartUndetectable 尝试拉起 Undetectable 主程序。
@@ -2339,15 +2372,23 @@ func main() {
 
 	// 优雅退出：收到 Ctrl+C / SIGTERM 时先把任务快照刷盘再退出，
 	// 避免最后那个合并窗口内的状态变更丢失（被强杀时靠 2 秒合并窗口兜底）。
+	appCtx, appCancel := context.WithCancel(context.Background())
+	defer appCancel()
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		<-sigCh
 		logger.Print("BOOT", "收到退出信号，正在保存任务快照…")
+		appCancel() // 停掉后台巡检等常驻协程
 		flushTaskStoreNow(logger)
 		logger.Close()
 		os.Exit(0)
 	}()
+
+	// Undetectable 后台健康巡检：进程内唯一的常驻探活。Undetectable 退出又被自动拉起后，
+	// 它负责清熔断 + 自动重放 paused 发布任务 + 收尾卡死超阈值的 running/queued，
+	// 使自愈不再依赖「人工重启 ag_center」或 account_sys 的 5 分钟兜底。
+	startUndetectableWatchdog(appCtx, logger)
 
 	// 启动上报：告知 account_sys「本机已重启」，让它立即重置本机丢失的异步任务，
 	// 不必再等 check_timeout_tasks 的 45 分钟兜底窗口。延迟 3 秒等服务真正开始监听。
