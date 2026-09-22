@@ -411,6 +411,39 @@ func buildPublishExecutor(ctx context.Context, taskType, payload string, logger 
 	return nil, false
 }
 
+// claimReplay 为一次「重放」原子地占位：返回可取消 context 并登记 cancel func。
+//
+// 关键作用（修复重复重放）：
+//   - **幂等**：若该 taskID 已有存活的 cancel（说明已有一条重放 goroutine 在跑/在排队），
+//     直接返回 false，不再起第二条；
+//   - **立刻把状态改写成 queued**：paused 任务被重新入队后，必须先离开 paused，
+//     否则 account_sys 的 MachinePauseMonitor 每 5 分钟一轮 `GET /tasks?status=paused`
+//     会再次把它当成「新暂停」而重复调 /tasks/resume，导致同一任务堆出多个 goroutine
+//     一起抢并发额度；先拿到额度的那条跑完后 finishTask 会 cancel 掉最后登记的那个
+//     cancel func，其余阻塞在 acquireBrowserSlot 的 goroutine 全部以
+//     「获取并发额度失败: context canceled」失败，还会把已成功的记录覆盖成 failed。
+func claimReplay(taskID string) (context.Context, bool) {
+	taskRecordsMu.Lock()
+	defer taskRecordsMu.Unlock()
+
+	if _, alive := taskCancels[taskID]; alive {
+		return nil, false // 已有存活的重放，跳过
+	}
+	rec, ok := taskRecords[taskID]
+	if !ok {
+		return nil, false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	taskCancels[taskID] = cancel
+
+	if rec.Status != taskStatusQueued {
+		rec.Status = taskStatusQueued
+		rec.UpdatedAt = time.Now()
+		markTaskStoreDirty()
+	}
+	return ctx, true
+}
+
 // resumeQueuedPublishTasks 重启后把排队中的发布任务重新入队执行。
 // 只处理 queued 且带 payload 的发布任务；running 与其余类型已在加载时标记 interrupted。
 func resumeQueuedPublishTasks(logger *logx.Logger) {
@@ -428,11 +461,12 @@ func resumeQueuedPublishTasks(logger *logx.Logger) {
 	taskRecordsMu.Unlock()
 
 	for _, rec := range toResume {
-		// 重新注册可取消 context，使 POST /tasks/clear 仍能中断重放的任务
-		ctx, cancel := context.WithCancel(context.Background())
-		taskRecordsMu.Lock()
-		taskCancels[rec.TaskID] = cancel
-		taskRecordsMu.Unlock()
+		// 原子占位：幂等（已有存活重放则跳过）+ 立刻离开 paused/终态，避免被
+		// MachinePauseMonitor 每 5 分钟一轮重复重放（详见 claimReplay 注释）。
+		ctx, ok := claimReplay(rec.TaskID)
+		if !ok {
+			continue
+		}
 
 		// taskID 单独拷贝，避免闭包捕获循环变量（go1.21 for-range 变量复用）
 		taskID := rec.TaskID
@@ -450,6 +484,10 @@ func resumeQueuedPublishTasks(logger *logx.Logger) {
 // resumePausedPublishTasks 人工确认 Undetectable 已启动后，把 paused 的发布任务重新入队执行。
 // 只处理带 payload 的发布任务（能本机重放）；非发布类的 paused 任务无 payload、无法本机重放，
 // 保持 paused 不动，靠 account_sys 各自调度器兜底重发。
+//
+// 重新入队时会把状态立刻改成 queued（而非等拿到并发额度才变）——这样
+// account_sys 的 MachinePauseMonitor 下一轮 `GET /tasks?status=paused` 就不会再看到它们，
+// 不会重复触发 resume。返回值是本次真正入队的条数。
 func resumePausedPublishTasks(logger *logx.Logger) int {
 	taskRecordsMu.Lock()
 	toResume := make([]TaskRecord, 0)
@@ -460,12 +498,15 @@ func resumePausedPublishTasks(logger *logx.Logger) int {
 	}
 	taskRecordsMu.Unlock()
 
+	queued := 0
 	for _, rec := range toResume {
-		// 重新注册可取消 context，使 POST /tasks/clear 仍能中断重放的任务
-		ctx, cancel := context.WithCancel(context.Background())
-		taskRecordsMu.Lock()
-		taskCancels[rec.TaskID] = cancel
-		taskRecordsMu.Unlock()
+		// 原子占位：幂等（已有存活重放则跳过）+ 立刻离开 paused/终态，避免被
+		// MachinePauseMonitor 每 5 分钟一轮重复重放（详见 claimReplay 注释）。
+		ctx, ok := claimReplay(rec.TaskID)
+		if !ok {
+			continue
+		}
+		queued++
 
 		// taskID 单独拷贝，避免闭包捕获循环变量（go1.21 for-range 变量复用）
 		taskID := rec.TaskID
@@ -478,7 +519,7 @@ func resumePausedPublishTasks(logger *logx.Logger) int {
 		logger.Print("RESUME", "恢复暂停的发布任务: "+rec.TaskID+" type="+rec.Type+" profile="+rec.ProfileName)
 		runAsyncPublish(ctx, logger, rec.TaskID, rec.Type, rec.ProfileName, rec.Ref, exec)
 	}
-	return len(toResume)
+	return queued
 }
 
 // handleTaskResume POST /tasks/resume —— 人工确认 Undetectable 已启动后，恢复被暂停的任务。
