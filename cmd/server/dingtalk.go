@@ -162,7 +162,18 @@ func sendSingleResult(logger *logx.Logger, webhook, keyword, owner, taskType, pr
 	}()
 }
 
+// batchSummaryTimeout 批次汇总的兜底窗口：即使该批声明的 batch_total 还没凑满，
+// 只要距「最早一个任务进入终态」超过这个时长，也照样发汇总，避免调用方少发/传错 N 时
+// 该批永远不发通知。
+const batchSummaryTimeout = 30 * time.Minute
+
 // maybeSendBatchSummary 当某批任务全部进入终态时，汇总发一条钉钉（成功/失败统计 + 失败任务 ID 列表）。
+//
+// 批次「发完」的判定：
+//   - 该批没有任何任务声明 batch_total（都传 0）→ 沿用旧逻辑：已登记的任务全部终态即发；
+//   - 有任务声明了 batch_total=N → 需「已登记数 >= N 且全部终态」才发（防止同批分多次下发时，
+//     先跑完的那几个被误判成"整批已发完"而提前触发）；
+//   - 兜底：无论是否凑满 N，距最早一个任务进入终态超过 batchSummaryTimeout 也发。
 func maybeSendBatchSummary(logger *logx.Logger, batch string) {
 	taskRecordsMu.Lock()
 	if notifiedBatches[batch] {
@@ -171,24 +182,39 @@ func maybeSendBatchSummary(logger *logx.Logger, batch string) {
 	}
 
 	var recs []*TaskRecord
+	expectedTotal := 0 // 该批声明总数（取所有任务里非零 BatchTotal 的最大值）
 	for _, rec := range taskRecords {
 		if rec.Batch == batch {
 			recs = append(recs, rec)
+			if rec.BatchTotal > expectedTotal {
+				expectedTotal = rec.BatchTotal
+			}
 		}
 	}
 	if len(recs) == 0 {
 		taskRecordsMu.Unlock()
 		return
 	}
+
 	allDone := true
+	var firstTerminal time.Time // 最早进入终态的时刻（用于兜底计时）
 	for _, rec := range recs {
 		if rec.Status != taskStatusSuccess && rec.Status != taskStatusFailed &&
 			rec.Status != taskStatusPaused && rec.Status != taskStatusInterrupted {
 			allDone = false
-			break
+			continue
+		}
+		if firstTerminal.IsZero() || rec.UpdatedAt.Before(firstTerminal) {
+			firstTerminal = rec.UpdatedAt
 		}
 	}
-	if !allDone {
+
+	registered := len(recs)
+	// 已凑满（或未声明 batch_total 时只要全部终态）才发
+	enough := allDone && (expectedTotal == 0 || registered >= expectedTotal)
+	// 兜底：最早终态已超过窗口，即使没凑满也发，避免永远不发
+	timeout := !firstTerminal.IsZero() && time.Since(firstTerminal) >= batchSummaryTimeout
+	if !enough && !timeout {
 		taskRecordsMu.Unlock()
 		return
 	}

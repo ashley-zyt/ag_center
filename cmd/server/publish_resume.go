@@ -56,6 +56,7 @@ type FacebookPublishRequest struct {
 	Async            bool            `json:"async"`
 	Ref              string          `json:"ref,omitempty"`
 	Batch            string          `json:"batch,omitempty"`
+	BatchTotal       int             `json:"batch_total,omitempty"`
 	NotifyDingtalk   *DingtalkNotify `json:"notify_dingtalk,omitempty"`
 }
 
@@ -72,6 +73,7 @@ type TwitterPublishRequest struct {
 	Async            bool            `json:"async"`
 	Ref              string          `json:"ref,omitempty"`
 	Batch            string          `json:"batch,omitempty"`
+	BatchTotal       int             `json:"batch_total,omitempty"`
 	NotifyDingtalk   *DingtalkNotify `json:"notify_dingtalk,omitempty"`
 }
 
@@ -89,6 +91,7 @@ type YouTubePublishRequest struct {
 	Async            bool            `json:"async"`
 	Ref              string          `json:"ref,omitempty"`
 	Batch            string          `json:"batch,omitempty"`
+	BatchTotal       int             `json:"batch_total,omitempty"`
 	NotifyDingtalk   *DingtalkNotify `json:"notify_dingtalk,omitempty"`
 }
 
@@ -105,6 +108,7 @@ type TikTokPublishRequest struct {
 	Async            bool            `json:"async"`
 	Ref              string          `json:"ref,omitempty"`
 	Batch            string          `json:"batch,omitempty"`
+	BatchTotal       int             `json:"batch_total,omitempty"`
 	NotifyDingtalk   *DingtalkNotify `json:"notify_dingtalk,omitempty"`
 }
 
@@ -121,6 +125,7 @@ type InstagramPublishRequest struct {
 	Async            bool            `json:"async"`
 	Ref              string          `json:"ref,omitempty"`
 	Batch            string          `json:"batch,omitempty"`
+	BatchTotal       int             `json:"batch_total,omitempty"`
 	NotifyDingtalk   *DingtalkNotify `json:"notify_dingtalk,omitempty"`
 }
 

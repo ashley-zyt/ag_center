@@ -1379,7 +1379,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("fetch", req.ProfileName, req.Ref, req.Batch, "", nil)
+			taskID, tctx := registerTask("fetch", req.ProfileName, req.Ref, req.Batch, 0, "", nil)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -1592,7 +1592,7 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("send_message", req.ProfileName, req.Ref, req.Batch, "", nil)
+			taskID, tctx := registerTask("send_message", req.ProfileName, req.Ref, req.Batch, 0, "", nil)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -1735,7 +1735,7 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("check_reply", req.ProfileName, req.Ref, req.Batch, "", nil)
+			taskID, tctx := registerTask("check_reply", req.ProfileName, req.Ref, req.Batch, 0, "", nil)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -1959,7 +1959,7 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("nurture", req.ProfileName, req.Ref, req.Batch, "", nil)
+			taskID, tctx := registerTask("nurture", req.ProfileName, req.Ref, req.Batch, 0, "", nil)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			go func() {
@@ -2057,7 +2057,7 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("facebook_publish", req.ProfileName, req.Ref, req.Batch, raw, req.NotifyDingtalk)
+			taskID, tctx := registerTask("facebook_publish", req.ProfileName, req.Ref, req.Batch, req.BatchTotal, raw, req.NotifyDingtalk)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			exec := guard(logger, func() (string, string, startByNameResult) {
 				return executeFacebookPublish(tctx, logger, req, func() { setTaskState(taskID, taskStatusRunning) })
@@ -2122,7 +2122,7 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("twitter_publish", req.ProfileName, req.Ref, req.Batch, raw, req.NotifyDingtalk)
+			taskID, tctx := registerTask("twitter_publish", req.ProfileName, req.Ref, req.Batch, req.BatchTotal, raw, req.NotifyDingtalk)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			exec := guard(logger, func() (string, string, startByNameResult) {
 				return executeTwitterPublish(tctx, logger, req, func() { setTaskState(taskID, taskStatusRunning) })
@@ -2186,7 +2186,7 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("youtube_publish", req.ProfileName, req.Ref, req.Batch, raw, req.NotifyDingtalk)
+			taskID, tctx := registerTask("youtube_publish", req.ProfileName, req.Ref, req.Batch, req.BatchTotal, raw, req.NotifyDingtalk)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			exec := guard(logger, func() (string, string, startByNameResult) {
 				return executeYoutubePublish(tctx, logger, req, func() { setTaskState(taskID, taskStatusRunning) })
@@ -2250,7 +2250,7 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("tiktok_publish", req.ProfileName, req.Ref, req.Batch, raw, req.NotifyDingtalk)
+			taskID, tctx := registerTask("tiktok_publish", req.ProfileName, req.Ref, req.Batch, req.BatchTotal, raw, req.NotifyDingtalk)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			exec := guard(logger, func() (string, string, startByNameResult) {
 				return executeTiktokPublish(tctx, logger, req, func() { setTaskState(taskID, taskStatusRunning) })
@@ -2315,7 +2315,7 @@ func main() {
 
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("instagram_publish", req.ProfileName, req.Ref, req.Batch, raw, req.NotifyDingtalk)
+			taskID, tctx := registerTask("instagram_publish", req.ProfileName, req.Ref, req.Batch, req.BatchTotal, raw, req.NotifyDingtalk)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
 			exec := guard(logger, func() (string, string, startByNameResult) {
 				return executeInstagramPublish(tctx, logger, req, func() { setTaskState(taskID, taskStatusRunning) })

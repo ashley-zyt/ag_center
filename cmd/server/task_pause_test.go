@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"testing"
+	"time"
 
 	"minimax_pro/internal/logx"
 )
@@ -78,7 +79,7 @@ func TestFinalizeAsyncTaskPaused(t *testing.T) {
 	logger := logx.New(io.Discard)
 	defer logger.Close()
 
-	taskID, _ := registerTask("facebook_publish", "fb1", "MoveTask:1", "b1", "{}", nil)
+	taskID, _ := registerTask("facebook_publish", "fb1", "MoveTask:1", "b1", 0, "{}", nil)
 	finalizeAsyncTask(logger, taskID, "facebook_publish", "fb1", "MoveTask:1", "failed",
 		"Undetectable 未启动，任务暂停执行（熔断中，稍后自动恢复）", nil)
 
@@ -221,7 +222,7 @@ func TestRegisterTaskDingtalkNotify(t *testing.T) {
 	}()
 
 	// 带 notify
-	taskID, _ := registerTask("tiktok_publish", "tt1", "", "", "{}", &DingtalkNotify{
+	taskID, _ := registerTask("tiktok_publish", "tt1", "", "", 0, "{}", &DingtalkNotify{
 		Webhook: "https://oapi.dingtalk.com/robot/send?access_token=abc",
 		Keyword: "发布结果",
 		Owner:   "张三",
@@ -243,11 +244,69 @@ func TestRegisterTaskDingtalkNotify(t *testing.T) {
 	}
 
 	// nil notify（account_sys 下发）应为空
-	taskID2, _ := registerTask("facebook_publish", "fb1", "", "", "{}", nil)
+	taskID2, _ := registerTask("facebook_publish", "fb1", "", "", 0, "{}", nil)
 	taskRecordsMu.Lock()
 	rec2 := taskRecords[taskID2]
 	taskRecordsMu.Unlock()
 	if rec2.DingtalkWebhook != "" || rec2.DingtalkKeyword != "" || rec2.DingtalkOwner != "" {
 		t.Errorf("nil notify 应得空字段，实际 %q/%q/%q", rec2.DingtalkWebhook, rec2.DingtalkKeyword, rec2.DingtalkOwner)
+	}
+}
+
+// TestBatchSummaryWaitsForBatchTotal 锁住「batch_total 未凑满不提前汇总」的修复：
+// 声明 batch_total=N 的同批任务，只有已登记数 >= N 且全部终态时才发汇总；
+// 否则（分多次下发、先跑完的那几个）不能提前触发，避免后续任务终态时被防重吞掉。
+func TestBatchSummaryWaitsForBatchTotal(t *testing.T) {
+	oldRecords, oldNotified := taskRecords, notifiedBatches
+	taskRecordsMu.Lock()
+	taskRecords = make(map[string]*TaskRecord)
+	notifiedBatches = make(map[string]bool)
+	taskRecordsMu.Unlock()
+	defer func() {
+		taskRecordsMu.Lock()
+		taskRecords, notifiedBatches = oldRecords, oldNotified
+		taskRecordsMu.Unlock()
+	}()
+
+	logger := logx.New(io.Discard)
+	defer logger.Close()
+
+	batch := "batch-total-test"
+	now := time.Now()
+
+	// 声明 batch_total=2，但只有 1 个任务终态 → 不应发汇总
+	taskRecordsMu.Lock()
+	taskRecords["t1"] = &TaskRecord{
+		TaskID: "t1", Type: "twitter_publish", ProfileName: "p1",
+		Batch: batch, BatchTotal: 2,
+		Status: taskStatusSuccess, CreatedAt: now, UpdatedAt: now,
+	}
+	taskRecordsMu.Unlock()
+
+	maybeSendBatchSummary(logger, batch)
+
+	taskRecordsMu.Lock()
+	notified := notifiedBatches[batch]
+	taskRecordsMu.Unlock()
+	if notified {
+		t.Fatal("batch_total=2 但只终态 1 个任务时，不应提前发汇总")
+	}
+
+	// 第二个任务也终态 → 凑满 N 且全终态，应发汇总
+	taskRecordsMu.Lock()
+	taskRecords["t2"] = &TaskRecord{
+		TaskID: "t2", Type: "youtube_publish", ProfileName: "p1",
+		Batch: batch, BatchTotal: 2,
+		Status: taskStatusFailed, CreatedAt: now, UpdatedAt: now,
+	}
+	taskRecordsMu.Unlock()
+
+	maybeSendBatchSummary(logger, batch)
+
+	taskRecordsMu.Lock()
+	notified = notifiedBatches[batch]
+	taskRecordsMu.Unlock()
+	if !notified {
+		t.Fatal("凑满 batch_total 且全终态后应发汇总")
 	}
 }

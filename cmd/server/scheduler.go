@@ -82,8 +82,9 @@ type TaskRecord struct {
 	Type        string    `json:"type"`
 	ProfileName string    `json:"profile_name,omitempty"`
 	Ref         string    `json:"ref,omitempty"`
-	Batch       string    `json:"batch,omitempty"`   // 批次标识，由调用方提交时指定（透传），用于对账「哪一批」
-	Payload     string    `json:"payload,omitempty"` // 原始请求体 JSON，供服务重启后重放 queued 的发布任务
+	Batch       string    `json:"batch,omitempty"`       // 批次标识，由调用方提交时指定（透传），用于对账「哪一批」
+	BatchTotal  int       `json:"batch_total,omitempty"` // 该批声明的任务总数（可选）：用于批次汇总「等满 N 个终态才发」，避免分开发时提前触发
+	Payload     string    `json:"payload,omitempty"`     // 原始请求体 JSON，供服务重启后重放 queued 的发布任务
 	Status      string    `json:"status"`
 	Message     string    `json:"message,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -109,9 +110,11 @@ func newTaskID() string {
 //
 // batch 为调用方指定的批次标识（可空）。同一批下发的任务带上同一个 batch，之后就能用
 // GET /tasks?batch=xxx 或 /tasks/summary 的 batches 聚合，精确回答"这批跑完没有"。
+// batchTotal 为该批声明的任务总数（可选，0 表示不声明）：用于批次汇总「等满 N 个且全终态才发」，
+// 避免同批任务分多次下发时，先跑完的那几个被误判成"整批已发完"而提前触发汇总。
 // payload 为原始请求体 JSON（可空），供服务重启后重放 queued 的发布任务（其余类型暂不重放）。
 // notify 为钉钉通知目标（可空）：非空表示人工/外部调用，任务终态后发结果到对应钉钉群。
-func registerTask(taskType, profileName, ref, batch, payload string, notify *DingtalkNotify) (string, context.Context) {
+func registerTask(taskType, profileName, ref, batch string, batchTotal int, payload string, notify *DingtalkNotify) (string, context.Context) {
 	taskID := newTaskID()
 	ctx, cancel := context.WithCancel(context.Background())
 	now := time.Now()
@@ -130,6 +133,7 @@ func registerTask(taskType, profileName, ref, batch, payload string, notify *Din
 		ProfileName:     profileName,
 		Ref:             ref,
 		Batch:           strings.TrimSpace(batch),
+		BatchTotal:      batchTotal,
 		Payload:         payload,
 		Status:          taskStatusQueued,
 		CreatedAt:       now,
