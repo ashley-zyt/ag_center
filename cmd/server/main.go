@@ -2345,6 +2345,9 @@ func main() {
 	mux.HandleFunc("/accounts/send_single_message", handleSendSingleMessage(logger))
 	mux.HandleFunc("/accounts/check_reply", handleCheckReply(logger))
 
+	// postforme 授权：打开授权页 → 点「确认授权」→ 关浏览器 → 回调 account_sys
+	mux.HandleFunc("/accounts/open_auth_url", handleOpenAuthURL(logger))
+
 	mux.HandleFunc("/api/browser/locked", chrome.GetLockedProfilesHandler(logger, "127.0.0.1", 25325))
 
 	// 鉴权：API Key 认证 + HMAC-SHA256 请求签名，保护所有发布/消息/账号接口。

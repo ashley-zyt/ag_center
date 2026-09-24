@@ -85,6 +85,17 @@ func CloseAllTabsThenBrowser(ctx context.Context) error {
 // CleanExtraTabs 关闭多余的标签页，只保留第一个。
 // ctx 必须是 chromedp.NewContext 创建的浏览器上下文, 不能是 allocator 上下文。
 //
+// ⚠️ 作为「任务里的第一个 chromedp 调用」，这里传的 ctx 必须是 chromedp 上下文本身，
+// 绝不能是它派生的「单次操作超时」子上下文（context.WithTimeout(ctx, ...)）。
+// chromedp 会把「首次 Allocate 所用的那个 ctx」与整条 CDP 连接绑定（见 chromedp/allocate.go）：
+//
+//	go func() { <-ctx.Done(); Cancel(ctx); cancel() /* 关闭 websocket */ }()
+//
+// 于是这个 ctx 一旦被 cancel —— 哪怕只是它派生出来的子 ctx 走过一次正常的单步超时 ——
+// 就会升级成对整个上下文的 Cancel，后续所有 chromedp 调用立刻返回 "context canceled"，
+// 且错误信息完全看不出真正原因（表现为任务刚起来就秒失败）。
+// 正确姿势：首个 chromedp 调用直接传 chromedp 上下文本身；之后再套子 ctx 做单步超时。
+//
 // 返回的 error 语义很重要：本函数通常是任务里**第一个** chromedp.Run 调用。
 // 一旦返回错误（尤其"获取标签页列表失败"，即连不上浏览器），说明 chromedp 的
 // 「首次分配 Browser」已经失败 —— 而 chromedp 在失败前就已 close 掉内部的
