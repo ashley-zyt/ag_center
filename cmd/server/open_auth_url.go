@@ -130,6 +130,11 @@ const (
 	xAuthDefaultWait = 10 * time.Minute
 	// xAuthPollInterval 轮询"页面是否已跳到本机回调地址"的间隔。
 	xAuthPollInterval = time.Second
+	// xAuthErrorCheckInterval 检查"授权页是否已经报错"的间隔（读页面文本，比轮询 URL 慢一些）。
+	xAuthErrorCheckInterval = 5 * time.Second
+	// xAuthErrorGraceWait 一旦确认授权页已报错（X 侧拒绝授权，重试通常无效），
+	// 把剩余等待缩短到这个时长 —— 既给人工「Go back」重试留窗口，又不至于白等满 10 分钟。
+	xAuthErrorGraceWait = 90 * time.Second
 	// xAuthCallbackRetries 授权码回调 account_sys 的重试次数（含首次）。
 	xAuthCallbackRetries = 3
 	// xAuthDefaultRedirectPrefix 兜底的本机回调前缀。
@@ -201,6 +206,10 @@ func handleOpenAuthURL(logger *logx.Logger) http.HandlerFunc {
 
 		logger.Print("AUTH", fmt.Sprintf("收到打开授权页请求: profile=%s mode=%s url=%s async=%v ref=%s",
 			req.ProfileName, mode, safeSnippet(req.URL, 120), req.Async, req.Ref))
+
+		if mode == authModeLocalCode {
+			logAuthURLParams(logger, req.URL)
+		}
 
 		// taskCtx 为任务根 context：异步时被替换为可取消 ctx，使 POST /tasks/clear 能中断。
 		var taskCtx context.Context = context.Background()
@@ -595,6 +604,36 @@ func resolveRedirectPrefix(req OpenAuthURLRequest) string {
 	return xAuthDefaultRedirectPrefix
 }
 
+// logAuthURLParams 打印 X 授权 URL 的关键 OAuth 参数，用于一眼核对与 X 后台配置是否一致：
+// `redirect_uri` 是否与开发者后台 Callback URL 逐字符相同、`state` 有没有带、
+// PKCE 参数是否齐全、`scope` 是否越界。X 授权失败时几乎不给有用信息，只能靠这些先对齐。
+func logAuthURLParams(logger *logx.Logger, rawURL string) {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		logger.Print("AUTH", "授权 URL 解析失败: "+err.Error())
+		return
+	}
+	q := u.Query()
+	stateFlag := "缺失"
+	if strings.TrimSpace(q.Get("state")) != "" {
+		stateFlag = "已带"
+	}
+	logger.Print("AUTH", fmt.Sprintf(
+		"授权 URL 参数: response_type=%q redirect_uri=%q scope=%q state=%s code_challenge_method=%q code_challenge_len=%d",
+		q.Get("response_type"), q.Get("redirect_uri"), q.Get("scope"), stateFlag,
+		q.Get("code_challenge_method"), len(q.Get("code_challenge"))))
+
+	// loopback 回调 + app 类型不匹配是 X 拒绝授权的头号原因，这里给出明确提示。
+	ru := strings.TrimSpace(q.Get("redirect_uri"))
+	if strings.HasPrefix(strings.ToLower(ru), "http://") {
+		logger.Print("AUTH", "注意: redirect_uri 是 http://（非 https）。X 仅对「Native App」类型的应用接受 loopback(http://127.0.0.1 / localhost) 回调；"+
+			"若该 app 在开发者后台的类型是 Web App / Automated App or Bot，X 会在授权页直接报 Something went wrong")
+	}
+	if stateFlag == "缺失" {
+		logger.Print("AUTH", "注意: 授权 URL 未带 state 参数（X 的 OAuth2 实践中缺 state 会导致授权页直接报错）")
+	}
+}
+
 // localCallback 从本机回调 URL 里抠出的授权信息。
 type localCallback struct {
 	Code  string
@@ -606,18 +645,27 @@ type localCallback struct {
 //
 // 扫**所有** page 标签页而不是只看当前工作标签页：授权中途 X 可能换标签页，
 // 或用户手动操作导致跳转发生在别的标签页上，扫全部更稳。
+//
+// 期间还会顺带做一件事：**检测 X 是否已经直接拒绝这次授权**（页面显示
+// "Something went wrong / You weren't able to give access to the App"，
+// 或跳到 x.com/i/oauth2/error）。这类错误绝大多数是 X 后台配置问题（见 detectAuthPageError），
+// 原地重试通常无效，但为了不误杀人工「Go back」重试，这里只把剩余等待缩短到
+// xAuthErrorGraceWait，并把 X 的原始提示带回错误信息 —— 不用等满 10 分钟就能定位。
 func waitLocalCallback(browserCtx, workCtx context.Context, logger *logx.Logger, prefix string, wait time.Duration) (localCallback, error) {
 	deadline := time.Now().Add(wait)
 	lastSeen := ""
+	authErr := "" // X 侧拒绝授权的现场信息（页面提示文案 / 错误页 URL）
+	nextErrCheck := time.Now()
 	for {
-		if raw := findRedirectURL(browserCtx, prefix); raw != "" {
-			if raw != lastSeen {
-				lastSeen = raw
-				logger.Print("AUTH", "检测到跳转到本机回调地址: "+safeSnippet(raw, 200))
+		redirectURL, errURL := scanPageTargets(browserCtx, prefix)
+		if redirectURL != "" {
+			if redirectURL != lastSeen {
+				lastSeen = redirectURL
+				logger.Print("AUTH", "检测到跳转到本机回调地址: "+safeSnippet(redirectURL, 200))
 			}
-			cb, ok, err := parseLocalCallback(raw)
+			cb, ok, err := parseLocalCallback(redirectURL)
 			if err != nil {
-				return localCallback{URL: raw}, err
+				return localCallback{URL: redirectURL}, err
 			}
 			if ok {
 				return cb, nil
@@ -625,10 +673,30 @@ func waitLocalCallback(browserCtx, workCtx context.Context, logger *logx.Logger,
 			// 命中回调地址但 query 里还没 code：导航中间态，继续等
 		}
 
+		// X 自己把授权请求判错了 —— 通常重试无效，别白等满 10 分钟
+		if authErr == "" {
+			if errURL != "" {
+				authErr = "X 授权错误页: " + safeSnippet(errURL, 200)
+			} else if !time.Now().Before(nextErrCheck) {
+				nextErrCheck = time.Now().Add(xAuthErrorCheckInterval)
+				authErr = detectAuthPageError(workCtx)
+			}
+			if authErr != "" {
+				logger.Print("AUTH", "⚠️ X 侧拒绝本次授权（多为 X 后台配置问题，原地重试通常无效）: "+authErr)
+				if d := time.Now().Add(xAuthErrorGraceWait); d.Before(deadline) {
+					deadline = d
+					logger.Print("AUTH", fmt.Sprintf("已把剩余等待缩短到 %s（仍可人工点 Go back 重试）", xAuthErrorGraceWait))
+				}
+			}
+		}
+
 		if err := workCtx.Err(); err != nil {
 			return localCallback{}, fmt.Errorf("等待授权期间任务被中断(%v)；%s", err, describePage(workCtx, nil))
 		}
 		if !time.Now().Before(deadline) {
+			if authErr != "" {
+				return localCallback{}, fmt.Errorf("等待 %s 未检测到授权跳转，且 X 侧已拒绝授权: %s", wait, authErr)
+			}
 			return localCallback{}, fmt.Errorf("等待 %s 仍未检测到授权跳转（用户未完成授权或已中断）；%s",
 				wait, describePage(workCtx, nil))
 		}
@@ -636,24 +704,79 @@ func waitLocalCallback(browserCtx, workCtx context.Context, logger *logx.Logger,
 	}
 }
 
-// findRedirectURL 在所有 page 标签页里找 URL 命中本机回调前缀的那个，返回其 URL；没有则空串。
+// scanPageTargets 一次 Targets 调用同时找出两个东西：
+//   - redirectURL：命中本机回调前缀的 page URL（授权成功的标志）；
+//   - authErrURL：X 授权错误页 URL（授权已被 X 拒绝的标志）。
 //
 // 为什么不用 chromedp.Location：目标端口无服务时 Chrome 渲染 chrome-error://chromewebdata/，
 // 页面级 API 只能看到错误页地址，`?code=` 就丢了；而 browser 级 Targets 里 page target 的
 // URL 仍保留原始请求 URL —— 2026-09-28 实测确认（见文件头踩坑 5）。
-func findRedirectURL(browserCtx context.Context, prefix string) string {
+func scanPageTargets(browserCtx context.Context, prefix string) (redirectURL, authErrURL string) {
 	ctx, cancel := context.WithTimeout(browserCtx, 5*time.Second)
 	defer cancel()
 	targets, err := chromedp.Targets(ctx)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	for _, t := range targets {
 		if t.Type != "page" {
 			continue
 		}
-		if matchRedirectURL(t.URL, prefix) {
-			return t.URL
+		if redirectURL == "" && matchRedirectURL(t.URL, prefix) {
+			redirectURL = t.URL
+			continue
+		}
+		if authErrURL == "" && isXAuthErrorURL(t.URL) {
+			authErrURL = t.URL
+		}
+	}
+	return redirectURL, authErrURL
+}
+
+// isXAuthErrorURL 判断某个 URL 是不是 X 的 OAuth 错误页。
+// 只在 x.com / twitter.com 上判定，避免把本机回调地址上的 ?error= 误当 X 报错。
+func isXAuthErrorURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host != "x.com" && host != "twitter.com" && host != "www.x.com" && host != "www.twitter.com" {
+		return false
+	}
+	if strings.Contains(u.Path, "/i/oauth2/error") {
+		return true
+	}
+	return strings.Contains(u.Path, "/i/oauth2/authorize") && strings.TrimSpace(u.Query().Get("error")) != ""
+}
+
+// xAuthErrorSignals X 拒绝授权时页面上的特征文案（英文 / 中文界面都要覆盖）。
+// 取自 X 实际错误页：标题 "Something went wrong"，正文
+// "You weren't able to give access to the App. Go back and try logging in again."
+var xAuthErrorSignals = []string{
+	"weren't able to give access",
+	"weren't able to give access to the app",
+	"were not able to give access",
+	"go back and try logging in again",
+	"无法获得该应用的访问权限",
+	"没有获得该应用的访问权限",
+}
+
+// detectAuthPageError 读当前工作标签页的可见文本，命中 X 的错误文案就返回该文案（已压平空白）。
+// 读不到页面（命令超时等）一律返回空 —— 绝不把「读不到」当成「报错」。
+func detectAuthPageError(workCtx context.Context) string {
+	evalCtx, cancel := context.WithTimeout(workCtx, 5*time.Second)
+	defer cancel()
+	var text string
+	if err := chromedp.Run(evalCtx,
+		chromedp.Evaluate(`(document.body && document.body.innerText || '').slice(0, 800)`, &text)); err != nil {
+		return ""
+	}
+	flat := strings.Join(strings.Fields(text), " ")
+	lower := strings.ToLower(flat)
+	for _, sig := range xAuthErrorSignals {
+		if strings.Contains(lower, strings.ToLower(sig)) {
+			return safeSnippet(flat, 300)
 		}
 	}
 	return ""
