@@ -137,6 +137,9 @@ const (
 	xAuthErrorGraceWait = 90 * time.Second
 	// xAuthCallbackRetries 授权码回调 account_sys 的重试次数（含首次）。
 	xAuthCallbackRetries = 3
+	// xConsentWait 等待 X 授权页「I trust this app」勾选框出现、勾选生效、
+	// 以及之后「Authorize app」按钮由 disabled 变为可点的上限（各自独立计时）。
+	xConsentWait = 30 * time.Second
 	// xAuthDefaultRedirectPrefix 兜底的本机回调前缀。
 	// 正常路径由授权 URL 自身的 redirect_uri 参数解析得到，无需请求方额外传参。
 	xAuthDefaultRedirectPrefix = "http://127.0.0.1:9000/callback"
@@ -320,15 +323,20 @@ func handleOpenAuthURL(logger *logx.Logger) http.HandlerFunc {
 			logger.Print("AUTH", "已打开授权页: "+safeSnippet(currentPageURL(workCtx, 5*time.Second), 160))
 
 			// ===== local_code 模式（X / Twitter OAuth 2.0 PKCE）=====
-			// 与 postforme 的唯一区别：**不点任何按钮**，等人工在浏览器里完成授权后页面
-			// 自己跳到本机回调地址，然后从该 URL 抠 code 回传 account_sys。
+			// 与 postforme 的区别：X 的授权页多一道「I trust this app」确认，**不勾选的话
+			// 「Authorize app」按钮一直 disabled**。所以这里先自动完成「勾选 → 点 Authorize app」，
+			// 之后等页面自己跳到本机回调地址，再从该 URL 抠 code 回传 account_sys。
 			//
 			// ⚠️ 判定跳转必须走 browser 级 Targets（见文件头踩坑 5）：目标端口没有服务监听，
 			// Chrome 会渲染 chrome-error://chromewebdata/ 错误页，Location 读不到原始 URL。
 			if mode == authModeLocalCode {
 				prefix := resolveRedirectPrefix(req)
 				waitDur := xAuthWaitDuration(req)
-				logger.Print("AUTH", fmt.Sprintf("X 认证：等待页面跳转到 %s（最长 %s，需人工完成授权）", prefix, waitDur))
+
+				// 自动勾选 + 授权（尽力而为，失败不中止 —— 后面仍在等跳转，人工可接手）
+				grantXAuthConsent(workCtx, logger)
+
+				logger.Print("AUTH", fmt.Sprintf("X 认证：等待页面跳转到 %s（最长 %s）", prefix, waitDur))
 
 				cb, err := waitLocalCallback(browserCtx, workCtx, logger, prefix, waitDur)
 				if err != nil {
@@ -474,6 +482,201 @@ func clickAuthButton(workCtx context.Context, logger *logx.Logger, req OpenAuthU
 	}
 	return fmt.Errorf("点击后 %d 秒未跳转（基准 URL=%s）；%s",
 		redirectWait, safeSnippet(baseURL, 100), describePage(workCtx, nil))
+}
+
+// ===== X 授权页的「I trust this app」确认（2026-09-28 新增）=====
+//
+// X 对 loopback 回调 / 申请了敏感权限的 app，会多插一道人工确认：页面上有
+// 「I trust this app」勾选框，**未勾选时「Authorize app」按钮带 disabled，点了毫无反应**。
+// 依据是桌面 1.txt（未勾选）与 2.txt（已勾选）两份页面快照的实测对比：
+// 未勾选时 checkbox 为 `aria-checked="false"`，勾选后变 `true`，同时按钮的 `disabled` 消失。
+//
+// ⚠️ 这些元素（含外层 label）的 id 都是 React 动态生成的（形如 `base-ui-_R_f8lb4l336_`，
+// 每次页面加载都变），**不能写死 selector**，只能按「文本 + 结构」定位：
+//
+//	label（可见 && 文本含 "I trust this app"）→ 其内 [role="checkbox"]
+//
+// label 里另有一个 `aria-hidden` 的 1px 隐藏 `<input type="checkbox">`，只是无障碍镜像，
+// 真实可点元素是那个 `<span role="checkbox">`，别去点 input。
+//
+// 另外 X 页面是响应式双份渲染（如 `mid:hidden`），同一文案可能存在多个隐藏副本，
+// 因此定位统一用 `getBoundingClientRect()` 过滤不可见元素，避免点到隐藏的那份。
+
+// xTrustCheckboxJS 生成「I trust this app」勾选框的三段脚本：
+// probeJS 返回 not-found / unchecked / checked；clickBoxJS 点 checkbox 本体；
+// clickLabelJS 退回点外层 label（包裹式 label 的点击会转发给内部控件）。
+//
+// ⚠️ 脚本里**不做点击后的同步状态校验**：React 的 state 更新是异步批处理的，
+// 同一 tick 读到的 `aria-checked` 还是旧值。点击是否生效一律交给 Go 侧轮询 probeJS 判断。
+func xTrustCheckboxJS() (probeJS, clickBoxJS, clickLabelJS string) {
+	const find = `(function(){
+	function vis(el){ if(!el) return false; var r = el.getBoundingClientRect(); return r.width > 0 || r.height > 0; }
+	var labels = document.querySelectorAll('label');
+	for (var i = 0; i < labels.length; i++) {
+		if (!vis(labels[i])) continue;
+		if ((labels[i].innerText || '').toLowerCase().indexOf('trust this app') < 0) continue;
+		var cb = labels[i].querySelector('[role="checkbox"]') || labels[i].querySelector('input[type="checkbox"]');
+		if (vis(cb)) return cb;
+	}
+	var all = document.querySelectorAll('[role="checkbox"]');
+	for (var j = 0; j < all.length; j++) { if (vis(all[j])) return all[j]; }
+	return null;
+})()`
+
+	probeJS = `(function(){
+	var box = ` + find + `;
+	if (!box) return 'not-found';
+	return box.getAttribute('aria-checked') === 'true' ? 'checked' : 'unchecked';
+})()`
+	clickBoxJS = `(function(){
+	var box = ` + find + `;
+	if (!box) return 'not-found';
+	if (box.getAttribute('aria-checked') === 'true') return 'already';
+	box.click();
+	return 'clicked';
+})()`
+	clickLabelJS = `(function(){
+	var box = ` + find + `;
+	if (!box) return 'not-found';
+	if (box.getAttribute('aria-checked') === 'true') return 'already';
+	var lb = box.closest ? box.closest('label') : null;
+	if (lb) { lb.click(); } else { box.click(); }
+	return 'clicked';
+})()`
+	return probeJS, clickBoxJS, clickLabelJS
+}
+
+// xAuthorizeButtonsJS 生成「Authorize app」按钮的探测/点击脚本。
+// 按钮同样没有稳定的 id / data-testid，按可见文本匹配（大小写不敏感）。
+// 关键是 disabled 状态：勾选「I trust this app」之前它一直是 disabled —— 所以必须先等 ready 再点，
+// 盲点等于白点（按钮毫无反应），这也是不能只靠「等按钮出现」的原因。
+func xAuthorizeButtonsJS() (probeJS, clickJS string) {
+	const find = `(function(){
+	function vis(el){ if(!el) return false; var r = el.getBoundingClientRect(); return r.width > 0 || r.height > 0; }
+	var bs = document.querySelectorAll('button');
+	for (var i = 0; i < bs.length; i++) {
+		if (!vis(bs[i])) continue;
+		if ((bs[i].innerText || '').toLowerCase().indexOf('authorize app') >= 0) return bs[i];
+	}
+	return null;
+})()`
+
+	probeJS = `(function(){
+	var b = ` + find + `;
+	if (!b) return 'not-found';
+	if (b.disabled || b.getAttribute('aria-disabled') === 'true') return 'disabled';
+	return 'ready';
+})()`
+	clickJS = `(function(){
+	var b = ` + find + `;
+	if (!b) return 'not-found';
+	if (b.disabled || b.getAttribute('aria-disabled') === 'true') return 'disabled';
+	b.click();
+	return 'clicked';
+})()`
+	return probeJS, clickJS
+}
+
+// grantXAuthConsent 自动完成 X 授权页上的两道确认：勾选「I trust this app」→ 点「Authorize app」。
+//
+// 设计为「尽力而为」：任何一步失败都只打日志、**不中止任务** —— 后面的 waitLocalCallback 仍在等
+// 页面跳转，人在旁边可以手动补点；失败原因已写进日志，最终超时错误里也能看到。
+// 反过来，如果这个 app 压根不需要勾选（X 只对 loopback / 敏感权限才插这道确认），
+// 这里会等 xConsentWait 后自动跳过，不影响后续流程。
+func grantXAuthConsent(workCtx context.Context, logger *logx.Logger) {
+	probeJS, clickBoxJS, clickLabelJS := xTrustCheckboxJS()
+
+	// 1) 等勾选框出现（授权页是客户端渲染的 SPA，元素晚于 body 就绪）
+	state := ""
+	deadline := time.Now().Add(xConsentWait)
+	for time.Now().Before(deadline) {
+		if s, err := evalString(workCtx, probeJS, authStepTimeout); err == nil && s != "" && s != "not-found" {
+			state = s
+			break
+		}
+		if workCtx.Err() != nil {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	if state == "" {
+		logger.Print("AUTH", "X 授权页未见「I trust this app」勾选框（该 app 可能不需要此确认，或页面结构已变），跳过自动确认")
+		return
+	}
+	if state == "checked" {
+		logger.Print("AUTH", "X 授权页「I trust this app」已是勾选状态")
+	}
+
+	// 2) 需要就勾上。先点 checkbox 本体；若状态迟迟不变，再退回点外层 label（两种点击目标各试一轮）。
+	//    每轮点击后都轮询 aria-checked，不在 JS 里做同步校验（React 状态更新是异步批处理的）。
+	if state == "unchecked" {
+		checked := false
+		for _, clickJS := range []string{clickBoxJS, clickLabelJS} {
+			if s, err := evalString(workCtx, clickJS, authStepTimeout); err != nil || (s != "clicked" && s != "already") {
+				continue
+			}
+			wait := time.Now().Add(xConsentWait)
+			for time.Now().Before(wait) {
+				if s, err := evalString(workCtx, probeJS, authStepTimeout); err == nil && s == "checked" {
+					checked = true
+					break
+				}
+				if workCtx.Err() != nil {
+					return
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+			if checked {
+				break
+			}
+		}
+		if !checked {
+			logger.Print("AUTH", "「I trust this app」勾选后状态未变为已选，改为等待人工完成授权")
+			return
+		}
+		logger.Print("AUTH", "已勾选「I trust this app」")
+	}
+
+	// 3) 等「Authorize app」按钮由 disabled 变为可点（勾选生效后才放开，可能有一拍延迟）
+	authProbeJS, authClickJS := xAuthorizeButtonsJS()
+	ready := false
+	deadline = time.Now().Add(xConsentWait)
+	for time.Now().Before(deadline) {
+		if s, err := evalString(workCtx, authProbeJS, authStepTimeout); err == nil && s == "ready" {
+			ready = true
+			break
+		}
+		if workCtx.Err() != nil {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !ready {
+		logger.Print("AUTH", "「Authorize app」按钮未变为可点状态，改为等待人工完成授权")
+		return
+	}
+
+	// 4) 点击。会触发导航，命令本身可能因页面卸载而中断 —— 忽略错误、不重试（避免重复授权）。
+	//    套子 ctx 是安全的：Evaluate 不是 responseAction，不会像 Navigate 那样与事件派发竞态。
+	clickCtx, cancelClick := context.WithTimeout(workCtx, 5*time.Second)
+	s, cerr := evalString(clickCtx, authClickJS, 5*time.Second)
+	cancelClick()
+	switch {
+	case s == "clicked":
+		logger.Print("AUTH", "已点击「Authorize app」")
+	case s == "disabled" || s == "not-found":
+		logger.Print("AUTH", fmt.Sprintf("「Authorize app」按钮不可点(%s)，改为等待人工完成授权", s))
+	default:
+		// 回执没拿到，多半是点击已触发导航、页面卸载导致命令中断 —— 按「已触发」处理，继续等跳转
+		logger.Print("AUTH", fmt.Sprintf("已触发「Authorize app」点击（回执未取到: %v），继续等待页面跳转", cerr))
+	}
+}
+
+// evalString 在页面上下文中求值一个返回字符串的 JS 表达式。
+func evalString(ctx context.Context, js string, timeout time.Duration) (string, error) {
+	var out string
+	err := evalBool(ctx, js, &out, timeout)
+	return out, err
 }
 
 // evalBool 在页面上下文中求值一个返回布尔的 JS 表达式。
@@ -752,14 +955,34 @@ func isXAuthErrorURL(raw string) bool {
 
 // xAuthErrorSignals X 拒绝授权时页面上的特征文案（英文 / 中文界面都要覆盖）。
 // 取自 X 实际错误页：标题 "Something went wrong"，正文
-// "You weren't able to give access to the App. Go back and try logging in again."
+// "You weren’t able to give access to the App. Go back and try logging in again."
+//
+// ⚠️ 信号一律写成「不含撇号的片段」：X 页面用的是**弯撇号** ’（U+2019），
+// 而源码里敲的是直撇号 '（U+0027），strings.Contains 是字节级精确匹配，带撇号的信号会静默失手
+// （2026-09-28 发现：照抄页面原文写信号，结果检测永远不触发，任务白等满 10 分钟）。
+// 匹配前还会统一做一次撇号归一化（normalizeAuthPageText），双保险。
 var xAuthErrorSignals = []string{
-	"weren't able to give access",
-	"weren't able to give access to the app",
-	"were not able to give access",
-	"go back and try logging in again",
+	"able to give access to the app",
+	"give access to the app",
+	"try logging in again",
+	"something went wrong", // 授权页上下文里出现这句 = X 已判错（正常授权不会渲染）
 	"无法获得该应用的访问权限",
 	"没有获得该应用的访问权限",
+	"该应用的访问权限",
+}
+
+// normalizeAuthPageText 归一化页面文本：压平空白 → 小写 → 抹平撇号/引号变体。
+// 弯引号（’ ‘ ʼ ´）与直引号（' `）在字节层不同，必须先统一才能做包含匹配。
+func normalizeAuthPageText(s string) string {
+	flat := strings.Join(strings.Fields(s), " ")
+	flat = strings.ToLower(flat)
+	return strings.NewReplacer(
+		"\u2019", "'", // ’ RIGHT SINGLE QUOTATION MARK
+		"\u2018", "'", // ‘ LEFT SINGLE QUOTATION MARK
+		"\u02bc", "'", // ʼ MODIFIER LETTER APOSTROPHE
+		"\u00b4", "'", // ´ ACUTE ACCENT
+		"`", "'",
+	).Replace(flat)
 }
 
 // detectAuthPageError 读当前工作标签页的可见文本，命中 X 的错误文案就返回该文案（已压平空白）。
@@ -768,14 +991,15 @@ func detectAuthPageError(workCtx context.Context) string {
 	evalCtx, cancel := context.WithTimeout(workCtx, 5*time.Second)
 	defer cancel()
 	var text string
+	// 取 4000 字符而非 800：正文前面可能有若干行导航/页脚文案，截太短会把特征句切掉。
 	if err := chromedp.Run(evalCtx,
-		chromedp.Evaluate(`(document.body && document.body.innerText || '').slice(0, 800)`, &text)); err != nil {
+		chromedp.Evaluate(`(document.body && document.body.innerText || '').slice(0, 4000)`, &text)); err != nil {
 		return ""
 	}
 	flat := strings.Join(strings.Fields(text), " ")
-	lower := strings.ToLower(flat)
+	norm := normalizeAuthPageText(text)
 	for _, sig := range xAuthErrorSignals {
-		if strings.Contains(lower, strings.ToLower(sig)) {
+		if strings.Contains(norm, normalizeAuthPageText(sig)) {
 			return safeSnippet(flat, 300)
 		}
 	}
