@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -78,11 +79,41 @@ import (
 //	任务里任何一处 panic（见 1）都会跳过手写的 cleanup，浏览器就此留在打开状态。
 //	本文件把「清标签页 + 停 profile + 取消 CDP 上下文」整体包成一个幂等的 closeBrowser，
 //	用 defer 注册，成功 / 失败 / panic 三条路径都会被关掉。
+//
+// 5) **跳转目标是无监听的 `127.0.0.1:9000` 时，`chromedp.Location` / `window.location.href`
+//    读到的是 `chrome-error://chromewebdata/`，不是带 code 的原始 URL。**
+//
+//	Chrome 在 `net::ERR_CONNECTION_REFUSED` 后会渲染内置错误页，页面级 API 只能看到错误页
+//	地址，**原始 URL 里的 `?code=...` 就丢了**。唯一可靠的读法是 browser 级的
+//	`chromedp.Targets()` → page target 的 `URL` 字段，它在导航失败后**仍然保留原始请求 URL**。
+//	2026-09-28 用 Edge（同 Chromium 内核）实测两条路径均如此：
+//
+//	    直接 Navigate 到 127.0.0.1:57321/callback?code=xxx
+//	        Location="chrome-error://chromewebdata/"        ← 拿不到 code
+//	        page target url="http://127.0.0.1:57321/callback?code=NF9kYW5SAMPLE123&state=abc123"  ← 有 code
+//	    在 about:blank 上 JS `location.href=...` 触发跳转：结论完全一致
+//
+//	所以 X（Twitter）OAuth 认证（见下方 authModeLocalCode）**必须**用 Targets 轮询，
+//	不能用 Location —— 契约文档里写的 Location 方案会直接失败。
 
 // postformeAuthCallbackURL 检测到点击授权按钮后，回调 account_sys 告知「已点击完成授权」。
 // 与 taskResultURL 同 host（47.89.235.227:3366）。account_sys 无论是否当场确认都回 success，
 // 因此本回调 Best Effort、不重试。
 const postformeAuthCallbackURL = "http://47.89.235.227:3366/api/v1/postforme/auth_callback"
+
+// xAuthCallbackURL X（Twitter）OAuth 认证：截到授权码后回调 account_sys。
+// code 是一次性的、account_sys 侧无轮询（丢了就只能人工重来），所以这个是**必达**回调，
+// 失败要重试（见 xAuthCallbackRetries）。
+const xAuthCallbackURL = "http://47.89.235.227:3366/api/v1/x_auth/auth_callback"
+
+// 授权模式：同一个 POST /accounts/open_auth_url 接口承载两种流程。
+const (
+	// authModeClick postforme 模式：等「Continue」按钮 → JS 点击 → 等 URL 变化。
+	authModeClick = "click"
+	// authModeLocalCode X/OAuth 2.0 PKCE 模式：人工在浏览器里完成授权 → 等页面跳到本机
+	// 回调地址（如 http://127.0.0.1:9000/callback?code=...）→ 从 URL 抠 code → 回调 account_sys。
+	authModeLocalCode = "local_code"
+)
 
 const (
 	// authWorkTimeout 「打开 + 点击 + 判定」整段工作的兜底超时。
@@ -93,6 +124,17 @@ const (
 	authButtonWait = 60 * time.Second
 	// authStepTimeout 单步页面命令（探测/取 URL）的超时。
 	authStepTimeout = 15 * time.Second
+
+	// xAuthDefaultWait X 认证等待用户完成授权的默认时长。
+	// 授权过程要人工登录 + 点确认，比 postforme 的自动点击慢得多。
+	xAuthDefaultWait = 10 * time.Minute
+	// xAuthPollInterval 轮询"页面是否已跳到本机回调地址"的间隔。
+	xAuthPollInterval = time.Second
+	// xAuthCallbackRetries 授权码回调 account_sys 的重试次数（含首次）。
+	xAuthCallbackRetries = 3
+	// xAuthDefaultRedirectPrefix 兜底的本机回调前缀。
+	// 正常路径由授权 URL 自身的 redirect_uri 参数解析得到，无需请求方额外传参。
+	xAuthDefaultRedirectPrefix = "http://127.0.0.1:9000/callback"
 )
 
 // OpenAuthURLRequest 「打开授权 URL + 点击确认」任务请求体。
@@ -107,12 +149,19 @@ type OpenAuthURLRequest struct {
 	// 点击后等待页面跳转的超时秒数（跳转 = 授权成功），默认 15；未跳转则判失败。
 	RedirectWaitS int `json:"redirect_wait_seconds,omitempty"`
 
+	// Mode 授权模式："click"（默认，postforme）/ "local_code"（X OAuth 认证）。
+	// 不传时按 ref 前缀推断：XAuth: → local_code，其余 → click。显式传值优先级最高。
+	Mode string `json:"mode,omitempty"`
+	// RedirectPrefix local_code 模式下用于判定"已跳转到本机回调"的 URL 前缀。
+	// 不传时自动从 url 里的 redirect_uri 参数解析，再兜底 xAuthDefaultRedirectPrefix。
+	RedirectPrefix string `json:"redirect_prefix,omitempty"`
+
 	Host             string `json:"host"`
 	Port             int    `json:"port"`
 	WaitSeconds      int    `json:"wait_seconds"`
 	UndetectablePath string `json:"undetectable_path"`
 	Async            bool   `json:"async"`
-	Ref              string `json:"ref,omitempty"` // 约定 "PostformeAuth:<account_id>"
+	Ref              string `json:"ref,omitempty"` // "PostformeAuth:<account_id>" 或 "XAuth:<account_id>"
 	Batch            string `json:"batch,omitempty"`
 }
 
@@ -147,8 +196,11 @@ func handleOpenAuthURL(logger *logx.Logger) http.HandlerFunc {
 			req.WaitSeconds = accountDefaultWaitS
 		}
 
-		logger.Print("AUTH", fmt.Sprintf("收到打开授权页请求: profile=%s url=%s async=%v ref=%s",
-			req.ProfileName, safeSnippet(req.URL, 120), req.Async, req.Ref))
+		// 授权模式：显式 mode 优先，否则按 ref 前缀推断（XAuth: → local_code，其余 click）。
+		mode := resolveAuthMode(req)
+
+		logger.Print("AUTH", fmt.Sprintf("收到打开授权页请求: profile=%s mode=%s url=%s async=%v ref=%s",
+			req.ProfileName, mode, safeSnippet(req.URL, 120), req.Async, req.Ref))
 
 		// taskCtx 为任务根 context：异步时被替换为可取消 ctx，使 POST /tasks/clear 能中断。
 		var taskCtx context.Context = context.Background()
@@ -239,8 +291,15 @@ func handleOpenAuthURL(logger *logx.Logger) http.HandlerFunc {
 			// 8. 任务级工作上下文：仅作兜底超时，**绝不在操作中途取消**。
 			// 之所以不直接用 tabCtx：tabCtx 无超时，一旦页面永久不 ready 会卡住任务；
 			// 而套子 ctx 又必须保证不会与 chromedp 的事件派发竞态（见文件头踩坑 2），
-			// 所以这里给足 10 分钟，只在极端情况下兜底。
-			workCtx, cancelWork := context.WithTimeout(tabCtx, authWorkTimeout)
+			// 所以这里给足兜底时长，只在极端情况下生效。
+			// local_code 模式要等人工完成授权，兜底时长必须覆盖等待时长，否则会先被这层掐断。
+			workTimeout := authWorkTimeout
+			if mode == authModeLocalCode {
+				if d := xAuthWaitDuration(req) + 2*time.Minute; d > workTimeout {
+					workTimeout = d
+				}
+			}
+			workCtx, cancelWork := context.WithTimeout(tabCtx, workTimeout)
 			defer cancelWork()
 
 			// 9. 打开授权页 —— 必须复用既有封装 NavigateAndWaitBody：
@@ -250,6 +309,34 @@ func handleOpenAuthURL(logger *logx.Logger) http.HandlerFunc {
 				return "failed", "打开授权页失败: " + err.Error()
 			}
 			logger.Print("AUTH", "已打开授权页: "+safeSnippet(currentPageURL(workCtx, 5*time.Second), 160))
+
+			// ===== local_code 模式（X / Twitter OAuth 2.0 PKCE）=====
+			// 与 postforme 的唯一区别：**不点任何按钮**，等人工在浏览器里完成授权后页面
+			// 自己跳到本机回调地址，然后从该 URL 抠 code 回传 account_sys。
+			//
+			// ⚠️ 判定跳转必须走 browser 级 Targets（见文件头踩坑 5）：目标端口没有服务监听，
+			// Chrome 会渲染 chrome-error://chromewebdata/ 错误页，Location 读不到原始 URL。
+			if mode == authModeLocalCode {
+				prefix := resolveRedirectPrefix(req)
+				waitDur := xAuthWaitDuration(req)
+				logger.Print("AUTH", fmt.Sprintf("X 认证：等待页面跳转到 %s（最长 %s，需人工完成授权）", prefix, waitDur))
+
+				cb, err := waitLocalCallback(browserCtx, workCtx, logger, prefix, waitDur)
+				if err != nil {
+					logger.Print("AUTH", "等待授权码失败: "+err.Error())
+					return "failed", "等待授权码失败: " + err.Error()
+				}
+				logger.Print("AUTH", fmt.Sprintf("已截获授权码: code=%s state=%s url=%s",
+					maskSecret(cb.Code), safeSnippet(cb.State, 60), safeSnippet(cb.URL, 200)))
+
+				// 先关浏览器，再回调（与 postforme 流程同序）
+				closeBrowser()
+				if err := callXAuthCallback(logger, req.Ref, cb); err != nil {
+					logger.Print("AUTH_CB", "授权码回调失败: "+err.Error())
+					return "failed", "已截获授权码但回调 account_sys 失败: " + err.Error()
+				}
+				return "success", "已获取授权码并回调 account_sys"
+			}
 
 			// 10. 等按钮 → 点击 → 等跳转（跳转 = 授权成功）
 			if err := clickAuthButton(workCtx, logger, req); err != nil {
@@ -458,4 +545,224 @@ func callPostformeAuthCallback(logger *logx.Logger, ref string) {
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	logger.Print("AUTH_CB", fmt.Sprintf("授权点击已回调 account_sys: account_id=%s status=%d body=%s",
 		accountID, resp.StatusCode, strings.TrimSpace(string(raw))))
+}
+
+// ===== X（Twitter）OAuth 2.0 认证：本机回调截码 =====
+//
+// 与 postforme 模式的差异：
+//   - postforme：机器端**替用户点**「Continue」，点完立刻算数；
+//   - X：机器端**不碰页面**，等人工登录 + 点「Authorize app」，X 把浏览器跳转到
+//     redirect_uri（如 http://127.0.0.1:9000/callback?code=...&state=...），机器端从 URL 抠 code。
+//
+// 注意：那个回调地址上**没有服务监听**，Chrome 会显示"无法访问此网站"错误页 —— 这正常，
+// 不影响取参（原始 URL 保留在 browser 级 target 信息里，见文件头踩坑 5）。
+
+// resolveAuthMode 决定授权流程模式：显式 mode 优先，否则按 ref 前缀推断。
+// 前缀推断是为了让 account_sys 侧只用 ref 就能切换流程（契约约定 XAuth: vs PostformeAuth:）。
+func resolveAuthMode(req OpenAuthURLRequest) string {
+	if m := strings.TrimSpace(req.Mode); m != "" {
+		return m
+	}
+	if strings.HasPrefix(strings.TrimSpace(req.Ref), "XAuth:") {
+		return authModeLocalCode
+	}
+	return authModeClick
+}
+
+// xAuthWaitDuration 等待用户完成授权的时长：取 max(请求值, xAuthDefaultWait)。
+// 之所以不用请求值直接兜底：请求缺省时 wait_seconds 会被填成 accountDefaultWaitS
+// （45 秒，语义是"等 profile 启动"），对人工授权远远不够，会把正常授权掐断。
+func xAuthWaitDuration(req OpenAuthURLRequest) time.Duration {
+	d := xAuthDefaultWait
+	if s := time.Duration(req.WaitSeconds) * time.Second; s > d {
+		d = s
+	}
+	return d
+}
+
+// resolveRedirectPrefix 解析"本机回调地址"前缀，优先级：
+// 请求显式传入 → 授权 URL 自身的 redirect_uri 参数（自动 URL 解码）→ 兜底默认值。
+// 走 redirect_uri 的好处：account_sys 不用额外传参，端口改了也自动跟随。
+func resolveRedirectPrefix(req OpenAuthURLRequest) string {
+	if p := strings.TrimSpace(req.RedirectPrefix); p != "" {
+		return p
+	}
+	if u, err := url.Parse(strings.TrimSpace(req.URL)); err == nil {
+		if ru := strings.TrimSpace(u.Query().Get("redirect_uri")); ru != "" {
+			return ru
+		}
+	}
+	return xAuthDefaultRedirectPrefix
+}
+
+// localCallback 从本机回调 URL 里抠出的授权信息。
+type localCallback struct {
+	Code  string
+	State string
+	URL   string
+}
+
+// waitLocalCallback 轮询"是否有 page 标签页停在 prefix 指向的回调地址"，命中且带 code 即返回。
+//
+// 扫**所有** page 标签页而不是只看当前工作标签页：授权中途 X 可能换标签页，
+// 或用户手动操作导致跳转发生在别的标签页上，扫全部更稳。
+func waitLocalCallback(browserCtx, workCtx context.Context, logger *logx.Logger, prefix string, wait time.Duration) (localCallback, error) {
+	deadline := time.Now().Add(wait)
+	lastSeen := ""
+	for {
+		if raw := findRedirectURL(browserCtx, prefix); raw != "" {
+			if raw != lastSeen {
+				lastSeen = raw
+				logger.Print("AUTH", "检测到跳转到本机回调地址: "+safeSnippet(raw, 200))
+			}
+			cb, ok, err := parseLocalCallback(raw)
+			if err != nil {
+				return localCallback{URL: raw}, err
+			}
+			if ok {
+				return cb, nil
+			}
+			// 命中回调地址但 query 里还没 code：导航中间态，继续等
+		}
+
+		if err := workCtx.Err(); err != nil {
+			return localCallback{}, fmt.Errorf("等待授权期间任务被中断(%v)；%s", err, describePage(workCtx, nil))
+		}
+		if !time.Now().Before(deadline) {
+			return localCallback{}, fmt.Errorf("等待 %s 仍未检测到授权跳转（用户未完成授权或已中断）；%s",
+				wait, describePage(workCtx, nil))
+		}
+		time.Sleep(xAuthPollInterval)
+	}
+}
+
+// findRedirectURL 在所有 page 标签页里找 URL 命中本机回调前缀的那个，返回其 URL；没有则空串。
+//
+// 为什么不用 chromedp.Location：目标端口无服务时 Chrome 渲染 chrome-error://chromewebdata/，
+// 页面级 API 只能看到错误页地址，`?code=` 就丢了；而 browser 级 Targets 里 page target 的
+// URL 仍保留原始请求 URL —— 2026-09-28 实测确认（见文件头踩坑 5）。
+func findRedirectURL(browserCtx context.Context, prefix string) string {
+	ctx, cancel := context.WithTimeout(browserCtx, 5*time.Second)
+	defer cancel()
+	targets, err := chromedp.Targets(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, t := range targets {
+		if t.Type != "page" {
+			continue
+		}
+		if matchRedirectURL(t.URL, prefix) {
+			return t.URL
+		}
+	}
+	return ""
+}
+
+// matchRedirectURL 判断 u 是否落在 prefix 指向的回调地址上。
+// 先字面前缀匹配；再退一步做 scheme/host/path 语义匹配，吸收大小写、尾斜杠等细微差异
+// （X 回跳时可能对 URL 做规范化）。
+func matchRedirectURL(u, prefix string) bool {
+	if u == "" || prefix == "" {
+		return false
+	}
+	if strings.HasPrefix(u, prefix) {
+		return true
+	}
+	pu, err1 := url.Parse(u)
+	pp, err2 := url.Parse(prefix)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return strings.EqualFold(pu.Scheme, pp.Scheme) &&
+		strings.EqualFold(pu.Host, pp.Host) &&
+		strings.TrimRight(pu.EscapedPath(), "/") == strings.TrimRight(pp.EscapedPath(), "/")
+}
+
+// parseLocalCallback 解析回调 URL 的 query，返回 (授权信息, 是否已拿到 code, error)。
+// error 非 nil 表示明确失败 —— 典型是 ?error=access_denied（用户点了拒绝）。
+func parseLocalCallback(raw string) (localCallback, bool, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return localCallback{}, false, fmt.Errorf("解析回调 URL 失败: %w", err)
+	}
+	q := u.Query()
+	cb := localCallback{Code: q.Get("code"), State: q.Get("state"), URL: raw}
+	if cb.Code != "" {
+		return cb, true, nil
+	}
+	if e := strings.TrimSpace(q.Get("error")); e != "" {
+		if desc := strings.TrimSpace(q.Get("error_description")); desc != "" {
+			return cb, false, fmt.Errorf("授权被拒绝或失败: %s (%s)", e, desc)
+		}
+		return cb, false, fmt.Errorf("授权被拒绝或失败: %s", e)
+	}
+	return cb, false, nil
+}
+
+// maskSecret 日志用：授权码只留首尾各 4 位，避免一次性凭证明文进日志。
+func maskSecret(s string) string {
+	if len(s) <= 8 {
+		return "***"
+	}
+	return s[:4] + "***" + s[len(s)-4:]
+}
+
+// callXAuthCallback 把抠到的授权码回调 account_sys（POST /api/v1/x_auth/auth_callback）。
+// account_id 从 ref="XAuth:<account_id>" 解析；state 可选（抠不到就不传）。
+//
+// 与 postforme 回调不同，这是**必达**回调：code 一次性、account_sys 侧无轮询，
+// 回调丢了该账号会一直卡"认证中"、只能人工重来 —— 所以失败要重试（退避 1s / 2s）。
+func callXAuthCallback(logger *logx.Logger, ref string, cb localCallback) error {
+	accountID := ""
+	if strings.HasPrefix(ref, "XAuth:") {
+		accountID = strings.TrimSpace(strings.TrimPrefix(ref, "XAuth:"))
+	}
+
+	payload := map[string]string{"account_id": accountID, "code": cb.Code}
+	if cb.State != "" {
+		payload["state"] = cb.State
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("构造回调体失败: %w", err)
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= xAuthCallbackRetries; attempt++ {
+		if lastErr = postXAuthCallback(logger, body, accountID, attempt); lastErr == nil {
+			return nil
+		}
+		if attempt < xAuthCallbackRetries {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+	return fmt.Errorf("重试 %d 次仍失败: %w", xAuthCallbackRetries, lastErr)
+}
+
+// postXAuthCallback 单次回调，2xx 视为成功。
+func postXAuthCallback(logger *logx.Logger, body []byte, accountID string, attempt int) error {
+	reqCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, xAuthCallbackURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("构建请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", accountCheckUA)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logger.Print("AUTH_CB", fmt.Sprintf("X 认证回调失败(第%d次): %v", attempt, err))
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	logger.Print("AUTH_CB", fmt.Sprintf("X 认证回调(第%d次): account_id=%s status=%d body=%s",
+		attempt, accountID, resp.StatusCode, safeSnippet(strings.TrimSpace(string(raw)), 300)))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("account_sys 返回 %d: %s", resp.StatusCode,
+			safeSnippet(strings.TrimSpace(string(raw)), 200))
+	}
+	return nil
 }
