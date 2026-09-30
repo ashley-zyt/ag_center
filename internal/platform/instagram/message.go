@@ -95,12 +95,20 @@ func (m *instagramMessenger) CheckLogin(ctx context.Context) (string, error) {
 	return message.StatusLoggedIn, nil
 }
 
-// OpenTargetProfile 导航到对方主页
+// OpenTargetProfile 导航到对方主页，并检测「页面打不开」的错误页。
+// 链接失效 / 账号被删 / 主页被移除时，Instagram 返回
+// "Sorry, this page isn't available. The link you followed may be broken, or the page may have been removed."
+// 的错误页（<title> 仍是 Instagram，URL 也不变），必须靠正文识别，命中则直接返回错误，
+// 避免后续 clickMessageButton 白等 60 秒再报一句含糊的「未找到 Message 按钮」。
 func (m *instagramMessenger) OpenTargetProfile(ctx context.Context, task message.SendTask) error {
 	if err := chromedputil.NavigateAndWaitBody(ctx, m.logger, task.TargetURL, "IG_MSG2"); err != nil {
 		return err
 	}
 	time.Sleep(3 * time.Second)
+	if err := m.detectUnavailablePage(ctx); err != nil {
+		m.logger.Print("IG_MSG2", "对方主页打不开: "+err.Error())
+		return err
+	}
 	m.logger.Print("IG_MSG2", "已打开目标用户主页: "+task.TargetURL)
 	return nil
 }
@@ -240,6 +248,47 @@ func (m *instagramMessenger) detectFollowState(ctx context.Context) string {
 	_ = chromedp.Run(detectCtx, chromedp.Evaluate(js, &st))
 	cancel()
 	return st
+}
+
+// igUnavailablePageSignals Instagram「主页打不开」错误页的特征文案。
+// 错误页正文（2026-09-30 快照「打不开页面.txt」实测）：
+//
+//	"Sorry, this page isn't available. The link you followed may be broken, or the page may have been removed."
+//
+// 只取不含撇号/撇号已归一化的片段；比对前先跑 normalizeIGPageText 统一。
+var igUnavailablePageSignals = []string{
+	"this page isn't available",       // 主文案（归一化后撇号为直撇号）
+	"link you followed may be broken", // 副文案，无撇号，最稳
+	"page may have been removed",      // 副文案，无撇号
+}
+
+// normalizeIGPageText 压平空白 + 小写 + 统一撇号，用于页面文本特征匹配。
+// Instagram 的撇号可能是弯撇号 ’(U+2019)，比对前统一成直撇号 '(U+0027)，
+// 避免字节级精确匹配静默失手（X 授权页踩过同样的坑）。
+func normalizeIGPageText(s string) string {
+	r := strings.NewReplacer("\u2019", "'", "\u2018", "'", "\u02bc", "'", "\u00b4", "'", "`", "'")
+	return strings.ToLower(strings.Join(strings.Fields(r.Replace(s)), " "))
+}
+
+// detectUnavailablePage 检测当前页面是否为「主页打不开」错误页。
+// 命中返回 error（调用方据此快速失败）；读不到页面或未命中一律返回 nil（不阻断正常流程）。
+// 注意：该错误页的 <title> 仍是 "Instagram"、URL 也不带 error 参数，与正常主页无从区分，
+// 只能靠读正文识别。
+func (m *instagramMessenger) detectUnavailablePage(ctx context.Context) error {
+	evalCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var text string
+	if err := chromedp.Run(evalCtx,
+		chromedp.Evaluate(`(document.body && document.body.innerText || '').slice(0, 4000)`, &text)); err != nil {
+		return nil
+	}
+	norm := normalizeIGPageText(text)
+	for _, sig := range igUnavailablePageSignals {
+		if strings.Contains(norm, normalizeIGPageText(sig)) {
+			return fmt.Errorf("页面不可用（Sorry, this page isn't available，链接失效或页面已删除）")
+		}
+	}
+	return nil
 }
 
 // clickMessageButton 查找并点击对方主页的"Message"按钮
