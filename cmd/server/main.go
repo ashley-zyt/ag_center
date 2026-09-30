@@ -1597,9 +1597,33 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 				}
 			}
 
-			logger.Print("MSG", fmt.Sprintf("单条私信流程完成: profile=%s, platform=%s, account_id=%d, 状态=%s", req.ProfileName, req.Platform, req.AccountID, sendRes.Status))
-			return "success", sendRes.Status, SendSingleMessageResponse{
-				Type:      "success",
+			// 业务结果映射为任务状态：只有真正发送成功(sendRes.Status=="completed")才算任务 success。
+			// 未登录(not_logged_in)/失败(failed)/异常(error)都属于业务失败，任务必须判 failed ——
+			// 否则 account_sys 的 handle_kol_send 用 status=='success' 判断私信是否成功，
+			// 会把「未登录」误判成「已发送」，进而错误地把 KolMessage 置 sent_success 并流转 contact/kol。
+			// 参考：同步路径 account_sys 用 parse_send_response 判的是
+			// type=="success" && status=="completed" && result.status=="sent"，三条件齐全才成功，
+			// 异步回调这里也必须与之对齐（status 不能无条件 success）。
+			taskStatus := "success"
+			respType := "success"
+			if sendRes.Status != "completed" {
+				taskStatus = "failed"
+				respType = "error"
+			}
+
+			// info 优先取具体错误信息（outcome.ErrorInfo 带平台 tag，如 "IG_MSG2 账号未登录"），
+			// 退回业务状态名（not_logged_in / failed / error）。
+			info := sendRes.Status
+			if outcome != nil && outcome.ErrorInfo != "" {
+				info = outcome.ErrorInfo
+			} else if sendRes.ErrorInfo != "" {
+				info = sendRes.ErrorInfo
+			}
+
+			logger.Print("MSG", fmt.Sprintf("单条私信流程完成: profile=%s, platform=%s, account_id=%d, 任务状态=%s, 业务状态=%s",
+				req.ProfileName, req.Platform, req.AccountID, taskStatus, sendRes.Status))
+			return taskStatus, info, SendSingleMessageResponse{
+				Type:      respType,
 				ProfileID: startRes.ProfileID,
 				AccountID: req.AccountID,
 				Status:    sendRes.Status,
@@ -1735,10 +1759,27 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 				}
 			}
 
-			logger.Print("MSG", fmt.Sprintf("判断回复完成: profile=%s, platform=%s, account_id=%d, 状态=%s, 回复状态=%s, 新回复=%d",
-				req.ProfileName, req.Platform, req.AccountID, checkRes.Status, checkRes.ReplyStatus, checkRes.ReplyCount))
-			return "success", checkRes.ReplyStatus, CheckReplyResponse{
-				Type:        "success",
+			// 业务结果映射任务状态（与 send_message 同理）：
+			// 只有真正查询完成(status=="completed")才算任务 success，
+			// not_logged_in / failed / error 都应判 failed ——
+			// 否则 account_sys 的 handle_kol_reply 用 status=='success' 会把「未登录/失败」误判成「已查」。
+			taskStatus := "success"
+			respType := "success"
+			if checkRes.Status != "completed" {
+				taskStatus = "failed"
+				respType = "error"
+			}
+
+			// info 优先取具体错误信息，退回回复状态名（replied / awaiting_reply）。
+			info := checkRes.ReplyStatus
+			if checkRes.ErrorInfo != "" {
+				info = checkRes.ErrorInfo
+			}
+
+			logger.Print("MSG", fmt.Sprintf("判断回复完成: profile=%s, platform=%s, account_id=%d, 任务状态=%s, 业务状态=%s, 回复状态=%s, 新回复=%d",
+				req.ProfileName, req.Platform, req.AccountID, taskStatus, checkRes.Status, checkRes.ReplyStatus, checkRes.ReplyCount))
+			return taskStatus, info, CheckReplyResponse{
+				Type:        respType,
 				ProfileID:   startRes.ProfileID,
 				AccountID:   req.AccountID,
 				Status:      checkRes.Status,
