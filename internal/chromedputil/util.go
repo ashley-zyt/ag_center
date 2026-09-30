@@ -54,8 +54,19 @@ func closePageTarget(ctx context.Context, exec cdp.Executor, id target.ID) error
 	return target.CloseTarget(id).Do(cdp.WithExecutor(closeCtx, exec))
 }
 
-// CloseAllTabsThenBrowser 关闭浏览器中所有 page 标签页(供停止 profile 前清理用)。
+// CloseAllTabsThenBrowser 关闭浏览器中所有 page 标签页。
 // ctx 必须是 chromedp.NewContext 创建的浏览器上下文, 不能是 allocator 上下文。
+//
+// ⚠️ 副作用很重：关掉**最后一个** page 标签页会让浏览器随之退出，CDP websocket 立即断开，
+// 而 chromedp 的 RemoteAllocator 在 LostConnection 时会 Cancel 整棵上下文
+// （chromedp/allocate.go:586-597）。也就是说，本函数一旦生效：
+//   - 该 browserCtx 及其所有子 ctx 立刻变成已取消状态，后续任何 CDP 调用都失败；
+//   - 此时再去调 Undetectable 的 stop 接口，就是在操作一个已不存在的浏览器
+//     （实测返回 Invalid profile id / 超时）。
+//
+// 因此它**只适合放在「停 profile 失败、需要自己动手把浏览器关掉」的兜底路径**，
+// 以及「本来就要销毁这个浏览器」的场景。正常收尾请先调 stop 接口
+// （见 cmd/server/stopProfileWithCleanup 与 CloseTabsAndStopProfile 的注释）。
 func CloseAllTabsThenBrowser(ctx context.Context) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -213,12 +224,47 @@ func NavigateAndWaitBody(ctx context.Context, logger *logx.Logger, url, tag stri
 	return nil
 }
 
-// CloseTabsAndStopProfile 关闭所有标签页, 并请求停止 Undetectable Profile。
+// CloseTabsAndStopProfile 收尾：停掉 Undetectable profile（失败才自己动手关浏览器）。
 // browserCtx 必须是 chromedp.NewContext 创建的浏览器上下文。
 // websocketURL 为该 profile 的 CDP 地址，用于在 stop 接口失效时按调试端口定位浏览器进程做兜底清理。
+//
+// ⚠️ 顺序（2026-09-29 修正，与原实现相反）：**先调 stop 接口，成功就直接结束**。
+// 原实现先 CloseAllTabsThenBrowser 清标签页再调 stop，但清掉最后一个标签页会让浏览器退出、
+// CDP 连接断开、chromedp 随之 Cancel 整棵上下文（详见 CloseAllTabsThenBrowser 注释），
+// 于是 stop 接口永远在操作一个不存在的浏览器：日志里固定出现
+// 「请求停止 Undetectable Profile 失败: all stop attempts failed: Invalid profile id / 404…」，
+// 白等 20~30 秒，且兜底的 CloseBrowserViaCDP 因 ctx 已取消而静默跳过。
+// 先停再清，主程序能在浏览器存活时干净收尾，profile 状态立即回到 Available。
+//
+// 函数名沿用旧名（调用点较多），实际顺序已是「stop → （失败才）清标签页 + 兜底」。
 func CloseTabsAndStopProfile(ctx context.Context, browserCtx context.Context, logger *logx.Logger,
 	profileID, undetectableHost string, undetectablePort int, websocketURL string, platformTag string) {
 
+	// 参数不全时退化为「只清标签页」：此时无法请求 stop 接口，只能自己动手关掉浏览器。
+	if profileID == "" || undetectableHost == "" || undetectablePort == 0 {
+		if browserCtx != nil {
+			closeCtx, cancelClose := context.WithTimeout(browserCtx, 15*time.Second)
+			if err := CloseAllTabsThenBrowser(closeCtx); err != nil {
+				logger.Print(platformTag, "清理标签页遇到异常 (Best Effort): "+err.Error())
+			}
+			cancelClose()
+		}
+		return
+	}
+
+	stopCtx, cancelStop := context.WithTimeout(ctx, 30*time.Second)
+	err := undetectable.NewClient(undetectableHost, undetectablePort).StopProfileBestEffort(stopCtx, profileID)
+	cancelStop()
+
+	if err == nil {
+		logger.Print(platformTag, "已成功请求停止 Undetectable Profile")
+		time.Sleep(3 * time.Second)
+		logger.Print(platformTag, "云端同步缓冲完成，配置安全关闭")
+		return
+	}
+
+	// 停不掉才自己动手：先清标签页（浏览器随之退出），再走 CDP / 进程级兜底。
+	logger.Print(platformTag, "请求停止 Undetectable Profile 失败: "+err.Error())
 	if browserCtx != nil {
 		closeCtx, cancelClose := context.WithTimeout(browserCtx, 15*time.Second)
 		if err := CloseAllTabsThenBrowser(closeCtx); err != nil {
@@ -228,25 +274,11 @@ func CloseTabsAndStopProfile(ctx context.Context, browserCtx context.Context, lo
 		}
 		cancelClose()
 	}
-
-	if profileID != "" && undetectableHost != "" && undetectablePort != 0 {
-		stopCtx, cancelStop := context.WithTimeout(ctx, 30*time.Second)
-		err := undetectable.NewClient(undetectableHost, undetectablePort).StopProfileBestEffort(stopCtx, profileID)
-		cancelStop()
-
-		if err != nil {
-			logger.Print(platformTag, "请求停止 Undetectable Profile 失败: "+err.Error())
-			// 兜底 1：通过 CDP 关闭浏览器本体
-			CloseBrowserViaCDP(browserCtx, logger, platformTag)
-			// 兜底 2：进程级清理。Undetectable 主程序崩溃/卡死时，stop 接口与 CDP 可能都失效，
-			// 此时按该 profile 的调试端口特征直接结束浏览器进程树，避免进程永久残留。
-			KillBrowserProcessesByHint(logger, RemoteDebugPortHint(websocketURL))
-		} else {
-			logger.Print(platformTag, "已成功请求停止 Undetectable Profile")
-			time.Sleep(3 * time.Second)
-			logger.Print(platformTag, "云端同步缓冲完成，配置安全关闭")
-		}
-	}
+	// 兜底 1：通过 CDP 关闭浏览器本体
+	CloseBrowserViaCDP(browserCtx, logger, platformTag)
+	// 兜底 2：进程级清理。Undetectable 主程序崩溃/卡死时，stop 接口与 CDP 可能都失效，
+	// 此时按该 profile 的调试端口特征直接结束浏览器进程树，避免进程永久残留。
+	KillBrowserProcessesByHint(logger, RemoteDebugPortHint(websocketURL))
 }
 
 // ===== 进程级兜底清理 =====

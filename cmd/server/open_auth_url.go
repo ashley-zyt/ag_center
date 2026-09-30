@@ -135,6 +135,10 @@ const (
 	// xAuthErrorGraceWait 一旦确认授权页已报错（X 侧拒绝授权，重试通常无效），
 	// 把剩余等待缩短到这个时长 —— 既给人工「Go back」重试留窗口，又不至于白等满 10 分钟。
 	xAuthErrorGraceWait = 90 * time.Second
+	// xAuthLoginCheckInterval 在「等勾选框」阶段顺带检测『X 未登录』页的间隔。
+	// 未登录属**致命**错误（机器端没能力替人登录），越早发现越好：命中即判失败，
+	// 不必白等满 xConsentWait 再白等满授权等待时长。
+	xAuthLoginCheckInterval = 3 * time.Second
 	// xAuthCallbackRetries 授权码回调 account_sys 的重试次数（含首次）。
 	xAuthCallbackRetries = 3
 	// xConsentWait 等待 X 授权页「I trust this app」勾选框出现、勾选生效、
@@ -333,8 +337,12 @@ func handleOpenAuthURL(logger *logx.Logger) http.HandlerFunc {
 				prefix := resolveRedirectPrefix(req)
 				waitDur := xAuthWaitDuration(req)
 
-				// 自动勾选 + 授权（尽力而为，失败不中止 —— 后面仍在等跳转，人工可接手）
-				grantXAuthConsent(workCtx, logger)
+				// 自动勾选 + 授权（尽力而为，失败不中止 —— 后面仍在等跳转，人工可接手）。
+				// **例外**：页面显示「X 未登录」时机器端没有任何补救手段（要账号密码 / 2FA），
+				// 继续等只会白占浏览器 → 直接判失败，把原因原样交回 account_sys。
+				if fatal := grantXAuthConsent(workCtx, logger); fatal != nil {
+					return "failed", fatal.Error()
+				}
 
 				logger.Print("AUTH", fmt.Sprintf("X 认证：等待页面跳转到 %s（最长 %s）", prefix, waitDur))
 
@@ -583,25 +591,39 @@ func xAuthorizeButtonsJS() (probeJS, clickJS string) {
 // 页面跳转，人在旁边可以手动补点；失败原因已写进日志，最终超时错误里也能看到。
 // 反过来，如果这个 app 压根不需要勾选（X 只对 loopback / 敏感权限才插这道确认），
 // 这里会等 xConsentWait 后自动跳过，不影响后续流程。
-func grantXAuthConsent(workCtx context.Context, logger *logx.Logger) {
+//
+// **唯一例外**：沿路若发现页面是「X 未登录」提示（见 xAuthNotLoggedInSignals），说明前置条件
+// 不满足 —— 机器端没能力替人登录（要账号密码 / 2FA），继续等只是白占浏览器，所以立刻返回该
+// 致命错误，由调用方直接判失败。返回非 nil 即代表「不要再往下走了」。
+func grantXAuthConsent(workCtx context.Context, logger *logx.Logger) *authPageError {
 	probeJS, clickBoxJS, clickLabelJS := xTrustCheckboxJS()
 
-	// 1) 等勾选框出现（授权页是客户端渲染的 SPA，元素晚于 body 就绪）
+	// 1) 等勾选框出现（授权页是客户端渲染的 SPA，元素晚于 body 就绪）。
+	//    沿路每 xAuthLoginCheckInterval 顺带检测一次「X 未登录」—— 未登录时页面上没有勾选框，
+	//    若不做这个检测就要白等满 xConsentWait（30s）再白等满授权等待时长（10min）。
 	state := ""
 	deadline := time.Now().Add(xConsentWait)
+	nextLoginCheck := time.Now() // 首轮就检查一次，页面已渲染好的话 1~2 秒内即可判失败
 	for time.Now().Before(deadline) {
 		if s, err := evalString(workCtx, probeJS, authStepTimeout); err == nil && s != "" && s != "not-found" {
 			state = s
 			break
 		}
+		if !time.Now().Before(nextLoginCheck) {
+			nextLoginCheck = time.Now().Add(xAuthLoginCheckInterval)
+			if e := detectAuthPageError(workCtx); e != nil && e.Fatal {
+				logger.Print("AUTH", "❌ "+e.Error())
+				return e
+			}
+		}
 		if workCtx.Err() != nil {
-			return
+			return nil
 		}
 		time.Sleep(time.Second)
 	}
 	if state == "" {
 		logger.Print("AUTH", "X 授权页未见「I trust this app」勾选框（该 app 可能不需要此确认，或页面结构已变），跳过自动确认")
-		return
+		return nil
 	}
 	if state == "checked" {
 		logger.Print("AUTH", "X 授权页「I trust this app」已是勾选状态")
@@ -622,7 +644,7 @@ func grantXAuthConsent(workCtx context.Context, logger *logx.Logger) {
 					break
 				}
 				if workCtx.Err() != nil {
-					return
+					return nil
 				}
 				time.Sleep(500 * time.Millisecond)
 			}
@@ -632,7 +654,7 @@ func grantXAuthConsent(workCtx context.Context, logger *logx.Logger) {
 		}
 		if !checked {
 			logger.Print("AUTH", "「I trust this app」勾选后状态未变为已选，改为等待人工完成授权")
-			return
+			return nil
 		}
 		logger.Print("AUTH", "已勾选「I trust this app」")
 	}
@@ -647,13 +669,13 @@ func grantXAuthConsent(workCtx context.Context, logger *logx.Logger) {
 			break
 		}
 		if workCtx.Err() != nil {
-			return
+			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	if !ready {
 		logger.Print("AUTH", "「Authorize app」按钮未变为可点状态，改为等待人工完成授权")
-		return
+		return nil
 	}
 
 	// 4) 点击。会触发导航，命令本身可能因页面卸载而中断 —— 忽略错误、不重试（避免重复授权）。
@@ -670,6 +692,7 @@ func grantXAuthConsent(workCtx context.Context, logger *logx.Logger) {
 		// 回执没拿到，多半是点击已触发导航、页面卸载导致命令中断 —— 按「已触发」处理，继续等跳转
 		logger.Print("AUTH", fmt.Sprintf("已触发「Authorize app」点击（回执未取到: %v），继续等待页面跳转", cerr))
 	}
+	return nil
 }
 
 // evalString 在页面上下文中求值一个返回字符串的 JS 表达式。
@@ -849,15 +872,17 @@ type localCallback struct {
 // 扫**所有** page 标签页而不是只看当前工作标签页：授权中途 X 可能换标签页，
 // 或用户手动操作导致跳转发生在别的标签页上，扫全部更稳。
 //
-// 期间还会顺带做一件事：**检测 X 是否已经直接拒绝这次授权**（页面显示
-// "Something went wrong / You weren't able to give access to the App"，
-// 或跳到 x.com/i/oauth2/error）。这类错误绝大多数是 X 后台配置问题（见 detectAuthPageError），
-// 原地重试通常无效，但为了不误杀人工「Go back」重试，这里只把剩余等待缩短到
-// xAuthErrorGraceWait，并把 X 的原始提示带回错误信息 —— 不用等满 10 分钟就能定位。
+// 期间还会顺带做一件事：**检测授权页是不是已经报错了**（见 detectAuthPageError），
+// 命中后按致命与否分两路：
+//   - 致命（Fail-Fast）：如「X 未登录」—— 机器端没有任何补救手段（要账号密码 / 2FA），
+//     继续等只是白占浏览器和任务时长，**立即返回错误**；
+//   - 非致命：如 X 侧拒绝授权（`Something went wrong / You weren't able to give access to the App`）
+//     或跳到 x.com/i/oauth2/error —— 多为 X 后台配置问题，但为了不误杀人工「Go back」重试，
+//     只把剩余等待缩短到 xAuthErrorGraceWait，并把现场原文带回错误信息。
 func waitLocalCallback(browserCtx, workCtx context.Context, logger *logx.Logger, prefix string, wait time.Duration) (localCallback, error) {
 	deadline := time.Now().Add(wait)
 	lastSeen := ""
-	authErr := "" // X 侧拒绝授权的现场信息（页面提示文案 / 错误页 URL）
+	var authErr *authPageError // 授权页上的错误现场（nil = 暂未发现）
 	nextErrCheck := time.Now()
 	for {
 		redirectURL, errURL := scanPageTargets(browserCtx, prefix)
@@ -876,16 +901,24 @@ func waitLocalCallback(browserCtx, workCtx context.Context, logger *logx.Logger,
 			// 命中回调地址但 query 里还没 code：导航中间态，继续等
 		}
 
-		// X 自己把授权请求判错了 —— 通常重试无效，别白等满 10 分钟
-		if authErr == "" {
+		// 授权页报错了 —— 先分类，再决定「立刻失败」还是「缩短等待」
+		if authErr == nil {
 			if errURL != "" {
-				authErr = "X 授权错误页: " + safeSnippet(errURL, 200)
+				authErr = &authPageError{
+					Text: "X 授权错误页: " + safeSnippet(errURL, 200),
+					Hint: "多为 X 后台配置问题，原地重试通常无效",
+				}
 			} else if !time.Now().Before(nextErrCheck) {
 				nextErrCheck = time.Now().Add(xAuthErrorCheckInterval)
 				authErr = detectAuthPageError(workCtx)
 			}
-			if authErr != "" {
-				logger.Print("AUTH", "⚠️ X 侧拒绝本次授权（多为 X 后台配置问题，原地重试通常无效）: "+authErr)
+			if authErr != nil {
+				if authErr.Fatal {
+					// 机器端没法补救（典型：X 未登录，需要账号密码 / 2FA）→ 立刻失败，不白占浏览器
+					logger.Print("AUTH", "❌ "+authErr.Error())
+					return localCallback{}, fmt.Errorf("X 授权无法继续: %s", authErr.Error())
+				}
+				logger.Print("AUTH", "⚠️ X 侧拒绝本次授权（多为 X 后台配置问题，原地重试通常无效）: "+authErr.Error())
 				if d := time.Now().Add(xAuthErrorGraceWait); d.Before(deadline) {
 					deadline = d
 					logger.Print("AUTH", fmt.Sprintf("已把剩余等待缩短到 %s（仍可人工点 Go back 重试）", xAuthErrorGraceWait))
@@ -897,8 +930,8 @@ func waitLocalCallback(browserCtx, workCtx context.Context, logger *logx.Logger,
 			return localCallback{}, fmt.Errorf("等待授权期间任务被中断(%v)；%s", err, describePage(workCtx, nil))
 		}
 		if !time.Now().Before(deadline) {
-			if authErr != "" {
-				return localCallback{}, fmt.Errorf("等待 %s 未检测到授权跳转，且 X 侧已拒绝授权: %s", wait, authErr)
+			if authErr != nil {
+				return localCallback{}, fmt.Errorf("等待 %s 未检测到授权跳转，且 X 侧已拒绝授权: %s", wait, authErr.Error())
 			}
 			return localCallback{}, fmt.Errorf("等待 %s 仍未检测到授权跳转（用户未完成授权或已中断）；%s",
 				wait, describePage(workCtx, nil))
@@ -953,6 +986,41 @@ func isXAuthErrorURL(raw string) bool {
 	return strings.Contains(u.Path, "/i/oauth2/authorize") && strings.TrimSpace(u.Query().Get("error")) != ""
 }
 
+// authPageError 授权页上检测到的错误现场。
+//
+// 用一个结构而不是裸字符串，是为了把「机器端还能不能补救」这件事显式带出来：
+// 机器端能做的补救非常有限（顶多替人点个按钮），凡涉及账号状态（比如未登录）就注定失败 ——
+// 这种情况下继续占着浏览器白等 10 分钟毫无意义，应该立刻把任务判掉。
+type authPageError struct {
+	Text  string // 页面现场原文（已压平空白、截断），原样进日志与任务错误信息
+	Hint  string // 成因提示，帮人一眼定位
+	Fatal bool   // true = 机器端无补救手段，立即判失败；false = 缩短等待，留人工补救窗口
+}
+
+func (e *authPageError) Error() string {
+	if e.Hint == "" {
+		return e.Text
+	}
+	return e.Hint + "；页面现场: " + e.Text
+}
+
+// xAuthNotLoggedInSignals 「X 账号未登录」页面的特征文案 —— 这属于**可直接判失败**的错误：
+// 机器端没有能力替人登录（要账号密码 / 2FA / 验证码），只能让用户先在指纹浏览器 profile 里
+// 登录好 X 再重试。
+//
+// 页面形态（2026-09-29 桌面快照实测，见桌面 1.txt）：
+//   - 标题仍是 `Authorize app / X`，与正常授权页**完全一样** → 不能拿 title 判定；
+//   - 正文 `To use this App you have to be logged in to X.`；
+//   - 另有一个 "Log in" 链接指向 `/i/jf/onboarding/web?mode=login&redirect_after_login=<授权URL>`；
+//   - URL 仍是 `/i/oauth2/authorize?...`（不带 error 参数）→ URL 特征同样帮不上忙。
+//
+// 结论：**只能读页面正文**。好在整句不含撇号，可安全整段匹配（不受 U+2019/U+0027 变形影响）。
+var xAuthNotLoggedInSignals = []string{
+	"have to be logged in to x",
+	"to use this app you have to be logged in",
+	"才能使用此应用", // 中文界面变体
+}
+
 // xAuthErrorSignals X 拒绝授权时页面上的特征文案（英文 / 中文界面都要覆盖）。
 // 取自 X 实际错误页：标题 "Something went wrong"，正文
 // "You weren’t able to give access to the App. Go back and try logging in again."
@@ -985,25 +1053,43 @@ func normalizeAuthPageText(s string) string {
 	).Replace(flat)
 }
 
-// detectAuthPageError 读当前工作标签页的可见文本，命中 X 的错误文案就返回该文案（已压平空白）。
-// 读不到页面（命令超时等）一律返回空 —— 绝不把「读不到」当成「报错」。
-func detectAuthPageError(workCtx context.Context) string {
+// detectAuthPageError 读当前工作标签页的可见文本，命中错误文案就返回现场信息；没命中返回 nil。
+// 读不到页面（命令超时等）一律返回 nil —— 绝不把「读不到」当成「报错」。
+//
+// 判定顺序很重要：**先判「未登录」**（致命，直接失败），再判「X 拒绝授权」（非致命，缩短等待）。
+func detectAuthPageError(workCtx context.Context) *authPageError {
 	evalCtx, cancel := context.WithTimeout(workCtx, 5*time.Second)
 	defer cancel()
 	var text string
 	// 取 4000 字符而非 800：正文前面可能有若干行导航/页脚文案，截太短会把特征句切掉。
 	if err := chromedp.Run(evalCtx,
 		chromedp.Evaluate(`(document.body && document.body.innerText || '').slice(0, 4000)`, &text)); err != nil {
-		return ""
+		return nil
 	}
 	flat := strings.Join(strings.Fields(text), " ")
 	norm := normalizeAuthPageText(text)
-	for _, sig := range xAuthErrorSignals {
+
+	// 1) X 账号未登录 —— 机器端无法补救，直接判失败（Fail-Fast）
+	for _, sig := range xAuthNotLoggedInSignals {
 		if strings.Contains(norm, normalizeAuthPageText(sig)) {
-			return safeSnippet(flat, 300)
+			return &authPageError{
+				Text:  safeSnippet(flat, 300),
+				Hint:  "X 账号未登录（请先在指纹浏览器 profile 里登录好 X，再重试本任务）",
+				Fatal: true,
+			}
 		}
 	}
-	return ""
+
+	// 2) X 侧拒绝授权 —— 多为 app 级配置问题，缩短等待但仍留人工「Go back」重试的窗口
+	for _, sig := range xAuthErrorSignals {
+		if strings.Contains(norm, normalizeAuthPageText(sig)) {
+			return &authPageError{
+				Text: safeSnippet(flat, 300),
+				Hint: "多为 X 后台配置问题，原地重试通常无效",
+			}
+		}
+	}
+	return nil
 }
 
 // matchRedirectURL 判断 u 是否落在 prefix 指向的回调地址上。

@@ -20,9 +20,14 @@ import (
 // 依据真实页面 DOM(1/3/5/7/9/11.txt)校准。Instagram 采用 CSS-in-JS 的哈希类名,
 // 稳定性有限, 但以下是当前真实页面可用的定位方式; 若页面改版需重新校准这里。
 
-// igFollowButtonSelector 主页关注按钮: 未关注/已关注均为 <button> 且类名含 "_aswp"。
-// 状态区分: 类名含 "_aswu" = 未关注(文案 Follow), 含 "_aswv" = 已关注(文案 Following)。
-const igFollowButtonSelector = `button[class*="_aswp"]`
+// igFollowButtonSelector 主页「关注/Following」按钮。
+// 依据真实页面 DOM(未关注.txt / 已关注.txt)校准：
+//   - 关注按钮(未关注 Follow / 已关注 Following)的 class 同时含 `_aswp` + `_aswr`，
+//     状态由 `_aswu`(未关注) / `_aswv`(已关注) 区分；
+//   - ⚠️ 主页 bio 里的外链按钮(文案 "Link icon…")class 是 `_aswp _aswq _asws _aswu`，
+//     **也带 `_aswu`**。若只按 `_aswp`/`_aswu` 定位，会把它误判成"未关注"，且 ByQuery
+//     取第一个还会点到外链按钮上。因此这里必须加 `_aswr` 把关注按钮与外链按钮区分开。
+const igFollowButtonSelector = `button[class*="_aswp"][class*="_aswr"]`
 
 // igMessageButtonSelectors 对方主页"Message"按钮候选(仅已关注时出现)。
 // 注意区分导航栏的 "Messages"(复数) 与按钮的 "Message"。
@@ -41,6 +46,7 @@ var igMessageInputSelectors = []string{
 // 消息方向标记(位于消息文本 div[dir="auto"] 的 class 后缀上):
 //   - xyk4ms5: 我方发出(outgoing, 白字)
 //   - x18lvrbx: 对方发来(incoming, 深色字)
+//
 // 说明: 气泡 role="presentation" 上的 x1lu5o8o/x1t39747 是"气泡圆角/分组位置"类, 并非方向,
 // 不能用于判定方向(实测两者都会在 outgoing/incoming 中出现)。方向应看文本 div 的 class 后缀。
 const igOutgoingClass = "xyk4ms5"
@@ -103,7 +109,7 @@ func (m *instagramMessenger) OpenTargetProfile(ctx context.Context, task message
 // 仅发送流程(MessageContent 非空)需要"先关注再私信"; 判断回复流程不主动关注。
 func (m *instagramMessenger) OpenConversationFromProfile(ctx context.Context, task message.SendTask) error {
 	if strings.TrimSpace(task.MessageContent) != "" {
-		if err := m.ensureFollowing(ctx); err != nil {
+		if err := m.ensureFollowing(ctx, task.TargetURL); err != nil {
 			return err
 		}
 	}
@@ -162,34 +168,19 @@ func (m *instagramMessenger) FetchConversationMessages(ctx context.Context) ([]m
 
 // ─────────────────────────── 辅助函数 ───────────────────────────
 
-// ensureFollowing 尽力确保已关注对方(未关注则点击 Follow)。
-// 注意: 实测部分账号点击 Follow 后按钮并不会变为 Following(关注请求挂起/未生效, 刷新后仍是 Follow),
-// 但此时 Message 按钮仍可点击并正常发消息。因此这里采用"尽力而为"策略:
-// 点击后短暂等待即返回, 不因"未变 Following"而阻断; 能否发消息交由 clickMessageButton 兜底判定。
-func (m *instagramMessenger) ensureFollowing(ctx context.Context) error {
+// ensureFollowing 确保已关注对方(未关注则点击 Follow, 刷新页面后确认)。
+//
+// 流程：检测关注状态 → 未关注则点击 Follow → 刷新页面 → 再次检测确认是否变 Following → 返回。
+// 若已关注，直接返回交由 clickMessageButton 点「Message」进会话。
+//
+// 刷新后若仍未变 Following(关注请求可能挂起/未生效)，不阻断：部分账号 Message 按钮仍可点击，
+// 能否发消息交由 clickMessageButton 兜底判定。
+func (m *instagramMessenger) ensureFollowing(ctx context.Context, targetURL string) error {
 	m.logger.Print("IG_MSG2", "检查并关注对方账号")
 
-	jsState := fmt.Sprintf(`(function(){
-		var btns = document.querySelectorAll(%q);
-		for (var i = 0; i < btns.length; i++) {
-			var b = btns[i];
-			var cls = (b.className || '');
-			var text = (b.innerText || b.textContent || '').trim();
-			if (cls.indexOf('_aswv') >= 0 || /^Following$/i.test(text)) return 'following';
-			if (cls.indexOf('_aswu') >= 0 || /^Follow$/i.test(text)) return 'follow';
-		}
-		return 'missing';
-	})()`, igFollowButtonSelector)
-
-	// 先检测一次当前状态
-	var st string
-	detectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	_ = chromedp.Run(detectCtx, chromedp.Evaluate(jsState, &st))
-	cancel()
-
-	switch st {
+	switch m.detectFollowState(ctx) {
 	case "following":
-		m.logger.Print("IG_MSG2", "已关注对方账号")
+		m.logger.Print("IG_MSG2", "已关注对方账号，直接进入私信")
 		return nil
 	case "missing":
 		// 无关注按钮(可能为本人主页等), 不阻断, 交给后续 Message 判定
@@ -197,7 +188,7 @@ func (m *instagramMessenger) ensureFollowing(ctx context.Context) error {
 		return nil
 	case "follow":
 		// 未关注, 点击 Follow
-		m.logger.Print("IG_MSG2", "点击关注按钮")
+		m.logger.Print("IG_MSG2", "未关注，点击关注按钮")
 		clickCtx, cancelClick := context.WithTimeout(ctx, 10*time.Second)
 		err := chromedp.Run(clickCtx,
 			chromedp.ScrollIntoView(igFollowButtonSelector, chromedp.ByQuery),
@@ -210,23 +201,45 @@ func (m *instagramMessenger) ensureFollowing(ctx context.Context) error {
 			m.logger.Print("IG_MSG2", "点击关注按钮失败(不阻断): "+err.Error())
 			return nil
 		}
-		m.logger.Print("IG_MSG2", "已点击关注按钮")
-		time.Sleep(3 * time.Second)
+		m.logger.Print("IG_MSG2", "已点击关注按钮，刷新页面确认关注状态")
 
-		// 回读一次状态(仅日志): 未变 Following 也继续往下走
-		var st2 string
-		readCtx, cancelRead := context.WithTimeout(ctx, 5*time.Second)
-		_ = chromedp.Run(readCtx, chromedp.Evaluate(jsState, &st2))
-		cancelRead()
-		if st2 == "following" {
-			m.logger.Print("IG_MSG2", "已关注对方账号")
+		// 刷新页面：复用现有导航封装（切勿自己用 context.WithTimeout 包 Navigate，
+		// 子 ctx 取消会与 chromedp 的加载事件派发竞态，把后续所有页面命令搞成超时）。
+		if err := chromedputil.NavigateAndWaitBody(ctx, m.logger, targetURL, "IG_MSG2"); err != nil {
+			m.logger.Print("IG_MSG2", "关注后刷新页面失败(不阻断): "+err.Error())
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+
+		if m.detectFollowState(ctx) == "following" {
+			m.logger.Print("IG_MSG2", "刷新后确认已关注对方账号")
 		} else {
-			m.logger.Print("IG_MSG2", "关注后按钮未变为 Following(可能挂起/未生效), 继续尝试发消息")
+			m.logger.Print("IG_MSG2", "刷新后仍未变为 Following(关注可能挂起/未生效), 继续尝试发消息")
 		}
 		return nil
 	default:
 		return nil
 	}
+}
+
+// detectFollowState 检测当前主页的关注状态，返回 "following" / "follow" / "missing"。
+// 只匹配「关注按钮」(class 同时含 _aswp + _aswr)，从源头排除 bio 外链按钮(含 _asws)。
+func (m *instagramMessenger) detectFollowState(ctx context.Context) string {
+	js := fmt.Sprintf(`(function(){
+		var btns = document.querySelectorAll(%q);
+		for (var i = 0; i < btns.length; i++) {
+			var cls = (btns[i].className || '');
+			if (cls.indexOf('_aswv') >= 0) return 'following';
+			if (cls.indexOf('_aswu') >= 0) return 'follow';
+		}
+		return 'missing';
+	})()`, igFollowButtonSelector)
+
+	var st string
+	detectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	_ = chromedp.Run(detectCtx, chromedp.Evaluate(js, &st))
+	cancel()
+	return st
 }
 
 // clickMessageButton 查找并点击对方主页的"Message"按钮

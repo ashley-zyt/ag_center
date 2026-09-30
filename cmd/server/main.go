@@ -723,24 +723,45 @@ func guardExtra[T any](logger *logx.Logger, fn func() (string, string, T, string
 	}
 }
 
+// stopProfileWithCleanup 停止 profile 并回收本地 CDP 资源（发布/采集/私信/养号/授权的统一收尾）。
+//
+// ⚠️ 顺序是关键（2026-09-29 修正）：**先按官方接口停 profile，再考虑关标签页**。
+//
+// 旧顺序是「先 CloseAllTabsThenBrowser 清标签页 → 再调 stop 接口」，看上去更"干净"，
+// 实际是反的：关掉最后一个 page 标签页后浏览器会随之退出，CDP websocket 随即断开，
+// 而 chromedp 的 RemoteAllocator 在 LostConnection 时会直接 Cancel 整棵上下文
+// （chromedp/allocate.go:586-597：`<-browser.LostConnection; Cancel(ctx)`）。
+// 于是在那之后：
+//   - stop 接口是在操作一个已经不存在的浏览器 → 一串
+//     `api code=1 {"error":"Invalid profile id"}` + `context deadline exceeded` + 404，
+//     既定位不到真因，还白等 20~30 秒（2026-09-28 22:49 实测）；
+//   - 兜底的 CloseBrowserViaCDP 因为 ctx 已被取消而**静默跳过**（日志里连一行都没有）。
+//
+// 先停再清则：浏览器还活着，主程序能干净收尾、profile 状态立刻回到 Available；
+// 万一 stop 失败，browserCtx 也还是好的，后面的 CDP / 进程级兜底才真正有效。
 func stopProfileWithCleanup(ctx context.Context, logger *logx.Logger, browserCtx context.Context, host string, port int, profileID string, websocketURL string) {
+	// 1. 先请主程序停 profile（内部已把官方路径式接口 GET /profile/stop/{id} 排到首位）。
+	//    超时给足 30s：端点响应稍慢也不能导致浏览器残留。
+	stopCtx, cancelStop := context.WithTimeout(ctx, 30*time.Second)
+	err := undetectable.NewClient(host, port).StopProfileBestEffort(stopCtx, profileID)
+	cancelStop()
+	if err == nil {
+		logger.Print("STOP", "已停止 Profile: "+profileID)
+		return
+	}
+
+	// 2. 停不掉才自己动手：先清标签页（浏览器会随之退出），失败再走 CDP / 进程级兜底。
+	logger.Print("E", "停止 Profile 失败(浏览器可能未彻底关闭): "+err.Error())
 	if browserCtx != nil {
 		closeCtx, cancelClose := context.WithTimeout(browserCtx, 10*time.Second)
 		_ = chromedputil.CloseAllTabsThenBrowser(closeCtx)
 		cancelClose()
 	}
-	// 停止 profile 需逐个尝试多个 API 端点，超时给足，避免端点响应稍慢就导致浏览器残留
-	stopCtx, cancelStop := context.WithTimeout(ctx, 30*time.Second)
-	err := undetectable.NewClient(host, port).StopProfileBestEffort(stopCtx, profileID)
-	cancelStop()
-	if err != nil {
-		logger.Print("E", "停止 Profile 失败(浏览器可能未彻底关闭): "+err.Error())
-		// 兜底 1：通过 CDP 关闭浏览器本体
-		chromedputil.CloseBrowserViaCDP(browserCtx, logger, "STOP")
-		// 兜底 2：进程级清理。Undetectable 主程序崩溃/卡死时 stop 接口与 CDP 可能都失效，
-		// 此时按该 profile 的调试端口特征直接结束浏览器进程树，避免进程永久残留。
-		chromedputil.KillBrowserProcessesByHint(logger, chromedputil.RemoteDebugPortHint(websocketURL))
-	}
+	// 兜底 1：通过 CDP 关闭浏览器本体
+	chromedputil.CloseBrowserViaCDP(browserCtx, logger, "STOP")
+	// 兜底 2：进程级清理。Undetectable 主程序崩溃/卡死时 stop 接口与 CDP 可能都失效，
+	// 此时按该 profile 的调试端口特征直接结束浏览器进程树，避免进程永久残留。
+	chromedputil.KillBrowserProcessesByHint(logger, chromedputil.RemoteDebugPortHint(websocketURL))
 }
 
 // [合并保留本地优化] isProfileLocked 判断启动/停止 profile 的错误是否为"锁被占用"类错误。

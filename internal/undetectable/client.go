@@ -153,6 +153,11 @@ type StartResult struct {
 	WebsocketLink string `json:"websocket_link"`
 }
 
+// StartProfileBestEffort 启动指定 profile（best effort：多端点逐个尝试，任一成功即返回）。
+//
+// 官方文档的启动接口是路径式 `GET /profile/start/{profileID}`（与 stop 同构）。
+// 这里把它排到首位：原先查询参数式在前，每次启动都会先白吃一个
+// `api code=1 {"error":"Invalid profile id"}`，既多一次往返，也会在失败信息里误导排查。
 func (c *Client) StartProfileBestEffort(ctx context.Context, profileID string) error {
 	candidates := []struct {
 		Method string
@@ -160,27 +165,13 @@ func (c *Client) StartProfileBestEffort(ctx context.Context, profileID string) e
 		Query  url.Values
 		Body   any
 	}{
-		// 常见路径
-		{Method: http.MethodGet, Path: "/profile/start", Query: url.Values{"profile_id": []string{profileID}}},
+		// 官方文档：GET /profile/start/{profileID}
 		{Method: http.MethodGet, Path: "/profile/start/" + profileID},
+		// 以下仅作老版本兜底
+		{Method: http.MethodGet, Path: "/profile/start", Query: url.Values{"profile_id": []string{profileID}}},
 		{Method: http.MethodPost, Path: "/profile/start", Body: map[string]string{"profile_id": profileID}},
-
-		// 可能的变体
-		{Method: http.MethodGet, Path: "/api/profile/start", Query: url.Values{"profile_id": []string{profileID}}},
-		{Method: http.MethodGet, Path: "/api/v1/profile/start", Query: url.Values{"profile_id": []string{profileID}}},
-		{Method: http.MethodGet, Path: "/v1/profile/start", Query: url.Values{"profile_id": []string{profileID}}},
-
-		// launch 动词
-		{Method: http.MethodGet, Path: "/profile/launch", Query: url.Values{"profile_id": []string{profileID}}},
 		{Method: http.MethodGet, Path: "/profile/launch/" + profileID},
-
-		// open 动词
-		{Method: http.MethodGet, Path: "/profile/open", Query: url.Values{"profile_id": []string{profileID}}},
 		{Method: http.MethodGet, Path: "/profile/open/" + profileID},
-
-		// 其他参数名
-		{Method: http.MethodGet, Path: "/profile/start", Query: url.Values{"id": []string{profileID}}},
-		{Method: http.MethodGet, Path: "/profile/start", Query: url.Values{"profile": []string{profileID}}},
 	}
 
 	var errs []string
@@ -239,6 +230,20 @@ func WaitProfileStarted(ctx context.Context, c *Client, profileID string, timeou
 	return ProfileInfo{}, fmt.Errorf("wait profile started timeout: %s (last status=%q)", timeout, lastStatus)
 }
 
+// StopProfileBestEffort 停止指定 profile（best effort：多端点逐个尝试，任一成功即返回）。
+//
+// ⚠️ 端点顺序有讲究（2026-09-29 据官方文档 + 实测修正）：
+// 官方 API 文档（Undetectable Local API，https://docs.undetectable.io/api/）定义的关闭接口是
+// **路径式**的 —— `GET /profile/stop/{profileID}`，与启动 `GET /profile/start/{profileID}` 同构；
+// 官方 Selenium 示例里就是 requests.get(f'.../profile/stop/{profile_id}')。
+//
+// 原先把「查询参数式」`/profile/stop?profile_id=...` 放在首位是错的：主程序会应答
+//
+//	api code=1 msg={"error":"Invalid profile id"}
+//
+// 看着像"profile 不存在"，实际只是参数形式不对，白白误导排查方向（2026-09-28 排了一轮）。
+// 现在把官方路径式排到第一位，其余仅作老版本兜底；同时删掉 `/api/...`、`/v1/...`、
+// `?id=`、`?profile=` 这些确认不存在的变体 —— 它们只会让失败信息变成一屏 404 噪音。
 func (c *Client) StopProfileBestEffort(ctx context.Context, profileID string) error {
 	// 停止 profile 属于清理动作，必须可靠：即使调用方的请求上下文已取消
 	// (客户端超时/断开导致 r.Context() 被取消)，也要完成停止，避免浏览器残留。
@@ -255,17 +260,12 @@ func (c *Client) StopProfileBestEffort(ctx context.Context, profileID string) er
 		Query  url.Values
 		Body   any
 	}{
-		{Method: http.MethodGet, Path: "/profile/stop", Query: url.Values{"profile_id": []string{profileID}}},
+		// 官方文档：GET /profile/stop/{profileID}
 		{Method: http.MethodGet, Path: "/profile/stop/" + profileID},
+		// 老版本兜底（保留少量即可，多了只会刷 404 噪音）
+		{Method: http.MethodGet, Path: "/profile/stop", Query: url.Values{"profile_id": []string{profileID}}},
 		{Method: http.MethodPost, Path: "/profile/stop", Body: map[string]string{"profile_id": profileID}},
-		{Method: http.MethodGet, Path: "/profile/close", Query: url.Values{"profile_id": []string{profileID}}},
 		{Method: http.MethodGet, Path: "/profile/close/" + profileID},
-		{Method: http.MethodPost, Path: "/profile/close", Body: map[string]string{"profile_id": profileID}},
-		{Method: http.MethodGet, Path: "/api/profile/stop", Query: url.Values{"profile_id": []string{profileID}}},
-		{Method: http.MethodGet, Path: "/api/v1/profile/stop", Query: url.Values{"profile_id": []string{profileID}}},
-		{Method: http.MethodGet, Path: "/v1/profile/stop", Query: url.Values{"profile_id": []string{profileID}}},
-		{Method: http.MethodGet, Path: "/profile/stop", Query: url.Values{"id": []string{profileID}}},
-		{Method: http.MethodGet, Path: "/profile/stop", Query: url.Values{"profile": []string{profileID}}},
 	}
 	var errs []string
 	for _, cnd := range candidates {
