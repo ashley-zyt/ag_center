@@ -438,66 +438,118 @@ func fillDescriptionTextbox(ctx context.Context, logger *logx.Logger, descriptio
 		chromedp.Focus(sel, chromedp.ByQuery),
 	)
 	cancel()
-	if err == nil {
-		typeCtx, cancelType := context.WithTimeout(ctx, 5*time.Second)
-		var ok bool
-		js := fmt.Sprintf(`(function(T){
+	if err != nil {
+		return errors.New("YTB5 cannot find youtube description input")
+	}
+
+	// 第 1 次：JS 原生「清空 + 写入」，并用容错比较校验（容忍末尾换行/空白的归一化差异）。
+	// 关键修复：不再用 execCommand('insertText') 兜底——selectAll 在 contenteditable 上
+	// 选不中时会退化成「追加」，导致简介被写两遍。统一改为「先原生清空，再原生写入」。
+	typeCtx, cancelType := context.WithTimeout(ctx, 5*time.Second)
+	var ok bool
+	js := fmt.Sprintf(`(function(T){
+		var el = document.querySelector(%q);
+		if(!el) return false;
+		el.focus();
+		function norm(s){ return (s||'').replace(/\u00a0/g,' ').replace(/[ \t\r\n]+$/,''); }
+		function curVal(){ return el.tagName==='TEXTAREA' ? (el.value||'') : (el.textContent||''); }
+		function clearNative(){
+			if(el.tagName==='TEXTAREA'){
+				var vs = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;
+				vs.call(el, '');
+			} else {
+				try{ el.textContent = ''; }catch(e){}
+				try{ el.innerText = ''; }catch(e){}
+			}
+			try{ el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward',data:null})); }
+			catch(e){ el.dispatchEvent(new Event('input',{bubbles:true})); }
+		}
+		function setNative(v){
+			if(el.tagName==='TEXTAREA'){
+				var vs = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;
+				vs.call(el, v);
+			} else {
+				try{
+					var ds = Object.getOwnPropertyDescriptor(window.HTMLElement.prototype,'textContent').set || Object.getOwnPropertyDescriptor(window.Node.prototype,'textContent').set;
+					ds.call(el, v);
+				}catch(e){ el.textContent = v; }
+				try{ el.innerText = v; }catch(e2){}
+			}
+			try{ el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:v})); }
+			catch(e3){ el.dispatchEvent(new Event('input',{bubbles:true})); }
+		}
+		clearNative();
+		setNative(T);
+		if(norm(curVal()) === norm(T)) return true;
+		// React 首帧可能重新归一化内容，再清空重写一次
+		clearNative();
+		setNative(T);
+		return norm(curVal()) === norm(T);
+	})(%q)`, sel, description)
+	_ = chromedp.Run(typeCtx, chromedp.Evaluate(js, &ok))
+	cancelType()
+	if ok {
+		logger.Print("YTB5", "简介已填写")
+		return nil
+	}
+
+	// 诊断：读回简介框实际内容，便于定位校验失败原因
+	var actual string
+	diagCtx, cancelDiag := context.WithTimeout(ctx, 3*time.Second)
+	_ = chromedp.Run(diagCtx, chromedp.Evaluate(fmt.Sprintf(`(function(){
+		var el = document.querySelector(%q);
+		return el ? (el.textContent || '') : 'NO_ELEMENT';
+	})()`, sel), &actual))
+	cancelDiag()
+	logger.Print("YTB5", fmt.Sprintf("JS填充校验失败，简介框实际内容=%q, 期望=%q", truncateRunes(actual, 50), truncateRunes(description, 50)))
+
+	// 第 2 兜底：先原生清空，再用 CDP Input.insertText 一次性插入（可靠替换，不逐个字符、不追加）。
+	insCtx, cancelIns := context.WithTimeout(ctx, 25*time.Second)
+	var cleared bool
+	err2 := chromedp.Run(insCtx,
+		chromedp.Evaluate(fmt.Sprintf(`(function(){
 			var el = document.querySelector(%q);
 			if(!el) return false;
 			el.focus();
-			function curVal(){ return el.tagName==='TEXTAREA' ? (el.value||'') : (el.textContent||''); }
-			function setNative(v){
-				if(el.tagName==='TEXTAREA'){
-					var vs = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;
-					vs.call(el, v);
-				} else {
-					try{
-						var ds = Object.getOwnPropertyDescriptor(window.HTMLElement.prototype,'textContent').set || Object.getOwnPropertyDescriptor(window.Node.prototype,'textContent').set;
-						ds.call(el, v);
-					}catch(e){ el.textContent = v; }
-					try{ el.innerText = v; }catch(e2){}
-				}
-				try{ el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:v})); }
-				catch(e3){ el.dispatchEvent(new Event('input',{bubbles:true})); }
+			if(el.tagName==='TEXTAREA'){
+				var vs = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;
+				vs.call(el, '');
+			} else {
+				try{ el.textContent = ''; }catch(e){}
+				try{ el.innerText = ''; }catch(e){}
 			}
-			try{document.execCommand('selectAll', false, null);}catch(e){}
-			try{document.execCommand('delete', false, null);}catch(e){}
-			try{ setNative(T); }catch(e){ try{ el.textContent = T; }catch(e2){} }
-			if(curVal() === T) return true;
-			try{ el.focus(); document.execCommand('selectAll', false, null); document.execCommand('insertText', false, T); }catch(e){}
-			return curVal() === T;
-		})(%q)`, sel, description)
-		_ = chromedp.Run(typeCtx, chromedp.Evaluate(js, &ok))
-		cancelType()
-		if ok {
-			logger.Print("YTB5", "简介已填写")
-			return nil
-		}
-		type2Ctx, cancelType2 := context.WithTimeout(ctx, 25*time.Second)
-		err2 := chromedp.Run(type2Ctx, chromedp.SendKeys(sel, kb.Control+"a", chromedp.ByQuery), chromedp.SendKeys(sel, kb.Delete, chromedp.ByQuery), chromedp.SendKeys(sel, description, chromedp.ByQuery))
-		cancelType2()
-		if err2 == nil {
-			logger.Print("YTB5", "简介已键盘兜底填写")
-			return nil
-		}
-		// 第 3 兜底：CDP Input.insertText 直接插入（对长文本最可靠，一次命令插入全部，不逐个字符）
-		insCtx, cancelIns := context.WithTimeout(ctx, 25*time.Second)
-		err3 := chromedp.Run(insCtx,
-			chromedp.Click(sel, chromedp.ByQuery),
-			chromedp.Focus(sel, chromedp.ByQuery),
-			chromedp.SendKeys(sel, kb.Control+"a", chromedp.ByQuery),
-			chromedp.SendKeys(sel, kb.Delete, chromedp.ByQuery),
-			chromedp.ActionFunc(func(ctx context.Context) error {
-				return input.InsertText(description).Do(ctx)
-			}),
-		)
-		cancelIns()
-		if err3 == nil {
-			logger.Print("YTB5", "简介已 InsertText 兜底填写")
-			return nil
-		}
+			try{ el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward',data:null})); }
+			catch(e){ el.dispatchEvent(new Event('input',{bubbles:true})); }
+			return true;
+		})()`, sel), &cleared),
+		chromedp.Click(sel, chromedp.ByQuery),
+		chromedp.Focus(sel, chromedp.ByQuery),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			return input.InsertText(description).Do(ctx)
+		}),
+	)
+	cancelIns()
+	if err2 == nil {
+		logger.Print("YTB5", "简介已 InsertText 兜底填写")
+		return nil
 	}
-	return errors.New("YTB5 cannot find youtube description input")
+
+	// 第 3 兜底：键盘全选删除后逐字符输入（仅在前两种都失败时）
+	type2Ctx, cancelType2 := context.WithTimeout(ctx, 25*time.Second)
+	err3 := chromedp.Run(type2Ctx,
+		chromedp.Click(sel, chromedp.ByQuery),
+		chromedp.Focus(sel, chromedp.ByQuery),
+		chromedp.SendKeys(sel, kb.Control+"a", chromedp.ByQuery),
+		chromedp.SendKeys(sel, kb.Delete, chromedp.ByQuery),
+		chromedp.SendKeys(sel, description, chromedp.ByQuery),
+	)
+	cancelType2()
+	if err3 == nil {
+		logger.Print("YTB5", "简介已键盘兜底填写")
+		return nil
+	}
+
+	return errors.New("YTB5 cannot fill youtube description input")
 }
 
 func clickSelector(ctx context.Context, selector string, by chromedp.QueryOption) error {
