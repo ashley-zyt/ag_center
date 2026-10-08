@@ -3,7 +3,6 @@
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -347,37 +346,8 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
+// parseTikTokMetric 解析TikTok计数, 统一走 scraper.ParseCount 适配
+// 千位/万位等常见计数表达方式(如 "1.04K"、"12.5万")。
 func parseTikTokMetric(s string) int {
-	s = strings.TrimSpace(strings.ToLower(s))
-	if s == "" {
-		return 0
-	}
-	s = strings.ReplaceAll(s, ",", "")
-	var clean strings.Builder
-	for _, r := range s {
-		if (r >= '0' && r <= '9') || r == '.' || r == 'k' || r == 'm' || r == 'b' {
-			clean.WriteRune(r)
-		} else {
-			break
-		}
-	}
-	s = clean.String()
-	multiplier := 1.0
-	if strings.HasSuffix(s, "k") {
-		multiplier = 1000.0
-		s = strings.TrimSuffix(s, "k")
-	}
-	if strings.HasSuffix(s, "m") {
-		multiplier = 1000000.0
-		s = strings.TrimSuffix(s, "m")
-	}
-	if strings.HasSuffix(s, "b") {
-		multiplier = 1000000000.0
-		s = strings.TrimSuffix(s, "b")
-	}
-	val, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0
-	}
-	return int(val * multiplier)
+	return scraper.ParseCount(s)
 }

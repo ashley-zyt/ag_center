@@ -115,7 +115,8 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 
 				// 解析订阅数
 				if result.SubText != "" {
-					numRe := regexp.MustCompile(`(\d[\d,\. \x{00a0}]*\s*[kKmMbB万亿億]?)`)
+					// 兼容英文数量级单词(thousand/million/billion 等)与单字缩写(K/M/B/万亿亿)。
+					numRe := regexp.MustCompile(`(\d[\d,\. \x{00a0}]*(?:\s*[kKmMbB万亿億])?(?:\s*(?:hundred|thousand|million|billion|trillion)s?)?)`)
 					if numMatches := numRe.FindStringSubmatch(strings.TrimSpace(result.SubText)); len(numMatches) >= 2 {
 						totalFollowers = parseYouTubeSubCount(numMatches[1])
 						logger.Print("YT_FETCH", fmt.Sprintf("账号总粉丝数(订阅者): %d (原始: %s)", totalFollowers, result.SubText))
@@ -823,127 +824,14 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-// metricThousandsDotRe 匹配越南语/欧洲格式的"点号千分位"（"1.314" = 1314）。
-// Go regexp(RE2) 不支持 lookahead，用"点号+3位数字+非数字或结尾"捕获组实现。
-var metricThousandsDotRe = regexp.MustCompile(`\.(\d{3})([^\d]|$)`)
-
+// parseYoutubeMetric 解析YouTube点赞/评论/观看数, 统一走 scraper.ParseCount 适配
+// 千位/万位等常见计数表达方式(如 "1.04K"、"1.2万"、"1.314" 欧洲千分位)。
 func parseYoutubeMetric(s string) int {
-	s = strings.TrimSpace(strings.ToLower(s))
-	if s == "" || s == "–" {
-		return 0
-	}
-	s = strings.ReplaceAll(s, ",", "")
-	// 越南语/欧洲格式：点号做千分位分隔符（"1.314" = 1314），点号后恰好 3 位数字视为千分位。
-	// 循环替换以处理多点号（如 "1.314.567" = 1314567）。
-	for {
-		next := metricThousandsDotRe.ReplaceAllString(s, "$1$2")
-		if next == s {
-			break
-		}
-		s = next
-	}
-
-	var clean strings.Builder
-	for _, r := range s {
-		if (r >= '0' && r <= '9') || r == '.' || r == 'k' || r == 'm' || r == 'b' || r == '万' {
-			clean.WriteRune(r)
-		} else if clean.Len() > 0 {
-			break
-		}
-	}
-	s = clean.String()
-
-	multiplier := 1.0
-	if strings.HasSuffix(s, "k") {
-		multiplier = 1000.0
-		s = strings.TrimSuffix(s, "k")
-	}
-	if strings.HasSuffix(s, "m") {
-		multiplier = 1000000.0
-		s = strings.TrimSuffix(s, "m")
-	}
-	if strings.HasSuffix(s, "b") {
-		multiplier = 1000000000.0
-		s = strings.TrimSuffix(s, "b")
-	}
-	if strings.HasSuffix(s, "万") {
-		multiplier = 10000.0
-		s = strings.TrimSuffix(s, "万")
-	}
-
-	val, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0
-	}
-	return int(val * multiplier)
+	return scraper.ParseCount(s)
 }
 
-// parseYouTubeSubCount 解析YouTube订阅数，支持多种语言和格式:
-// "1.2M subscribers"(英), "12.5万 位订阅者"(中), "1,2 M suscriptores"(欧),
-// "1 093 subscribers"(空格千分), "チャンネル登録者数 1.2万人"(日), "1.5億"(亿)
+// parseYouTubeSubCount 解析YouTube订阅数, 统一走 scraper.ParseCount 适配
+// 千位/万位等常见计数表达方式(如 "1.04K"、"12.5万"、"1.5亿")。
 func parseYouTubeSubCount(s string) int {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0
-	}
-	// 移除空格和不间断空格(部分语言用作千分位分隔符, 如 "1 093")
-	s = strings.ReplaceAll(s, "\u00a0", "")
-	s = strings.ReplaceAll(s, " ", "")
-
-	// 提取后缀并计算倍率
-	multiplier := 1.0
-	hasSuffix := true
-	switch {
-	case strings.HasSuffix(s, "万"):
-		multiplier = 10000.0
-		s = strings.TrimSuffix(s, "万")
-	case strings.HasSuffix(s, "億"):
-		multiplier = 100000000.0
-		s = strings.TrimSuffix(s, "億")
-	case strings.HasSuffix(s, "亿"):
-		multiplier = 100000000.0
-		s = strings.TrimSuffix(s, "亿")
-	default:
-		if len(s) > 0 {
-			last := strings.ToLower(s[len(s)-1:])
-			switch last {
-			case "k":
-				multiplier = 1000.0
-				s = s[:len(s)-1]
-			case "m":
-				multiplier = 1000000.0
-				s = s[:len(s)-1]
-			case "b":
-				multiplier = 1000000000.0
-				s = s[:len(s)-1]
-			default:
-				hasSuffix = false
-			}
-		}
-	}
-
-	// 处理小数/千分位分隔符:
-	// 同时含逗号和句号: 最后出现的是小数点
-	// 仅含逗号: 有后缀→小数点(欧洲), 无后缀→千分位(英语)
-	// 仅含句号: 视为小数点
-	if strings.Contains(s, ",") && strings.Contains(s, ".") {
-		if strings.LastIndex(s, ",") > strings.LastIndex(s, ".") {
-			s = strings.ReplaceAll(s, ".", "")
-			s = strings.ReplaceAll(s, ",", ".")
-		} else {
-			s = strings.ReplaceAll(s, ",", "")
-		}
-	} else if strings.Contains(s, ",") {
-		if hasSuffix {
-			s = strings.ReplaceAll(s, ",", ".")
-		} else {
-			s = strings.ReplaceAll(s, ",", "")
-		}
-	}
-
-	val, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0
-	}
-	return int(val * multiplier)
+	return scraper.ParseCount(s)
 }

@@ -360,67 +360,8 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-// parseTwitterMetric 解析Twitter数字，支持:
-// "8", "1,234", "12.5K", "1.5M", "1.2万", "1 234"(空格千分), "1,2K"(欧洲小数)
+// parseTwitterMetric 解析Twitter计数, 统一走 scraper.ParseCount 适配
+// 千位/万位等常见计数表达方式(如 "1.04K"、"1.2万")。
 func parseTwitterMetric(s string) int {
-	s = strings.TrimSpace(strings.ToLower(s))
-	if s == "" {
-		return 0
-	}
-	// 移除空格和不间断空格
-	s = strings.ReplaceAll(s, "\u00a0", "")
-	s = strings.ReplaceAll(s, " ", "")
-
-	multiplier := 1.0
-	hasSuffix := true
-	switch {
-	case strings.HasSuffix(s, "万"):
-		multiplier = 10000.0
-		s = strings.TrimSuffix(s, "万")
-	case strings.HasSuffix(s, "亿"):
-		multiplier = 100000000.0
-		s = strings.TrimSuffix(s, "亿")
-	case strings.HasSuffix(s, "億"):
-		multiplier = 100000000.0
-		s = strings.TrimSuffix(s, "億")
-	default:
-		if len(s) > 0 {
-			last := s[len(s)-1:]
-			switch last {
-			case "k":
-				multiplier = 1000.0
-				s = s[:len(s)-1]
-			case "m":
-				multiplier = 1000000.0
-				s = s[:len(s)-1]
-			case "b":
-				multiplier = 1000000000.0
-				s = s[:len(s)-1]
-			default:
-				hasSuffix = false
-			}
-		}
-	}
-
-	// 处理千分位/小数分隔符
-	if strings.Contains(s, ",") && strings.Contains(s, ".") {
-		if strings.LastIndex(s, ",") > strings.LastIndex(s, ".") {
-			s = strings.ReplaceAll(s, ".", "")
-			s = strings.ReplaceAll(s, ",", ".")
-		} else {
-			s = strings.ReplaceAll(s, ",", "")
-		}
-	} else if strings.Contains(s, ",") {
-		if hasSuffix {
-			s = strings.ReplaceAll(s, ",", ".")
-		} else {
-			s = strings.ReplaceAll(s, ",", "")
-		}
-	}
-
-	val, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0
-	}
-	return int(val * multiplier)
+	return scraper.ParseCount(s)
 }

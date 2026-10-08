@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	"minimax_pro/internal/logx"
@@ -359,70 +358,8 @@ func FetchInstagramPosts(ctx context.Context, logger *logx.Logger, req scraper.F
 	return scraper.SanitizeResult(result), nil
 }
 
-// parseInsMetric 解析Instagram数字，支持:
-// "53", "1,234", "12.5K", "1.5M", "1.2万", "1 234"(空格千分), "1,2K"(欧洲小数)
+// parseInsMetric 解析Instagram计数, 统一走 scraper.ParseCount 适配
+// 千位/万位等常见计数表达方式(如 "1.04K"、"1.2万")。
 func parseInsMetric(s string) int {
-	s = strings.TrimSpace(strings.ToLower(s))
-	if s == "" || s == "0" {
-		return 0
-	}
-	// 移除空格和不间断空格(部分语言用作千分位)
-	s = strings.ReplaceAll(s, "\u00a0", "")
-	s = strings.ReplaceAll(s, " ", "")
-
-	multiplier := 1.0
-	hasSuffix := true
-	switch {
-	case strings.HasSuffix(s, "万"):
-		multiplier = 10000.0
-		s = strings.TrimSuffix(s, "万")
-	case strings.HasSuffix(s, "亿"):
-		multiplier = 100000000.0
-		s = strings.TrimSuffix(s, "亿")
-	case strings.HasSuffix(s, "億"):
-		multiplier = 100000000.0
-		s = strings.TrimSuffix(s, "億")
-	default:
-		if len(s) > 0 {
-			last := s[len(s)-1:]
-			switch last {
-			case "k":
-				multiplier = 1000.0
-				s = s[:len(s)-1]
-			case "m":
-				multiplier = 1000000.0
-				s = s[:len(s)-1]
-			case "b":
-				multiplier = 1000000000.0
-				s = s[:len(s)-1]
-			default:
-				hasSuffix = false
-			}
-		}
-	}
-
-	// 处理千分位/小数分隔符:
-	// 同时含逗号和句号: 最后出现的是小数点
-	// 仅含逗号: 有后缀→小数点(欧洲), 无后缀→千分位(英语)
-	// 仅含句号: 视为小数点
-	if strings.Contains(s, ",") && strings.Contains(s, ".") {
-		if strings.LastIndex(s, ",") > strings.LastIndex(s, ".") {
-			s = strings.ReplaceAll(s, ".", "")
-			s = strings.ReplaceAll(s, ",", ".")
-		} else {
-			s = strings.ReplaceAll(s, ",", "")
-		}
-	} else if strings.Contains(s, ",") {
-		if hasSuffix {
-			s = strings.ReplaceAll(s, ",", ".")
-		} else {
-			s = strings.ReplaceAll(s, ",", "")
-		}
-	}
-
-	val, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0
-	}
-	return int(val * multiplier)
+	return scraper.ParseCount(s)
 }
