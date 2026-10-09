@@ -549,7 +549,7 @@ func clickCreatePost(ctx context.Context, logger *logx.Logger) error {
 
 	logger.Print("IG3", "等待创建帖子弹窗出现")
 	dialogSel := `div[aria-label="Create new post"]`
-	waitCtx, cancelWait := context.WithTimeout(ctx, 8*time.Second)
+	waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
 	err = chromedp.Run(waitCtx, chromedp.WaitVisible(dialogSel, chromedp.ByQuery))
 	cancelWait()
 	if err != nil {
