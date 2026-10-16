@@ -1293,7 +1293,7 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 		}
 
 		var req FetchPostsRequest
-		_, err := decodeJSONBody(r, &req, 2<<20)
+		raw, err := decodeJSONBody(r, &req, 2<<20)
 		if err != nil {
 			logger.Print("E", "fetch_posts JSON解析失败: "+err.Error())
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
@@ -1314,204 +1314,19 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			req.WaitSeconds = accountDefaultWaitS
 		}
 
-		updateEndpoint := resolvePostsUpdateURL(req.UpdateAPIURL)
-
-		// execute 执行完整采集流程：并发额度 → profile锁 → 启动(带重试) → 遍历采集+上报 → 关闭释放。
-		// 返回 (status, info, results, profileID)。
-		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
-		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
-		var taskCtx context.Context = context.Background()
-		execute := func() (string, string, []FetchPostsAccountResult, string) {
-			bgCtx := taskCtx
-
-			// 获取全局并发额度（排队等待）
-			if err := acquireBrowserSlot(bgCtx); err != nil {
-				return "failed", "获取并发额度失败: " + err.Error(), nil, ""
-			}
-			defer releaseBrowserSlot()
-
-			// 获取Profile操作锁(防止同一Profile的fetch和nurture并发执行导致浏览器混乱)
-			releaseLock := acquireProfileLock(req.ProfileName, logger)
-			defer releaseLock()
-
-			// 1. 启动指纹浏览器环境
-			logger.Print("FP1", fmt.Sprintf("启动Profile环境: %s (任务数: %d)", req.ProfileName, len(req.ActiveAccounts)))
-			startRes, err := startProfileByNameWithRetry(bgCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
-			if err != nil {
-				logger.Print("E", "启动Profile失败: "+err.Error())
-				return "failed", err.Error(), nil, ""
-			}
-
-			// 建立 CDP 远程连接
-			allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(bgCtx, startRes.Info.WebsocketLink, chromedp.NoModifyURL)
-			defer cancelAlloc()
-
-			// 🌟 双重静音保险：阻止 Chrome 底层未定义事件乱喷日志
-			browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
-				chromedp.WithLogf(func(string, ...interface{}) {}),
-				chromedp.WithErrorf(func(string, ...interface{}) {}),
-			)
-			defer cancelBrowser()
-
-			// 清理多余标签页
-			chromedputil.CleanExtraTabs(browserCtx, logger, "FETCH")
-
-			type tabInfo struct {
-				ctx    context.Context
-				cancel context.CancelFunc
-			}
-			openedTabs := make([]tabInfo, 0, len(req.ActiveAccounts))
-			results := make([]FetchPostsAccountResult, 0, len(req.ActiveAccounts))
-			statsEndpoint := resolveAccountStatsUpdateURL()
-			if statsEndpoint != "" {
-				logger.Print("FP3", fmt.Sprintf("账号统计更新API: %s (采集到粉丝数后立即上报)", statsEndpoint))
-			}
-
-			// 2. 串行遍历账号采集
-			// 第一个账号复用browserCtx(已含错误抑制)，后续账号新建标签页(同样带错误抑制)，避免多余空白标签页
-			for i, acc := range req.ActiveAccounts {
-				res := FetchPostsAccountResult{
-					AccountID: acc.ID,
-					Platform:  acc.Platform,
-					SourceURL: acc.SourceURL,
-					Status:    "abnormal",
-					Posts:     []scraper.Post{},
-				}
-
-				trimmedURL := strings.TrimSpace(acc.SourceURL)
-				if acc.ID == 0 || strings.TrimSpace(acc.Platform) == "" {
-					res.ErrorInfo = "账号参数不完整"
-					results = append(results, res)
-					continue
-				}
-
-				logger.Print("FP3", fmt.Sprintf("[%d/%d] 正在创建标签页任务 -> 平台: %s", i+1, len(req.ActiveAccounts), acc.Platform))
-
-				var tabCtx context.Context
-				var cancelTab context.CancelFunc
-				if i == 0 {
-					// 首个账号复用browserCtx，避免创建多余空白标签
-					tabCtx = browserCtx
-					cancelTab = cancelBrowser // 使用已有的cancel，不重复defer
-				} else {
-					// 注意: WithLogf/WithErrorf 是 BrowserOption(分配浏览器时用), 不是 ContextOption(创建tab时用)
-					// 在已有的browserCtx上创建新tab时传入这些选项会导致 panic
-					tabCtx, cancelTab = chromedp.NewContext(browserCtx)
-				}
-				openedTabs = append(openedTabs, tabInfo{ctx: tabCtx, cancel: cancelTab})
-
-				fetchCtx, cancelFetch := context.WithTimeout(tabCtx, 20*time.Minute)
-				stallCtx, cancelStall, watcher := chromedputil.WatchPageStall(fetchCtx, logger, fetchStallTimeout)
-				fetchRes, fetchErr := fetchPostsByPlatform(stallCtx, logger, acc.Platform, scraper.FetchRequest{
-					SourceURL:            trimmedURL,
-					AccountID:            int64(acc.ID),
-					AccountStatsEndpoint: statsEndpoint,
-				})
-				cancelStall()
-				cancelFetch()
-
-				if fetchErr != nil {
-					if watcher.Stalled() {
-						res.StalledURL = watcher.URL()
-						res.ErrorInfo = "页面停留超时, 卡在页面: " + watcher.URL()
-						logger.Print("FP3", fmt.Sprintf("[%d/%d] 页面停留超时, 卡在: %s", i+1, len(req.ActiveAccounts), watcher.URL()))
-					} else {
-						res.ErrorInfo = fetchErr.Error()
-					}
-				} else {
-					res.Posts = fetchRes.Posts
-					if res.Posts == nil {
-						res.Posts = []scraper.Post{}
-					}
-					res.PostCount = len(res.Posts)
-					res.TotalFollowers = fetchRes.TotalFollowers
-					res.TotalLikes = fetchRes.TotalLikes
-					res.TotalPosts = fetchRes.TotalPosts
-					res.Status = "normal"
-				}
-
-				// 🌟 2. 核心调整：如果配置了接口，将多条发文拆解为 Rails 期待的单条参数，循环推送
-				if res.Status == "normal" && len(res.Posts) > 0 {
-					if updateEndpoint == "" {
-						logger.Print("POSTS_UPD", fmt.Sprintf("未配置发文更新接口，跳过同步 (account_id=%d)", acc.ID))
-					} else {
-						successCount := 0
-						for _, post := range res.Posts {
-							// 将各平台提取的日期归一化为 Rails 能解析的标准字符串
-							postDate := normalizePostDate(post.PublishTime)
-
-							// 转换为 Rails 对应的单条结构
-							payload := RailsPostParam{
-								AccountID:     int64(acc.ID),
-								PostDate:      postDate,
-								URL:           post.Link,
-								Title:         post.Title,
-								LikesCount:    post.Likes,
-								SharesCount:   post.Shares,
-								CommentsCount: post.Comments,
-								ViewsCount:    post.Views,
-								DataUpdatedAt: time.Now().Format(time.RFC3339),
-							}
-
-							// 发起请求
-							updateErr := callSinglePostUpdateAPI(bgCtx, logger, updateEndpoint, payload)
-							if updateErr != nil {
-								logger.Print("E", fmt.Sprintf("同步单条推文失败 (URL: %s): %s", post.Link, updateErr.Error()))
-								res.UpdateError = updateErr.Error()
-							} else {
-								successCount++
-							}
-						}
-
-						if successCount == len(res.Posts) {
-							res.UpdateSent = true
-						}
-						logger.Print("POSTS_UPD", fmt.Sprintf("账号(account_id=%d) 数据推送完毕。成功: %d/%d", acc.ID, successCount, len(res.Posts)))
-					}
-				}
-
-				results = append(results, res)
-
-				if i < len(req.ActiveAccounts)-1 {
-					time.Sleep(2 * time.Second)
-				}
-			}
-
-			// 3. 收尾清理
-			logger.Print("FP4", "任务结束，正在释放标签页与关闭Profile进程...")
-			for _, tab := range openedTabs {
-				tab.cancel()
-			}
-
-			stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID, startRes.Info.WebsocketLink)
-
-			normalCount := 0
-			for _, res := range results {
-				if res.Status == "normal" {
-					normalCount++
-				}
-			}
-			return "success", fmt.Sprintf("采集完成 %d/%d 个账号", normalCount, len(results)), results, startRes.ProfileID
-		}
-
-		// 任务执行统一加 panic 隔离：单个任务内部异常不应终止整个服务进程
-		execute = guardExtra(logger, execute)
-
 		// 异步：立即返回 task_id，后台执行，完成后回调
 		if req.Async {
-			taskID, tctx := registerTask("fetch", req.ProfileName, req.Ref, req.Batch, 0, "", nil)
-			taskCtx = tctx
+			taskID, tctx := registerTask("fetch", req.ProfileName, req.Ref, req.Batch, 0, raw, nil)
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
-			go func() {
-				setTaskState(taskID, taskStatusRunning)
-				status, info, results, _ := execute()
-				finalizeAsyncTask(logger, taskID, "fetch", req.ProfileName, req.Ref, status, info, results)
-			}()
+			runAsyncFetch(tctx, logger, taskID, "fetch", req.ProfileName, req.Ref,
+				guardExtra(logger, func() (string, string, []FetchPostsAccountResult, string) {
+					return executeFetchPosts(tctx, logger, req, func() { setTaskState(taskID, taskStatusRunning) })
+				}))
 			return
 		}
 
 		// 同步：原地执行并返回
-		status, info, results, profileID := execute()
+		status, info, results, profileID := executeFetchPosts(context.Background(), logger, req, nil)
 		if status != "success" {
 			writeJSON(w, http.StatusBadGateway, ErrorResponse{Type: "error", ErrorInfo: info})
 			return
@@ -1522,6 +1337,187 @@ func handleFetchPosts(logger *logx.Logger) http.HandlerFunc {
 			Results:   results,
 		})
 	}
+}
+
+// executeFetchPosts 执行完整采集流程：并发额度 → profile锁 → 启动(带重试) → 遍历采集+上报 → 关闭释放。
+// 返回 (status, info, results, profileID)。独立成函数以支持服务重启后按 payload 重放。
+func executeFetchPosts(ctx context.Context, logger *logx.Logger, req FetchPostsRequest, onStart func()) (string, string, []FetchPostsAccountResult, string) {
+	bgCtx := ctx
+	updateEndpoint := resolvePostsUpdateURL(req.UpdateAPIURL)
+
+	// 获取全局并发额度（排队等待）
+	if err := acquireBrowserSlot(bgCtx); err != nil {
+		return "failed", "获取并发额度失败: " + err.Error(), nil, ""
+	}
+	defer releaseBrowserSlot()
+
+	// 拿到并发槽位才算真正开始执行，才置 running；排队等待期间保持 queued（重启后可重放）
+	if onStart != nil {
+		onStart()
+	}
+
+	// 获取Profile操作锁(防止同一Profile的fetch和nurture并发执行导致浏览器混乱)
+	releaseLock := acquireProfileLock(req.ProfileName, logger)
+	defer releaseLock()
+
+	// 1. 启动指纹浏览器环境
+	logger.Print("FP1", fmt.Sprintf("启动Profile环境: %s (任务数: %d)", req.ProfileName, len(req.ActiveAccounts)))
+	startRes, err := startProfileByNameWithRetry(bgCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+	if err != nil {
+		logger.Print("E", "启动Profile失败: "+err.Error())
+		return "failed", err.Error(), nil, ""
+	}
+
+	// 建立 CDP 远程连接
+	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(bgCtx, startRes.Info.WebsocketLink, chromedp.NoModifyURL)
+	defer cancelAlloc()
+
+	// 🌟 双重静音保险：阻止 Chrome 底层未定义事件乱喷日志
+	browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
+		chromedp.WithLogf(func(string, ...interface{}) {}),
+		chromedp.WithErrorf(func(string, ...interface{}) {}),
+	)
+	defer cancelBrowser()
+
+	// 清理多余标签页
+	chromedputil.CleanExtraTabs(browserCtx, logger, "FETCH")
+
+	type tabInfo struct {
+		ctx    context.Context
+		cancel context.CancelFunc
+	}
+	openedTabs := make([]tabInfo, 0, len(req.ActiveAccounts))
+	results := make([]FetchPostsAccountResult, 0, len(req.ActiveAccounts))
+	statsEndpoint := resolveAccountStatsUpdateURL()
+	if statsEndpoint != "" {
+		logger.Print("FP3", fmt.Sprintf("账号统计更新API: %s (采集到粉丝数后立即上报)", statsEndpoint))
+	}
+
+	// 2. 串行遍历账号采集
+	// 第一个账号复用browserCtx(已含错误抑制)，后续账号新建标签页(同样带错误抑制)，避免多余空白标签页
+	for i, acc := range req.ActiveAccounts {
+		res := FetchPostsAccountResult{
+			AccountID: acc.ID,
+			Platform:  acc.Platform,
+			SourceURL: acc.SourceURL,
+			Status:    "abnormal",
+			Posts:     []scraper.Post{},
+		}
+
+		trimmedURL := strings.TrimSpace(acc.SourceURL)
+		if acc.ID == 0 || strings.TrimSpace(acc.Platform) == "" {
+			res.ErrorInfo = "账号参数不完整"
+			results = append(results, res)
+			continue
+		}
+
+		logger.Print("FP3", fmt.Sprintf("[%d/%d] 正在创建标签页任务 -> 平台: %s", i+1, len(req.ActiveAccounts), acc.Platform))
+
+		var tabCtx context.Context
+		var cancelTab context.CancelFunc
+		if i == 0 {
+			// 首个账号复用browserCtx，避免创建多余空白标签
+			tabCtx = browserCtx
+			cancelTab = cancelBrowser // 使用已有的cancel，不重复defer
+		} else {
+			// 注意: WithLogf/WithErrorf 是 BrowserOption(分配浏览器时用), 不是 ContextOption(创建tab时用)
+			// 在已有的browserCtx上创建新tab时传入这些选项会导致 panic
+			tabCtx, cancelTab = chromedp.NewContext(browserCtx)
+		}
+		openedTabs = append(openedTabs, tabInfo{ctx: tabCtx, cancel: cancelTab})
+
+		fetchCtx, cancelFetch := context.WithTimeout(tabCtx, 20*time.Minute)
+		stallCtx, cancelStall, watcher := chromedputil.WatchPageStall(fetchCtx, logger, fetchStallTimeout)
+		fetchRes, fetchErr := fetchPostsByPlatform(stallCtx, logger, acc.Platform, scraper.FetchRequest{
+			SourceURL:            trimmedURL,
+			AccountID:            int64(acc.ID),
+			AccountStatsEndpoint: statsEndpoint,
+		})
+		cancelStall()
+		cancelFetch()
+
+		if fetchErr != nil {
+			if watcher.Stalled() {
+				res.StalledURL = watcher.URL()
+				res.ErrorInfo = "页面停留超时, 卡在页面: " + watcher.URL()
+				logger.Print("FP3", fmt.Sprintf("[%d/%d] 页面停留超时, 卡在: %s", i+1, len(req.ActiveAccounts), watcher.URL()))
+			} else {
+				res.ErrorInfo = fetchErr.Error()
+			}
+		} else {
+			res.Posts = fetchRes.Posts
+			if res.Posts == nil {
+				res.Posts = []scraper.Post{}
+			}
+			res.PostCount = len(res.Posts)
+			res.TotalFollowers = fetchRes.TotalFollowers
+			res.TotalLikes = fetchRes.TotalLikes
+			res.TotalPosts = fetchRes.TotalPosts
+			res.Status = "normal"
+		}
+
+		// 🌟 2. 核心调整：如果配置了接口，将多条发文拆解为 Rails 期待的单条参数，循环推送
+		if res.Status == "normal" && len(res.Posts) > 0 {
+			if updateEndpoint == "" {
+				logger.Print("POSTS_UPD", fmt.Sprintf("未配置发文更新接口，跳过同步 (account_id=%d)", acc.ID))
+			} else {
+				successCount := 0
+				for _, post := range res.Posts {
+					// 将各平台提取的日期归一化为 Rails 能解析的标准字符串
+					postDate := normalizePostDate(post.PublishTime)
+
+					// 转换为 Rails 对应的单条结构
+					payload := RailsPostParam{
+						AccountID:     int64(acc.ID),
+						PostDate:      postDate,
+						URL:           post.Link,
+						Title:         post.Title,
+						LikesCount:    post.Likes,
+						SharesCount:   post.Shares,
+						CommentsCount: post.Comments,
+						ViewsCount:    post.Views,
+						DataUpdatedAt: time.Now().Format(time.RFC3339),
+					}
+
+					// 发起请求
+					updateErr := callSinglePostUpdateAPI(bgCtx, logger, updateEndpoint, payload)
+					if updateErr != nil {
+						logger.Print("E", fmt.Sprintf("同步单条推文失败 (URL: %s): %s", post.Link, updateErr.Error()))
+						res.UpdateError = updateErr.Error()
+					} else {
+						successCount++
+					}
+				}
+
+				if successCount == len(res.Posts) {
+					res.UpdateSent = true
+				}
+				logger.Print("POSTS_UPD", fmt.Sprintf("账号(account_id=%d) 数据推送完毕。成功: %d/%d", acc.ID, successCount, len(res.Posts)))
+			}
+		}
+
+		results = append(results, res)
+
+		if i < len(req.ActiveAccounts)-1 {
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	// 3. 收尾清理
+	logger.Print("FP4", "任务结束，正在释放标签页与关闭Profile进程...")
+	for _, tab := range openedTabs {
+		tab.cancel()
+	}
+
+	stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID, startRes.Info.WebsocketLink)
+
+	normalCount := 0
+	for _, res := range results {
+		if res.Status == "normal" {
+			normalCount++
+		}
+	}
+	return "success", fmt.Sprintf("采集完成 %d/%d 个账号", normalCount, len(results)), results, startRes.ProfileID
 }
 
 // normalizePostDate 将各平台抓取到的发文时间归一化为 Rails 可解析的 RFC3339 字符串。

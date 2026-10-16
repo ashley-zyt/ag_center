@@ -299,9 +299,9 @@ func loadTaskStore(logger *logx.Logger) {
 			rec.Status = taskStatusInterrupted
 			orphan++
 		} else if rec.Status == taskStatusQueued {
-			// 排队中：发布任务若参数完整（有 payload），保留 queued，由 resumeQueuedPublishTasks 自动重放；
-			// 其余类型（fetch/nurture/send_message/check_reply）仍标记 interrupted，靠各自调度器兜底。
-			if rec.Payload != "" && strings.HasSuffix(rec.Type, "_publish") {
+			// 排队中：发布/采集任务若参数完整（有 payload），保留 queued，由 resumeQueuedPublishTasks 自动重放；
+			// 其余类型（nurture/send_message/check_reply）仍标记 interrupted，靠各自调度器兜底。
+			if rec.Payload != "" && isReplayableTaskType(rec.Type) {
 				// 保留 queued，等待重放
 			} else {
 				rec.Message = appendTaskMessage(rec.Message, "服务重启中断")

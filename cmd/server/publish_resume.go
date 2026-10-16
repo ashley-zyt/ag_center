@@ -366,6 +366,16 @@ func runAsyncPublish(ctx context.Context, logger *logx.Logger, taskID, taskType,
 	}()
 }
 
+// runAsyncFetch 异步执行一个采集任务：执行 → 统一收尾（finalizeAsyncTask）。
+// 状态置 running 的时机同样下沉到 executeFetchPosts 内部（拿到并发槽位后经 onStart 触发），
+// 排队等待槽位的采集任务保持 queued，重启后能被 resumeQueuedPublishTasks 自动重放。
+func runAsyncFetch(ctx context.Context, logger *logx.Logger, taskID, taskType, profileName, ref string, exec func() (string, string, []FetchPostsAccountResult, string)) {
+	go func() {
+		status, info, results, _ := exec()
+		finalizeAsyncTask(logger, taskID, taskType, profileName, ref, status, info, results)
+	}()
+}
+
 // ===== 重启重放 =====
 
 // buildPublishExecutor 根据任务类型与原始请求体 payload，构建可执行的发布闭包。
@@ -416,6 +426,18 @@ func buildPublishExecutor(ctx context.Context, taskType, payload string, logger 
 	return nil, false
 }
 
+// buildFetchExecutor 根据采集任务 payload（原始请求体 JSON）构建可执行的采集闭包。
+// 返回 (exec, true) 表示解析成功；解析失败返回 (nil, false)。
+func buildFetchExecutor(ctx context.Context, payload string, logger *logx.Logger, onStart func()) (func() (string, string, []FetchPostsAccountResult, string), bool) {
+	var req FetchPostsRequest
+	if err := json.Unmarshal([]byte(payload), &req); err != nil {
+		return nil, false
+	}
+	return guardExtra(logger, func() (string, string, []FetchPostsAccountResult, string) {
+		return executeFetchPosts(ctx, logger, req, onStart)
+	}), true
+}
+
 // claimReplay 为一次「重放」原子地占位：返回可取消 context 并登记 cancel func。
 //
 // 关键作用（修复重复重放）：
@@ -449,8 +471,9 @@ func claimReplay(taskID string) (context.Context, bool) {
 	return ctx, true
 }
 
-// resumeQueuedPublishTasks 重启后把排队中的发布任务重新入队执行。
-// 只处理 queued 且带 payload 的发布任务；running 与其余类型已在加载时标记 interrupted。
+// resumeQueuedPublishTasks 重启后把排队中的任务（发布/采集）重新入队执行。
+// 只处理 queued 且带 payload、可本机重放的类型（*_publish 与 fetch）；
+// running 与其余类型已在加载时标记 interrupted。
 func resumeQueuedPublishTasks(logger *logx.Logger) {
 	if !taskStoreEnabled {
 		return
@@ -459,7 +482,7 @@ func resumeQueuedPublishTasks(logger *logx.Logger) {
 	taskRecordsMu.Lock()
 	toResume := make([]TaskRecord, 0)
 	for _, rec := range taskRecords {
-		if rec.Status == taskStatusQueued && rec.Payload != "" && strings.HasSuffix(rec.Type, "_publish") {
+		if rec.Status == taskStatusQueued && rec.Payload != "" && isReplayableTaskType(rec.Type) {
 			toResume = append(toResume, *rec)
 		}
 	}
@@ -475,6 +498,18 @@ func resumeQueuedPublishTasks(logger *logx.Logger) {
 
 		// taskID 单独拷贝，避免闭包捕获循环变量（go1.21 for-range 变量复用）
 		taskID := rec.TaskID
+		if rec.Type == "fetch" {
+			exec, ok := buildFetchExecutor(ctx, rec.Payload, logger, func() { setTaskState(taskID, taskStatusRunning) })
+			if !ok {
+				finishTask(rec.TaskID, taskStatusInterrupted, "服务重启中断（无法解析任务参数）")
+				logger.Print("RESUME", "重放失败（无法解析参数）: "+rec.TaskID)
+				continue
+			}
+			logger.Print("RESUME", "重放排队中的采集任务: "+rec.TaskID+" type="+rec.Type+" profile="+rec.ProfileName)
+			runAsyncFetch(ctx, logger, rec.TaskID, rec.Type, rec.ProfileName, rec.Ref, exec)
+			continue
+		}
+
 		exec, ok := buildPublishExecutor(ctx, rec.Type, rec.Payload, logger, func() { setTaskState(taskID, taskStatusRunning) })
 		if !ok {
 			finishTask(rec.TaskID, taskStatusInterrupted, "服务重启中断（无法解析任务参数）")
@@ -486,8 +521,13 @@ func resumeQueuedPublishTasks(logger *logx.Logger) {
 	}
 }
 
-// resumePausedPublishTasks 人工确认 Undetectable 已启动后，把 paused 的发布任务重新入队执行。
-// 只处理带 payload 的发布任务（能本机重放）；非发布类的 paused 任务无 payload、无法本机重放，
+// isReplayableTaskType 判断任务类型是否支持本机按 payload 重放（发布与采集）。
+func isReplayableTaskType(t string) bool {
+	return strings.HasSuffix(t, "_publish") || t == "fetch"
+}
+
+// resumePausedPublishTasks 人工确认 Undetectable 已启动后，把 paused 的任务（发布/采集）重新入队执行。
+// 只处理带 payload、可本机重放的类型（*_publish 与 fetch）；非重放类的 paused 任务无 payload、无法本机重放，
 // 保持 paused 不动，靠 account_sys 各自调度器兜底重发。
 //
 // 重新入队时会把状态立刻改成 queued（而非等拿到并发额度才变）——这样
@@ -497,7 +537,7 @@ func resumePausedPublishTasks(logger *logx.Logger) int {
 	taskRecordsMu.Lock()
 	toResume := make([]TaskRecord, 0)
 	for _, rec := range taskRecords {
-		if rec.Status == taskStatusPaused && rec.Payload != "" && strings.HasSuffix(rec.Type, "_publish") {
+		if rec.Status == taskStatusPaused && rec.Payload != "" && isReplayableTaskType(rec.Type) {
 			toResume = append(toResume, *rec)
 		}
 	}
@@ -515,6 +555,18 @@ func resumePausedPublishTasks(logger *logx.Logger) int {
 
 		// taskID 单独拷贝，避免闭包捕获循环变量（go1.21 for-range 变量复用）
 		taskID := rec.TaskID
+		if rec.Type == "fetch" {
+			exec, ok := buildFetchExecutor(ctx, rec.Payload, logger, func() { setTaskState(taskID, taskStatusRunning) })
+			if !ok {
+				finishTask(rec.TaskID, taskStatusFailed, "恢复执行失败（无法解析任务参数）")
+				logger.Print("RESUME", "恢复失败（无法解析参数）: "+rec.TaskID)
+				continue
+			}
+			logger.Print("RESUME", "恢复暂停的采集任务: "+rec.TaskID+" type="+rec.Type+" profile="+rec.ProfileName)
+			runAsyncFetch(ctx, logger, rec.TaskID, rec.Type, rec.ProfileName, rec.Ref, exec)
+			continue
+		}
+
 		exec, ok := buildPublishExecutor(ctx, rec.Type, rec.Payload, logger, func() { setTaskState(taskID, taskStatusRunning) })
 		if !ok {
 			finishTask(rec.TaskID, taskStatusFailed, "恢复执行失败（无法解析任务参数）")
