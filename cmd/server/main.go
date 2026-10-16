@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -210,7 +211,105 @@ func downloadVideoFromOss(ctx context.Context, logger *logx.Logger, ossURL strin
 	}
 
 	logger.Print("DL", "视频下载完成: "+localPath)
+	// 下载后统一检测编码，非 H.264+AAC 则转码，避免各平台上传报 "could not be read by your browser"
+	localPath = transcodeIfNeeded(ctx, logger, localPath)
 	return localPath, nil
+}
+
+// findTool 查找 ffmpeg/ffprobe 可执行文件，优先 PATH，找不到再兜底常见安装目录。
+func findTool(name string) string {
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
+	candidates := []string{
+		filepath.Join(os.Getenv("ProgramData"), "chocolatey", "bin", name+".exe"),
+		filepath.Join(os.Getenv("ProgramFiles"), "ffmpeg", "bin", name+".exe"),
+		filepath.Join("C:\\ffmpeg", "bin", name+".exe"),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
+// probeCodec 探测指定流(如 v:0 / a:0)的编码名称，读不到或无该流时返回空字符串。
+func probeCodec(ctx context.Context, ffprobe, path, streamSpec string) string {
+	cmd := exec.CommandContext(ctx, ffprobe,
+		"-v", "error", "-select_streams", streamSpec,
+		"-show_entries", "stream=codec_name",
+		"-of", "default=noprint_wrappers=1:nokey=1", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// transcodeIfNeeded 检测视频编码，若视频非 H.264 或音频非 AAC/MP3 则用 ffmpeg 转成 H.264+AAC。
+// 转码成功返回新文件路径并删除原文件；无需转码、工具缺失或转码失败时返回原路径（不阻断发布）。
+func transcodeIfNeeded(ctx context.Context, logger *logx.Logger, srcPath string) string {
+	ffprobe := findTool("ffprobe")
+	ffmpeg := findTool("ffmpeg")
+	if ffprobe == "" || ffmpeg == "" {
+		logger.Print("DL", "未找到 ffmpeg/ffprobe，跳过转码检测，使用原始文件")
+		return srcPath
+	}
+
+	videoCodec := probeCodec(ctx, ffprobe, srcPath, "v:0")
+	if videoCodec == "" {
+		logger.Print("DL", "无法读取视频编码，跳过转码，使用原始文件")
+		return srcPath
+	}
+	audioCodec := probeCodec(ctx, ffprobe, srcPath, "a:0")
+
+	needsVideo := !isCompatibleVideoCodec(videoCodec)
+	needsAudio := audioCodec != "" && !isCompatibleAudioCodec(audioCodec)
+	if !needsVideo && !needsAudio {
+		return srcPath
+	}
+
+	logger.Print("DL", fmt.Sprintf("检测到不兼容编码 video=%s audio=%s，开始转码为 H.264+AAC", videoCodec, audioCodec))
+
+	ext := filepath.Ext(srcPath)
+	dstPath := strings.TrimSuffix(srcPath, ext) + "_h264.mp4"
+
+	args := []string{"-y", "-i", srcPath,
+		"-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p"}
+	if audioCodec != "" {
+		args = append(args, "-c:a", "aac", "-b:a", "128k")
+	} else {
+		args = append(args, "-an")
+	}
+	args = append(args, "-movflags", "+faststart", dstPath)
+
+	cmd := exec.CommandContext(ctx, ffmpeg, args...)
+	if err := cmd.Run(); err != nil {
+		logger.Print("DL", "转码失败，使用原始文件: "+err.Error())
+		return srcPath
+	}
+	if err := os.Remove(srcPath); err != nil {
+		logger.Print("DL", "删除原始视频失败(忽略): "+err.Error())
+	}
+	logger.Print("DL", "转码完成: "+dstPath)
+	return dstPath
+}
+
+func isCompatibleVideoCodec(codec string) bool {
+	switch strings.ToLower(strings.TrimSpace(codec)) {
+	case "h264", "avc", "avc1":
+		return true
+	}
+	return false
+}
+
+func isCompatibleAudioCodec(codec string) bool {
+	switch strings.ToLower(strings.TrimSpace(codec)) {
+	case "aac", "mp3":
+		return true
+	}
+	return false
 }
 
 func decodeJSONBody(r *http.Request, dst any, maxBytes int64) (string, error) {
