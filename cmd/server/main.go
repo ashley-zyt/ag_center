@@ -2525,7 +2525,7 @@ func main() {
 	// 避免公网直连明文 IP:8080。如需调整可用 LISTEN_ADDR 环境变量覆盖。
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
-		addr = "127.0.0.1:8080"
+		addr = "0.0.0.0:8080"
 	}
 	// 任务快照：状态变更后合并写入本地 JSON，并按保留策略定期清理超期记录。
 	startTaskStoreWriter(logger)
