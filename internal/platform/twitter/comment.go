@@ -87,8 +87,19 @@ func CommentOnTweet(ctx context.Context, logger *logx.Logger, targetURL, content
 		return CommentResult{Status: "failed", ErrorInfo: err.Error()}, err
 	}
 
-	// 7. 点击 Reply 并验证弹窗关闭（评论发送成功）
+	// 6.5 填写后等待 3 秒，让 Draft.js 状态稳定、Reply 按钮解除禁用
+	time.Sleep(3 * time.Second)
+
+	// 7. 点击 Reply 并验证弹窗关闭
 	if err := clickCommentSubmit(ctx, logger, tag); err != nil {
+		return CommentResult{Status: "failed", ErrorInfo: err.Error()}, err
+	}
+
+	// 7.5 点击后等待 10 秒，让评论真正发布
+	time.Sleep(10 * time.Second)
+
+	// 8. 强校验：评论内容真的出现在评论区
+	if err := verifyCommentPosted(ctx, logger, tag, content); err != nil {
 		return CommentResult{Status: "failed", ErrorInfo: err.Error()}, err
 	}
 
@@ -259,4 +270,42 @@ func clickCommentSubmit(ctx context.Context, logger *logx.Logger, tag string) er
 		time.Sleep(1 * time.Second)
 	}
 	return errors.New("点击 Reply 后评论弹窗未关闭，无法确认发送成功")
+}
+
+// verifyCommentPosted 强校验：评论内容真的出现在推文评论区。
+// 滚动加载评论区，匹配我方刚发的评论文本（前若干字符），避免「弹窗关闭但实际没发出去」的误判。
+func verifyCommentPosted(ctx context.Context, logger *logx.Logger, tag, content string) error {
+	needle := firstNChars(strings.TrimSpace(content), 8)
+	if needle == "" {
+		return errors.New("评论内容为空，无法校验")
+	}
+	logger.Print(tag, "校验评论是否已发布到评论区")
+
+	js := fmt.Sprintf(`(function(){
+		var needle = %q;
+		var articles = document.querySelectorAll('article[data-testid="tweet"]');
+		for(var i=0;i<articles.length;i++){
+			var textEl = articles[i].querySelector('[data-testid="tweetText"]');
+			if(!textEl) continue;
+			var t = (textEl.textContent || '').trim();
+			if(t.length > 0 && t.indexOf(needle) !== -1) return true;
+		}
+		return false;
+	})()`, needle)
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		var found bool
+		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_ = chromedp.Run(checkCtx, chromedp.Evaluate(js, &found))
+		cancel()
+		if found {
+			logger.Print(tag, "已确认评论出现在评论区")
+			return nil
+		}
+		// 滚动加载更多评论
+		_ = chromedp.Run(ctx, chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight)`, nil))
+		time.Sleep(2 * time.Second)
+	}
+	return errors.New("评论发送后未在评论区找到我方评论，无法确认成功")
 }
