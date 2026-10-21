@@ -1909,6 +1909,164 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 	}
 }
 
+// ─────────────────────────── 评论模块 ───────────────────────────
+
+// CommentRequest POST /twitter/comment 请求体（对指定推文发表评论/回复）。
+type CommentRequest struct {
+	ProfileName      string `json:"profile_name"`    // 浏览器名称
+	Platform         string `json:"platform"`        // 平台名，目前仅 twitter/x
+	TargetURL        string `json:"target_url"`      // 要评论的推文 URL
+	CommentContent   string `json:"comment_content"` // 评论内容
+	AccountID        int64  `json:"account_id"`      // 账号ID(由调用方传入, 用于追踪)
+	Host             string `json:"host"`
+	Port             int    `json:"port"`
+	WaitSeconds      int    `json:"wait_seconds"`
+	UndetectablePath string `json:"undetectable_path"`
+	Async            bool   `json:"async"`
+	Ref              string `json:"ref,omitempty"`
+	Batch            string `json:"batch,omitempty"`
+}
+
+// CommentResponse 评论任务响应结构。
+type CommentResponse struct {
+	Type      string `json:"type"`
+	ProfileID string `json:"profile_id,omitempty"`
+	AccountID int64  `json:"account_id,omitempty"`
+	Status    string `json:"status"` // completed / not_logged_in / failed
+	ErrorInfo string `json:"error_info,omitempty"`
+}
+
+// commentByPlatform 分发评论任务到平台实现。
+func commentByPlatform(ctx context.Context, logger *logx.Logger, platform, targetURL, content string) (twitter.CommentResult, error) {
+	switch strings.ToLower(strings.TrimSpace(platform)) {
+	case "twitter", "x":
+		return twitter.CommentOnTweet(ctx, logger, targetURL, content)
+	default:
+		return twitter.CommentResult{Status: "failed", ErrorInfo: "unsupported platform: " + platform}, fmt.Errorf("comment: unsupported platform %q", platform)
+	}
+}
+
+// executeComment 执行完整评论流程：并发额度 → profile锁 → 启动(带重试) → 评论 → 关闭。
+// 返回 (status, info, resp, profileID)。独立成函数以支持服务重启后按 payload 重放。
+func executeComment(ctx context.Context, logger *logx.Logger, req CommentRequest, onStart func()) (string, string, CommentResponse, string) {
+	bgCtx := ctx
+
+	// 获取全局并发额度（排队等待）
+	if err := acquireBrowserSlot(bgCtx); err != nil {
+		return "failed", "获取并发额度失败: " + err.Error(), CommentResponse{Type: "error", AccountID: req.AccountID, ErrorInfo: "获取并发额度失败: " + err.Error()}, ""
+	}
+	defer releaseBrowserSlot()
+
+	// 拿到并发槽位才算真正开始执行，才置 running；排队等待期间保持 queued（重启后可重放）
+	if onStart != nil {
+		onStart()
+	}
+
+	releaseLock := acquireProfileLock(req.ProfileName, logger)
+	defer releaseLock()
+
+	startRes, err := startProfileByNameWithRetry(bgCtx, logger, req.ProfileName, req.Host, req.Port, req.WaitSeconds, req.UndetectablePath)
+	if err != nil {
+		logger.Print("CMT", "启动Profile失败: "+err.Error())
+		return "failed", err.Error(), CommentResponse{Type: "error", AccountID: req.AccountID, ErrorInfo: err.Error()}, ""
+	}
+
+	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(bgCtx, startRes.Info.WebsocketLink, chromedp.NoModifyURL)
+	defer cancelAlloc()
+	browserCtx, cancelBrowser := chromedp.NewContext(allocCtx,
+		chromedp.WithLogf(func(string, ...interface{}) {}),
+		chromedp.WithErrorf(func(string, ...interface{}) {}),
+	)
+	defer cancelBrowser()
+	chromedputil.CleanExtraTabs(browserCtx, logger, "CMT")
+
+	commentCtx, cancelComment := context.WithTimeout(browserCtx, 5*time.Minute)
+	defer cancelComment()
+	commentRes, commentErr := commentByPlatform(commentCtx, logger, req.Platform, req.TargetURL, req.CommentContent)
+
+	stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID, startRes.Info.WebsocketLink)
+
+	if commentErr != nil {
+		info := commentRes.ErrorInfo
+		if info == "" {
+			info = commentErr.Error()
+		}
+		logger.Print("CMT", "评论流程失败: "+info)
+		return "failed", info, CommentResponse{
+			Type:      "error",
+			ProfileID: startRes.ProfileID,
+			AccountID: req.AccountID,
+			Status:    commentRes.Status,
+			ErrorInfo: info,
+		}, startRes.ProfileID
+	}
+
+	return "success", "", CommentResponse{
+		Type:      "success",
+		ProfileID: startRes.ProfileID,
+		AccountID: req.AccountID,
+		Status:    "completed",
+	}, startRes.ProfileID
+}
+
+// handleComment POST /twitter/comment 处理函数。
+func handleComment(logger *logx.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Type: "error", ErrorInfo: "method not allowed"})
+			return
+		}
+
+		var req CommentRequest
+		raw, err := decodeJSONBody(r, &req, 1<<20)
+		if err != nil {
+			logger.Print("CMT", "comment JSON解析失败: "+err.Error())
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "invalid json: " + err.Error()})
+			return
+		}
+
+		if req.ProfileName == "" || req.Platform == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "profile_name and platform are required"})
+			return
+		}
+		if req.TargetURL == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "target_url is required"})
+			return
+		}
+		if req.CommentContent == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Type: "error", ErrorInfo: "comment_content is required"})
+			return
+		}
+		if req.Host == "" {
+			req.Host = accountDefaultHost
+		}
+		if req.Port == 0 {
+			req.Port = accountDefaultPort
+		}
+		if req.WaitSeconds <= 0 {
+			req.WaitSeconds = accountDefaultWaitS
+		}
+
+		logger.Print("CMT", fmt.Sprintf("收到评论请求: profile=%s, platform=%s, account_id=%d, target=%s, async=%v",
+			req.ProfileName, req.Platform, req.AccountID, req.TargetURL, req.Async))
+
+		// 异步：立即返回 task_id，后台执行，完成后回调
+		if req.Async {
+			taskID, tctx := registerTask("twitter_comment", req.ProfileName, req.Ref, req.Batch, 0, raw, nil)
+			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			runAsyncComment(tctx, logger, taskID, "twitter_comment", req.ProfileName, req.Ref,
+				guardExtra(logger, func() (string, string, CommentResponse, string) {
+					return executeComment(tctx, logger, req, func() { setTaskState(taskID, taskStatusRunning) })
+				}))
+			return
+		}
+
+		// 同步：原地执行并返回
+		_, _, resp, _ := executeComment(context.Background(), logger, req, nil)
+		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
 func main() {
 	logger := logx.New(os.Stdout)
 	defer logger.Close()
@@ -2501,6 +2659,9 @@ func main() {
 	// 私信模块: 主动发消息(单条) + 判断回复 [保留本地精简逻辑，移除批量发送]
 	mux.HandleFunc("/accounts/send_single_message", handleSendSingleMessage(logger))
 	mux.HandleFunc("/accounts/check_reply", handleCheckReply(logger))
+
+	// 评论：对指定推文发表评论（twitter）
+	mux.HandleFunc("/twitter/comment", handleComment(logger))
 
 	// postforme 授权：打开授权页 → 点「确认授权」→ 关浏览器 → 回调 account_sys
 	mux.HandleFunc("/accounts/open_auth_url", handleOpenAuthURL(logger))
