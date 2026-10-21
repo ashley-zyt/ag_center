@@ -281,6 +281,11 @@ const taskResultURL = "http://47.89.235.227:3366/api/v1/browser_tasks/result"
 // 不必再等 check_timeout_tasks 的 45 分钟兜底窗口。
 const machineRestartedURL = "http://47.89.235.227:3366/api/v1/browser_tasks/machine_restarted"
 
+// commentTaskResultURL 评论任务完成后的回调地址（account_sys 评论专用接口）。
+// 与通用 browser_tasks/result 不同：评论任务走 /api/v1/comment_tasks/result，
+// 回传字段为 task_id(CommentTask 主键 id) + status + message。
+const commentTaskResultURL = "http://47.89.235.227:3366/api/v1/comment_tasks/result"
+
 // TaskResultPayload 任务完成回调的 payload。
 type TaskResultPayload struct {
 	TaskID      string `json:"task_id"`
@@ -290,6 +295,24 @@ type TaskResultPayload struct {
 	Ref         string `json:"ref,omitempty"`
 	Message     string `json:"message,omitempty"`
 	Result      any    `json:"result,omitempty"`
+}
+
+// commentTaskResultPayload 评论任务完成回调的 payload（account_sys 评论专用接口）。
+type commentTaskResultPayload struct {
+	TaskID  string `json:"task_id"`           // CommentTask 主键 id
+	Status  string `json:"status"`            // success / failed
+	Message string `json:"message,omitempty"` // 失败原因
+}
+
+// extractCommentTaskID 从 ref 解析 CommentTask 主键 id。
+// account_sys 下发评论任务时 ref 格式为 "comment_task:<id>"；解析失败时回退为原 ref。
+func extractCommentTaskID(ref string) string {
+	ref = strings.TrimSpace(ref)
+	const prefix = "comment_task:"
+	if strings.HasPrefix(ref, prefix) {
+		return strings.TrimSpace(strings.TrimPrefix(ref, prefix))
+	}
+	return ref
 }
 
 // finalizeAsyncTask 统一异步任务的收尾：置终态 + 回调 account_sys。
@@ -309,15 +332,22 @@ func finalizeAsyncTask(logger *logx.Logger, taskID, taskType, profileName, ref, 
 		finalStatus = taskStatusFailed
 	}
 	finishTask(taskID, finalStatus, info)
-	callbackTaskResult(context.Background(), logger, TaskResultPayload{
-		TaskID:      taskID,
-		ProfileName: profileName,
-		TaskType:    taskType,
-		Ref:         ref,
-		Status:      status,
-		Message:     info,
-		Result:      result,
-	})
+
+	// 评论任务走 account_sys 评论专用回传接口（task_id=CommentTask 主键 id + status + message）；
+	// 其余任务走通用 browser_tasks/result 接口。
+	if taskType == "twitter_comment" {
+		callbackCommentTaskResult(context.Background(), logger, taskID, ref, status, info)
+	} else {
+		callbackTaskResult(context.Background(), logger, TaskResultPayload{
+			TaskID:      taskID,
+			ProfileName: profileName,
+			TaskType:    taskType,
+			Ref:         ref,
+			Status:      status,
+			Message:     info,
+			Result:      result,
+		})
+	}
 	// 钉钉通知（仅人工/外部调用带配置的任务，best effort）
 	notifyDingtalkResult(logger, taskID, taskType, profileName, status, info)
 }
@@ -356,6 +386,50 @@ func callbackTaskResult(ctx context.Context, logger *logx.Logger, payload TaskRe
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	logger.Print("TASK_CB", fmt.Sprintf("任务回调完成: status=%d body=%s", resp.StatusCode, string(raw)))
+}
+
+// callbackCommentTaskResult 评论任务完成后回调 account_sys 评论专用接口。
+// 回传 task_id(从 ref 解析 CommentTask 主键 id) + status + message（Best Effort：失败仅打日志）。
+func callbackCommentTaskResult(ctx context.Context, logger *logx.Logger, taskID, ref, status, message string) {
+	if commentTaskResultURL == "" {
+		return
+	}
+	// 任务已被手动清除：不再回调 account_sys，避免把「已作废」的任务状态写回去。
+	if isTaskCleared(taskID) {
+		logger.Print("TASK_CB", "评论任务已被清除，跳过回调: "+taskID)
+		return
+	}
+	commentTaskID := extractCommentTaskID(ref)
+	if commentTaskID == "" {
+		logger.Print("TASK_CB", "评论任务缺少 ref 无法解析 CommentTask id，跳过回调: "+taskID)
+		return
+	}
+
+	payload := commentTaskResultPayload{TaskID: commentTaskID, Status: status, Message: message}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		logger.Print("TASK_CB", "序列化评论任务回调失败: "+err.Error())
+		return
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, commentTaskResultURL, bytes.NewReader(body))
+	if err != nil {
+		logger.Print("TASK_CB", "构建评论任务回调请求失败: "+err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", accountCheckUA)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logger.Print("TASK_CB", "评论任务回调失败: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	logger.Print("TASK_CB", fmt.Sprintf("评论任务回调完成: status=%d body=%s", resp.StatusCode, string(raw)))
 }
 
 // ===== 机器重启上报 =====
