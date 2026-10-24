@@ -217,14 +217,20 @@ func downloadVideoFromOss(ctx context.Context, logger *logx.Logger, ossURL strin
 }
 
 // findTool 查找 ffmpeg/ffprobe 可执行文件，优先 PATH，找不到再兜底常见安装目录。
+// 服务进程的 PATH 在启动时即固化（若启动早于 choco 安装，则不含 chocolatey/bin），
+// 且部分服务环境可能缺失 ProgramData 等系统变量，因此兜底同时提供硬编码绝对路径。
 func findTool(name string) string {
 	if p, err := exec.LookPath(name); err == nil {
 		return p
 	}
 	candidates := []string{
+		// choco 安装位置：shim + 真实 exe（硬编码，不依赖环境变量）
+		`C:\ProgramData\chocolatey\bin\` + name + `.exe`,
+		`C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin\` + name + `.exe`,
+		// 环境变量兜底（兼容不同机器/安装位置）
 		filepath.Join(os.Getenv("ProgramData"), "chocolatey", "bin", name+".exe"),
 		filepath.Join(os.Getenv("ProgramFiles"), "ffmpeg", "bin", name+".exe"),
-		filepath.Join("C:\\ffmpeg", "bin", name+".exe"),
+		`C:\ffmpeg\bin\` + name + `.exe`,
 	}
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
