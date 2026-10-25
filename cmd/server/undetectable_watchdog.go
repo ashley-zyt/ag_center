@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"minimax_pro/internal/chromedputil"
+	"minimax_pro/internal/config"
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/undetectable"
 )
@@ -46,9 +48,81 @@ var defaultWatchdogConfig = watchdogConfig{
 	enabled:      true,
 }
 
+// undetectableMainProcName Undetectable 主程序进程名，用于状态判断与拉起前清理残留。
+// 可通过环境变量 UNDETECTABLE_MAIN_PROC 覆盖。
+var undetectableMainProcName = "Undetectable.exe"
+
+// Undetectable 状态告警配置（环境变量）与告警状态追踪。
+var (
+	undetectableAlertWebhook  = ""
+	undetectableAlertKeyword  = ""
+	undetectableAlertCooldown = 10 * time.Minute
+
+	undetectableAlertMu sync.Mutex
+	lastAlertState      undetectableState
+	lastAlertAt         time.Time
+)
+
+func init() {
+	if v := config.Get("UNDETECTABLE_MAIN_PROC", ""); v != "" {
+		undetectableMainProcName = v
+	}
+	if v := config.Get("UNDETECTABLE_ALERT_WEBHOOK", ""); v != "" {
+		undetectableAlertWebhook = v
+	}
+	if v := config.Get("UNDETECTABLE_ALERT_KEYWORD", ""); v != "" {
+		undetectableAlertKeyword = v
+	}
+	if n := config.GetInt("UNDETECTABLE_ALERT_COOLDOWN", 0); n > 0 {
+		undetectableAlertCooldown = time.Duration(n) * time.Second
+	}
+}
+
+// undetectableState Undetectable 的运行状态。
+type undetectableState int
+
+const (
+	stateUnknown     undetectableState = iota
+	stateNormal                        // /status 可用（已登录且运行）
+	stateNotLoggedIn                   // /status 不可用，但主程序进程仍在（疑似未登录，API 未监听）
+	stateNotRunning                    // /status 不可用，且主程序进程不存在（未启动/卡退/崩溃）
+)
+
+func (s undetectableState) String() string {
+	switch s {
+	case stateNormal:
+		return "normal"
+	case stateNotLoggedIn:
+		return "not_logged_in"
+	case stateNotRunning:
+		return "not_running"
+	default:
+		return "unknown"
+	}
+}
+
+// probeUndetectableState 探测 Undetectable 当前状态：
+// 先看 /status 是否可用；不可用时靠「主程序进程是否存在」区分「未登录」与「未启动」。
+// 依据实测：Undetectable 只要未正常登录启动，25325 端口的本地 API 都不会监听，/status 直接连接拒绝。
+func probeUndetectableState(logger *logx.Logger, timeout time.Duration) undetectableState {
+	probeCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	client := undetectable.NewClient(accountDefaultHost, accountDefaultPort)
+	if err := client.Status(probeCtx); err == nil {
+		return stateNormal
+	}
+
+	if chromedputil.IsProcessRunning(undetectableMainProcName) {
+		logger.Print("WATCHDOG", "Undetectable API 不可用但主程序进程存在，疑似未登录")
+		return stateNotLoggedIn
+	}
+	return stateNotRunning
+}
+
 // watchdogEnvDisabled 读取环境变量开关（未设置/无法识别时启用）。
 func watchdogEnvDisabled() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("UNDETECTABLE_WATCHDOG")))
+	v := strings.ToLower(config.Get("UNDETECTABLE_WATCHDOG", ""))
 	switch v {
 	case "0", "false", "off", "no", "disabled":
 		return true
@@ -88,23 +162,90 @@ func startUndetectableWatchdog(ctx context.Context, logger *logx.Logger) {
 	}()
 }
 
-// watchdogTick 一轮巡检：探活 → 可用则清熔断 + 重放 paused + 收尾卡死任务。
+// watchdogTick 一轮巡检：探测状态 → 正常则清熔断+重放 paused；未运行则自动拉起；未登录则告警。
 func watchdogTick(logger *logx.Logger, cfg watchdogConfig) {
-	probeCtx, cancel := context.WithTimeout(context.Background(), cfg.probeTimeout)
-	defer cancel()
+	state := probeUndetectableState(logger, cfg.probeTimeout)
 
-	client := undetectable.NewClient(accountDefaultHost, accountDefaultPort)
-	if err := client.Status(probeCtx); err != nil {
-		// 不可用属正常状态（熔断/未启动），静默即可：任务入口会负责暂停与提示。
+	switch state {
+	case stateNormal:
+		// 探活成功：解除熔断，让任务入口立刻恢复正常判定
+		clearUndetectableBroken()
+		// 自动重放 paused 的发布任务（带 payload 的，能本机续跑）
+		if n := resumePausedPublishTasks(logger); n > 0 {
+			logger.Print("WATCHDOG", fmt.Sprintf("探活成功，自动重放暂停的发布任务: %d 条", n))
+		}
+		maybeAlertUndetectable(logger, stateNormal)
+	case stateNotRunning:
+		// 未启动/卡退：尝试自动拉起（若配置了路径）
+		path := resolveUndetectablePath("")
+		if path != "" {
+			logger.Print("WATCHDOG", "检测到 Undetectable 未运行，尝试自动拉起")
+			if err := tryStartUndetectable(context.Background(), logger, path); err != nil {
+				logger.Print("WATCHDOG", "自动拉起 Undetectable 失败: "+err.Error())
+			}
+		} else {
+			logger.Print("WATCHDOG", "检测到 Undetectable 未运行，但未配置自动拉起路径（UNDETECTABLE_EXE）")
+		}
+		maybeAlertUndetectable(logger, stateNotRunning)
+	case stateNotLoggedIn:
+		// 主程序进程在但 API 不可用，疑似未登录：自动拉起无效，需人工登录
+		logger.Print("WATCHDOG", "Undetectable 疑似未登录（进程在但 API 不可用），需人工登录")
+		maybeAlertUndetectable(logger, stateNotLoggedIn)
+	}
+}
+
+// maybeAlertUndetectable 根据状态变化发送钉钉告警（配了 UNDETECTABLE_ALERT_WEBHOOK 才发）。
+// 防轰炸：状态从 normal 变异常立即告警；异常持续期间按冷却期（默认 10 分钟）最多告警一次；
+// 状态恢复 normal 时发一条「已恢复」。
+func maybeAlertUndetectable(logger *logx.Logger, state undetectableState) {
+	if undetectableAlertWebhook == "" {
+		return // 未配置告警 webhook，静默
+	}
+
+	undetectableAlertMu.Lock()
+	defer undetectableAlertMu.Unlock()
+
+	now := time.Now()
+
+	if state == stateNormal {
+		// 从异常恢复：发恢复通知并重置追踪
+		if lastAlertState != stateUnknown && lastAlertState != stateNormal {
+			lastAlertState = stateNormal
+			lastAlertAt = now
+			go sendUndetectableAlert(logger, stateNormal, "Undetectable 已恢复正常")
+		}
 		return
 	}
 
-	// 探活成功：解除熔断，让任务入口立刻恢复正常判定
-	clearUndetectableBroken()
+	// 异常状态：状态变化立即告警，持续异常按冷却期告警
+	if state == lastAlertState && now.Sub(lastAlertAt) < undetectableAlertCooldown {
+		return
+	}
+	lastAlertState = state
+	lastAlertAt = now
 
-	// 自动重放 paused 的发布任务（带 payload 的，能本机续跑）
-	if n := resumePausedPublishTasks(logger); n > 0 {
-		logger.Print("WATCHDOG", fmt.Sprintf("探活成功，自动重放暂停的发布任务: %d 条", n))
+	detail := ""
+	switch state {
+	case stateNotLoggedIn:
+		detail = "主程序进程存在但本地 API 不可用，疑似未登录，请人工登录"
+	case stateNotRunning:
+		detail = "主程序未运行或已卡退"
+	}
+	go sendUndetectableAlert(logger, state, detail)
+}
+
+// sendUndetectableAlert 发送一条 Undetectable 状态告警到钉钉（Best Effort）。
+func sendUndetectableAlert(logger *logx.Logger, state undetectableState, detail string) {
+	title := fmt.Sprintf("【Undetectable %s】", state.String())
+	content := fmt.Sprintf("### Undetectable 状态告警\n\n- 状态：%s\n- 详情：%s\n- 时间：%s",
+		state.String(), detail, time.Now().Format("2006-01-02 15:04:05"))
+	if v := config.Get("MACHINE_IP", ""); v != "" {
+		content += "\n- 机器：" + v
+	}
+	if err := sendDingtalkMarkdown(logger, undetectableAlertWebhook, undetectableAlertKeyword, title, content); err != nil {
+		logger.Print("WATCHDOG", "钉钉告警发送失败: "+err.Error())
+	} else {
+		logger.Print("WATCHDOG", "钉钉告警已发送: "+state.String())
 	}
 }
 

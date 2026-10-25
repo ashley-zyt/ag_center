@@ -29,10 +29,11 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"sync"
 	"time"
+
+	"minimax_pro/internal/config"
 )
 
 // Header names used by the protocol.
@@ -72,19 +73,17 @@ func (c Config) skew() time.Duration {
 // minute clock-skew tolerance — mainly useful when the server clock is
 // intentionally not synced; a large value weakens replay protection.
 func LoadConfig() (Config, error) {
-	key := os.Getenv("API_KEY")
+	key := config.Get("API_KEY", "")
 	if key == "" {
-		return Config{}, errors.New("API_KEY environment variable is required (set it to a long random secret)")
+		return Config{}, errors.New("API_KEY is required (set it via environment variable or config.json)")
 	}
-	secret := os.Getenv("API_SECRET")
+	secret := config.Get("API_SECRET", "")
 	if secret == "" {
 		secret = key
 	}
 	skew := defaultMaxSkew
-	if v := os.Getenv("AUTH_MAX_SKEW_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			skew = time.Duration(n) * time.Second
-		}
+	if n := config.GetInt("AUTH_MAX_SKEW_SECONDS", 0); n > 0 {
+		skew = time.Duration(n) * time.Second
 	}
 	return Config{APIKey: key, APISecret: secret, MaxSkew: skew}, nil
 }

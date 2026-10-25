@@ -1,14 +1,14 @@
-﻿package facebook
+package facebook
 
 import (
 	"context"
 	"fmt"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"minimax_pro/internal/config"
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/platform/scraper"
 
@@ -24,7 +24,7 @@ const (
 // 相对时间("3 days ago")换算成绝对日期时校正"现在"。
 // 可通过环境变量 FB_TIME_OFFSET_SECONDS 覆盖：本机慢 15 小时则设 54000。
 func fbTimeOffsetSeconds() int64 {
-	if v := os.Getenv("FB_TIME_OFFSET_SECONDS"); v != "" {
+	if v := config.Get("FB_TIME_OFFSET_SECONDS", ""); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
 		}

@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"minimax_pro/internal/config"
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/undetectable"
 
@@ -291,9 +291,14 @@ func CloseTabsAndStopProfile(ctx context.Context, browserCtx context.Context, lo
 var undetectedBrowserProcessName = "Undetected.exe"
 
 func init() {
-	if v := strings.TrimSpace(os.Getenv("UNDETECTED_BROWSER_PROC")); v != "" {
+	if v := config.Get("UNDETECTED_BROWSER_PROC", ""); v != "" {
 		undetectedBrowserProcessName = v
 	}
+}
+
+// BrowserProcessName 返回浏览器进程名（可用环境变量 UNDETECTED_BROWSER_PROC 覆盖）。
+func BrowserProcessName() string {
+	return undetectedBrowserProcessName
 }
 
 // DebugPortFromWebsocket 从 CDP 的 websocket 地址解析调试端口。
@@ -383,6 +388,43 @@ func KillBrowserProcessesByHint(logger *logx.Logger, hints ...string) {
 		return
 	}
 	logger.Print("KILL", "进程级兜底清理结果: "+result)
+}
+
+// IsProcessRunning 检测指定进程名是否存在（Windows，用 tasklist 查询）。
+func IsProcessRunning(name string) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	out, err := exec.Command("tasklist", "/FI", "IMAGENAME eq "+name, "/NH").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(out)), strings.ToLower(name))
+}
+
+// KillProcessByName 按进程名强制结束进程树（taskkill /F /T /IM），Best Effort。
+// 用于 Undetectable 拉起前清理残留的主程序/浏览器进程；进程不存在时仅记日志，不算失败。
+func KillProcessByName(logger *logx.Logger, name string) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	killCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(killCtx, "taskkill", "/F", "/T", "/IM", name).CombinedOutput()
+	result := strings.TrimSpace(string(out))
+	if err != nil {
+		logger.Print("KILL", fmt.Sprintf("按名清理进程 %s: %s", name, result))
+		return
+	}
+	logger.Print("KILL", fmt.Sprintf("按名清理进程 %s 成功: %s", name, result))
 }
 
 // CloseBrowserViaCDP 通过 CDP 的 Browser.close 命令直接关闭浏览器本体。

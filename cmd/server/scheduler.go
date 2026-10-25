@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"minimax_pro/internal/config"
 	"minimax_pro/internal/logx"
 )
 
@@ -27,11 +27,9 @@ var (
 )
 
 func init() {
-	if v := os.Getenv("MAX_CONCURRENT_BROWSERS"); v != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
-			maxConcurrentBrowsers = n
-			browserSem = make(chan struct{}, n)
-		}
+	if n := config.GetInt("MAX_CONCURRENT_BROWSERS", 0); n > 0 {
+		maxConcurrentBrowsers = n
+		browserSem = make(chan struct{}, n)
 	}
 }
 
@@ -454,7 +452,7 @@ func notifyMachineRestarted(logger *logx.Logger) {
 	}
 
 	payload := map[string]string{}
-	if v := strings.TrimSpace(os.Getenv("MACHINE_IP")); v != "" {
+	if v := config.Get("MACHINE_IP", ""); v != "" {
 		payload["machine_ip"] = v
 	}
 	body, err := json.Marshal(payload)

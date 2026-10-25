@@ -23,6 +23,7 @@ import (
 	"minimax_pro/internal/auth"
 	"minimax_pro/internal/chromedputil"
 	chrome "minimax_pro/internal/clock"
+	"minimax_pro/internal/config"
 	"minimax_pro/internal/logx"
 	"minimax_pro/internal/platform/facebook"
 	"minimax_pro/internal/platform/instagram"
@@ -422,14 +423,14 @@ func resolvePostsUpdateURL(override string) string {
 	if v := strings.TrimSpace(override); v != "" {
 		return v
 	}
-	if v := strings.TrimSpace(os.Getenv("POSTS_UPDATE_API_URL")); v != "" {
+	if v := config.Get("POSTS_UPDATE_API_URL", ""); v != "" {
 		return v
 	}
 	return accountPostsUpdateURL
 }
 
 func resolveAccountStatsUpdateURL() string {
-	if v := strings.TrimSpace(os.Getenv("ACCOUNT_STATS_UPDATE_API_URL")); v != "" {
+	if v := config.Get("ACCOUNT_STATS_UPDATE_API_URL", ""); v != "" {
 		return v
 	}
 	return accountStatsUpdateURL
@@ -994,7 +995,7 @@ func resolveUndetectablePath(explicit string) string {
 		rememberUndetectablePath(p)
 		return p
 	}
-	if p := strings.TrimSpace(os.Getenv("UNDETECTABLE_EXE")); p != "" {
+	if p := config.Get("UNDETECTABLE_EXE", ""); p != "" {
 		rememberUndetectablePath(p)
 		return p
 	}
@@ -1016,8 +1017,20 @@ func tryStartUndetectable(ctx context.Context, logger *logx.Logger, path string)
 	}
 	undetectableStartAt = time.Now()
 
+	// 拉起前先清理残留进程：主程序 + 浏览器进程，避免新旧进程冲突/端口占用/登录态串
+	killUndetectableResidue(logger)
+
 	logger.Print("BOOT", "尝试启动Undetectable: "+path)
 	return undetectable.StartLocal(ctx, path)
+}
+
+// killUndetectableResidue 拉起 Undetectable 前清理残留进程（主程序 + 浏览器），Best Effort。
+// 主程序进程名 undetectableMainProcName，浏览器进程名由 chromedputil.BrowserProcessName() 提供。
+func killUndetectableResidue(logger *logx.Logger) {
+	logger.Print("BOOT", "拉起前清理 Undetectable 残留进程")
+	chromedputil.KillProcessByName(logger, undetectableMainProcName)
+	chromedputil.KillProcessByName(logger, chromedputil.BrowserProcessName())
+	time.Sleep(2 * time.Second) // 等进程退出，避免新旧进程冲突
 }
 
 // isUndetectableNotStarted 判断错误是否属于「Undetectable 未启动」这一环境性问题
@@ -2688,12 +2701,9 @@ func main() {
 	}
 	handler := auth.Middleware(authCfg, mux)
 
-	// 默认只监听本机回环地址，由同机 nginx 反代对外提供 HTTPS 访问，
-	// 避免公网直连明文 IP:8080。如需调整可用 LISTEN_ADDR 环境变量覆盖。
-	addr := os.Getenv("LISTEN_ADDR")
-	if addr == "" {
-		addr = "0.0.0.0:8080"
-	}
+	// 默认监听 0.0.0.0:8080，由同机 nginx 反代对外提供 HTTPS 访问，
+	// 避免公网直连明文 IP:8080。可通过 LISTEN_ADDR 环境变量或 config.json 覆盖。
+	addr := config.Get("LISTEN_ADDR", "0.0.0.0:8080")
 	// 任务快照：状态变更后合并写入本地 JSON，并按保留策略定期清理超期记录。
 	startTaskStoreWriter(logger)
 

@@ -26,7 +26,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +33,7 @@ import (
 
 	_ "modernc.org/sqlite" // 纯 Go 的 SQLite 驱动，无需 CGO/gcc，注册 driver 名 "sqlite"
 
+	"minimax_pro/internal/config"
 	"minimax_pro/internal/logx"
 )
 
@@ -61,22 +61,14 @@ var (
 )
 
 func init() {
-	if v := strings.TrimSpace(os.Getenv("TASK_STORE_ENABLED")); v == "false" || v == "0" {
+	if v := config.Get("TASK_STORE_ENABLED", ""); v == "false" || v == "0" {
 		taskStoreEnabled = false
 	}
-	if v := strings.TrimSpace(os.Getenv("TASK_STORE_DIR")); v != "" {
+	if v := config.Get("TASK_STORE_DIR", ""); v != "" {
 		taskStoreDir = v
 	}
-	if v := strings.TrimSpace(os.Getenv("TASK_RETENTION_DAYS")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			taskRetentionDays = n
-		}
-	}
-	if v := strings.TrimSpace(os.Getenv("TASK_MAX_RECORDS")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			taskMaxRecords = n
-		}
-	}
+	taskRetentionDays = config.GetInt("TASK_RETENTION_DAYS", taskRetentionDays)
+	taskMaxRecords = config.GetInt("TASK_MAX_RECORDS", taskMaxRecords)
 	taskStorePath = filepath.Join(taskStoreDir, taskStoreFileName)
 }
 
