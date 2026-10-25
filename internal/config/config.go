@@ -2,7 +2,9 @@ package config
 
 import (
 	"encoding/json"
+	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,36 +34,51 @@ func ensureLoaded() {
 	})
 }
 
-// loadFile 读取并解析 config.json；文件不存在或解析失败时返回空 map（静默降级到默认值）。
+// loadFile 读取并解析 config.json；按候选路径逐个尝试，第一个能读到且解析成功的生效。
+// 文件不存在时静默降级到默认值；文件存在但解析失败时打警告日志（配置写错了要能被发现）。
 func loadFile() map[string]string {
 	result := make(map[string]string)
 
-	path := defaultConfigPath
-	if v := strings.TrimSpace(os.Getenv("CONFIG_PATH")); v != "" {
-		path = v
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return result
-	}
-
-	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return result
-	}
-
-	for k, v := range raw {
-		switch val := v.(type) {
-		case string:
-			result[k] = val
-		case float64:
-			result[k] = strconv.FormatFloat(val, 'f', -1, 64)
-		case bool:
-			result[k] = strconv.FormatBool(val)
+	for _, path := range configPaths() {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue // 该候选不存在，试下一个
 		}
+
+		var raw map[string]any
+		if err := json.Unmarshal(data, &raw); err != nil {
+			log.Printf("[CONFIG] 配置文件 %s 解析失败，已忽略（回退默认值）: %v", path, err)
+			return result
+		}
+
+		for k, v := range raw {
+			switch val := v.(type) {
+			case string:
+				result[k] = val
+			case float64:
+				result[k] = strconv.FormatFloat(val, 'f', -1, 64)
+			case bool:
+				result[k] = strconv.FormatBool(val)
+			}
+		}
+		log.Printf("[CONFIG] 已加载配置文件: %s", path)
+		return result
 	}
 	return result
+}
+
+// configPaths 返回候选配置文件路径：CONFIG_PATH > 工作目录 config.json > exe 所在目录 config.json。
+// 最后一级兜底解决「从其它目录启动 exe 导致相对路径 config.json 找不到」的问题。
+func configPaths() []string {
+	var paths []string
+	if v := strings.TrimSpace(os.Getenv("CONFIG_PATH")); v != "" {
+		paths = append(paths, v)
+	}
+	paths = append(paths, defaultConfigPath) // 相对工作目录
+	if exe, err := os.Executable(); err == nil {
+		paths = append(paths, filepath.Join(filepath.Dir(exe), defaultConfigPath))
+	}
+	return paths
 }
 
 // Get 返回字符串配置值：环境变量 > config.json > 默认值。
