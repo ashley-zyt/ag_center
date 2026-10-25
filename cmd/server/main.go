@@ -1646,6 +1646,8 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
 		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
 		var taskCtx context.Context = context.Background()
+		var onStart func()
+
 		execute := func() (string, string, SendSingleMessageResponse) {
 			bgCtx := taskCtx
 
@@ -1662,6 +1664,11 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 				return "failed", "获取并发额度失败: " + err.Error(), SendSingleMessageResponse{Type: "error", AccountID: req.AccountID, ErrorInfo: "获取并发额度失败: " + err.Error()}
 			}
 			defer releaseBrowserSlot()
+
+			// 拿到槽位才置 running：排队期间保持 queued
+			if onStart != nil {
+				onStart()
+			}
 
 			releaseLock := acquireProfileLock(req.ProfileName, logger)
 			defer releaseLock()
@@ -1754,8 +1761,8 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 			taskID, tctx := registerTask("send_message", req.ProfileName, req.Ref, req.Batch, 0, "", nil)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			onStart = func() { setTaskState(taskID, taskStatusRunning) }
 			go func() {
-				setTaskState(taskID, taskStatusRunning)
 				status, info, resp := execute()
 				finalizeAsyncTask(logger, taskID, "send_message", req.ProfileName, req.Ref, status, info, resp)
 			}()
@@ -1813,6 +1820,8 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
 		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
 		var taskCtx context.Context = context.Background()
+		var onStart func()
+
 		execute := func() (string, string, CheckReplyResponse) {
 			bgCtx := taskCtx
 
@@ -1820,6 +1829,11 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 				return "failed", "获取并发额度失败: " + err.Error(), CheckReplyResponse{Type: "error", AccountID: req.AccountID, ErrorInfo: "获取并发额度失败: " + err.Error()}
 			}
 			defer releaseBrowserSlot()
+
+			// 拿到槽位才置 running：排队期间保持 queued
+			if onStart != nil {
+				onStart()
+			}
 
 			releaseLock := acquireProfileLock(req.ProfileName, logger)
 			defer releaseLock()
@@ -1914,8 +1928,8 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 			taskID, tctx := registerTask("check_reply", req.ProfileName, req.Ref, req.Batch, 0, "", nil)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			onStart = func() { setTaskState(taskID, taskStatusRunning) }
 			go func() {
-				setTaskState(taskID, taskStatusRunning)
 				status, info, resp := execute()
 				finalizeAsyncTask(logger, taskID, "check_reply", req.ProfileName, req.Ref, status, info, resp)
 			}()
@@ -2232,6 +2246,8 @@ func main() {
 		// taskCtx 为该任务的根 context：异步执行时会被替换为任务自身的可取消 context，
 		// 使 POST /tasks/clear 能中断它。同步执行时保持 Background。
 		var taskCtx context.Context = context.Background()
+		var onStart func()
+
 		execute := func() (string, string) {
 			bgCtx := taskCtx
 
@@ -2240,6 +2256,11 @@ func main() {
 				return "failed", "获取并发额度失败: " + err.Error()
 			}
 			defer releaseBrowserSlot()
+
+			// 拿到槽位才置 running：排队期间保持 queued
+			if onStart != nil {
+				onStart()
+			}
 
 			// 2. 获取 Profile 操作锁（同一浏览器串行，防止并发操作导致混乱）
 			releaseLock := acquireProfileLock(req.ProfileName, logger)
@@ -2296,8 +2317,8 @@ func main() {
 			taskID, tctx := registerTask("nurture", req.ProfileName, req.Ref, req.Batch, 0, "", nil)
 			taskCtx = tctx
 			writeJSON(w, http.StatusOK, map[string]string{"type": "accepted", "task_id": taskID})
+			onStart = func() { setTaskState(taskID, taskStatusRunning) }
 			go func() {
-				setTaskState(taskID, taskStatusRunning)
 				status, info := execute()
 				finalizeAsyncTask(logger, taskID, "nurture", req.ProfileName, req.Ref, status, info, nil)
 			}()
@@ -2686,6 +2707,11 @@ func main() {
 	mux.HandleFunc("/accounts/open_auth_url", handleOpenAuthURL(logger))
 
 	mux.HandleFunc("/api/browser/locked", chrome.GetLockedProfilesHandler(logger, "127.0.0.1", 25325))
+
+	// 调试/运维：查询所有 profile 状态 + 单独停止/解锁指定 profile
+	mux.HandleFunc("/api/browser/profiles", chrome.ListAllProfilesHandler(logger, "127.0.0.1", 25325))
+	mux.HandleFunc("/api/browser/stop", chrome.StopProfileHandler(logger, "127.0.0.1", 25325))
+	mux.HandleFunc("/api/browser/unlock", chrome.UnlockProfileHandler(logger, "127.0.0.1", 25325))
 
 	// 鉴权：API Key 认证 + HMAC-SHA256 请求签名，保护所有发布/消息/账号接口。
 	authCfg, err := auth.LoadConfig()

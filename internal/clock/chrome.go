@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"time"
 
 	"minimax_pro/internal/logx"
@@ -135,5 +136,216 @@ func GetLockedProfilesHandler(logger *logx.Logger, host string, port int) http.H
 			Message: "success",
 			Data:    lockedProfiles,
 		})
+	}
+}
+
+// ProfileStatusInfo 单个 profile 的完整状态信息（调试/运维查询用）。
+type ProfileStatusInfo struct {
+	ProfileID     string `json:"profile_id"`
+	Name          string `json:"name"`
+	Status        string `json:"status"`
+	DebugPort     string `json:"debug_port"`
+	WebsocketLink string `json:"websocket_link,omitempty"`
+}
+
+// ListAllProfiles 返回所有 profile 的状态列表（按名称排序）。
+func ListAllProfiles(ctx context.Context, logger *logx.Logger, host string, port int) ([]ProfileStatusInfo, error) {
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if port == 0 {
+		port = 25325
+	}
+	client := undetectable.NewClient(host, port)
+	localCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	profiles, err := client.ListProfiles(localCtx)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]ProfileStatusInfo, 0, len(profiles))
+	for id, info := range profiles {
+		result = append(result, ProfileStatusInfo{
+			ProfileID:     id,
+			Name:          info.Name,
+			Status:        info.Status,
+			DebugPort:     info.DebugPort,
+			WebsocketLink: info.WebsocketLink,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result, nil
+}
+
+// StopProfile 停止指定 profile。对 Locked 状态会先尝试 unlock 再 stop
+// （Locked 状态直接 stop 会报 "Profile not started"）。
+func StopProfile(ctx context.Context, logger *logx.Logger, host string, port int, profileID string) error {
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if port == 0 {
+		port = 25325
+	}
+	client := undetectable.NewClient(host, port)
+	localCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	// 先解锁：Locked 状态 stop 无效，需先调 unlock
+	if err := client.UnlockProfile(localCtx, profileID); err != nil {
+		logger.Print("API", "解锁 profile 失败（继续尝试 stop）: "+err.Error())
+	} else {
+		logger.Print("API", "已解锁 profile: "+profileID)
+	}
+	return client.StopProfileBestEffort(localCtx, profileID)
+}
+
+// UnlockProfile 解锁指定 profile（解除 Locked 状态）。
+func UnlockProfile(ctx context.Context, logger *logx.Logger, host string, port int, profileID string) error {
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if port == 0 {
+		port = 25325
+	}
+	client := undetectable.NewClient(host, port)
+	localCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	return client.UnlockProfile(localCtx, profileID)
+}
+
+// findProfileIDByName 按名称查找 profile ID。
+func findProfileIDByName(ctx context.Context, logger *logx.Logger, host string, port int, name string) (string, error) {
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if port == 0 {
+		port = 25325
+	}
+	client := undetectable.NewClient(host, port)
+	localCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	profiles, err := client.ListProfiles(localCtx)
+	if err != nil {
+		return "", fmt.Errorf("获取 profile 列表失败: %v", err)
+	}
+	return undetectable.FindProfileIDByName(profiles, name)
+}
+
+// ListAllProfilesHandler GET /api/browser/profiles —— 查询所有 profile 状态。
+func ListAllProfilesHandler(logger *logx.Logger, host string, port int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 405, "message": "仅支持 GET"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		defer cancel()
+		profiles, err := ListAllProfiles(ctx, logger, host, port)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 500, "message": "查询失败: " + err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "message": "success", "data": profiles})
+	}
+}
+
+// StopProfileHandler POST /api/browser/stop —— 停止指定 profile（传 profile_id 或 profile_name）。
+func StopProfileHandler(logger *logx.Logger, host string, port int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 405, "message": "仅支持 POST"})
+			return
+		}
+
+		var req struct {
+			ProfileID   string `json:"profile_id"`
+			ProfileName string `json:"profile_name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 400, "message": "请求体解析失败: " + err.Error()})
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		defer cancel()
+
+		profileID := req.ProfileID
+		if profileID == "" && req.ProfileName != "" {
+			id, err := findProfileIDByName(ctx, logger, host, port, req.ProfileName)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 400, "message": err.Error()})
+				return
+			}
+			profileID = id
+		}
+		if profileID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 400, "message": "profile_id 或 profile_name 必填"})
+			return
+		}
+
+		if err := StopProfile(ctx, logger, host, port, profileID); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 500, "message": "停止失败: " + err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "message": "success", "profile_id": profileID})
+	}
+}
+
+// UnlockProfileHandler POST /api/browser/unlock —— 解锁指定 profile（传 profile_id 或 profile_name）。
+func UnlockProfileHandler(logger *logx.Logger, host string, port int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 405, "message": "仅支持 POST"})
+			return
+		}
+
+		var req struct {
+			ProfileID   string `json:"profile_id"`
+			ProfileName string `json:"profile_name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 400, "message": "请求体解析失败: " + err.Error()})
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		defer cancel()
+
+		profileID := req.ProfileID
+		if profileID == "" && req.ProfileName != "" {
+			id, err := findProfileIDByName(ctx, logger, host, port, req.ProfileName)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 400, "message": err.Error()})
+				return
+			}
+			profileID = id
+		}
+		if profileID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 400, "message": "profile_id 或 profile_name 必填"})
+			return
+		}
+
+		if err := UnlockProfile(ctx, logger, host, port, profileID); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 500, "message": "解锁失败: " + err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "message": "success", "profile_id": profileID})
 	}
 }

@@ -281,6 +281,21 @@ func (c *Client) StopProfileBestEffort(ctx context.Context, profileID string) er
 	}
 	return fmt.Errorf("all stop attempts failed:\n%s", strings.Join(errs, "\n"))
 }
+
+// UnlockProfile 解锁指定 profile（解除「技术性锁定」状态）。
+// Undetectable 2.47.0 新增：第三方脚本崩溃/连接中断时 profile 会停留在 Locked 状态，
+// 此时 stop 会报 "Profile not started"，需先调此接口解锁（对应客户端右键 unlock）。
+func (c *Client) UnlockProfile(ctx context.Context, profileID string) error {
+	resp, err := c.do(ctx, http.MethodGet, "/profile/unlock/"+profileID, nil, nil)
+	if err != nil {
+		return err
+	}
+	if resp.Code != 0 {
+		return fmt.Errorf("unlock profile failed: code=%d msg=%s", resp.Code, string(resp.Data))
+	}
+	return nil
+}
+
 func StartLocal(ctx context.Context, exePath string) error {
 	if exePath == "" {
 		return fmt.Errorf("empty exePath")

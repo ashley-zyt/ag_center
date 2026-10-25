@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"log"
 	"os"
@@ -44,6 +45,9 @@ func loadFile() map[string]string {
 		if err != nil {
 			continue // 该候选不存在，试下一个
 		}
+		// 去掉 UTF-8 BOM：Windows 记事本/部分编辑器保存时会在文件头加 EF BB BF，
+		// json.Unmarshal 不识别它，会报 "invalid character 'ï'"。
+		data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 
 		var raw map[string]any
 		if err := json.Unmarshal(data, &raw); err != nil {
