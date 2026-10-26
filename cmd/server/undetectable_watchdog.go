@@ -188,8 +188,18 @@ func watchdogTick(logger *logx.Logger, cfg watchdogConfig) {
 		}
 		maybeAlertUndetectable(logger, stateNotRunning)
 	case stateNotLoggedIn:
-		// 主程序进程在但 API 不可用，疑似未登录：自动拉起无效，需人工登录
-		logger.Print("WATCHDOG", "Undetectable 疑似未登录（进程在但 API 不可用），需人工登录")
+		// 主程序进程在但 API 不可用：多为「进程残留导致未正常自动登录」。
+		// 实测 kill 残留进程后重新启动 Undetectable 即可恢复，因此这里也自动 kill + 拉起
+		// （tryStartUndetectable 内部会先清理残留进程再启动）。
+		path := resolveUndetectablePath("")
+		if path != "" {
+			logger.Print("WATCHDOG", "Undetectable 疑似未登录/进程残留，尝试 kill 残留并重新拉起")
+			if err := tryStartUndetectable(context.Background(), logger, path); err != nil {
+				logger.Print("WATCHDOG", "自动拉起 Undetectable 失败: "+err.Error())
+			}
+		} else {
+			logger.Print("WATCHDOG", "Undetectable 疑似未登录/进程残留，但未配置自动拉起路径（UNDETECTABLE_EXE），需人工处理")
+		}
 		maybeAlertUndetectable(logger, stateNotLoggedIn)
 	}
 }
@@ -227,7 +237,7 @@ func maybeAlertUndetectable(logger *logx.Logger, state undetectableState) {
 	detail := ""
 	switch state {
 	case stateNotLoggedIn:
-		detail = "主程序进程存在但本地 API 不可用，疑似未登录，请人工登录"
+		detail = "主程序进程存在但本地 API 不可用（疑似未登录或进程残留），已尝试自动重启，若仍异常请人工登录"
 	case stateNotRunning:
 		detail = "主程序未运行或已卡退"
 	}
