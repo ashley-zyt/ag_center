@@ -75,16 +75,14 @@ type instagramMessenger struct {
 
 func (m *instagramMessenger) Tag() string { return "IG_MSG" }
 
-// CheckLogin 登录态检测: URL 被重定向到 /accounts/ 即未登录; 页面报错文案视为异常
+// CheckLogin 登录态检测: URL 被重定向到 /accounts/ 或出现登录文案即未登录; 页面报错文案视为异常
 func (m *instagramMessenger) CheckLogin(ctx context.Context) (string, error) {
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	var loc string
-	if err := chromedp.Run(checkCtx, chromedp.Location(&loc)); err == nil {
-		if strings.Contains(loc, "instagram.com/accounts/") {
-			return message.StatusNotLoggedIn, nil
-		}
+	// 退出登录检测（URL 重定向 + 登录文案）
+	if loggedOut, _ := checkLoggedOut(checkCtx); loggedOut {
+		return message.StatusNotLoggedIn, nil
 	}
 
 	var riskNodes []*cdp.Node

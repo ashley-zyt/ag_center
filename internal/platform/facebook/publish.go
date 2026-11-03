@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"minimax_pro/internal/logx"
+	"minimax_pro/internal/screenshot"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
@@ -46,7 +47,7 @@ type PublishRequest struct {
 	ProfileID        string
 }
 
-func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) error {
+func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) (err error) {
 	if req.WebsocketURL == "" {
 		return errors.New("FB0 websocket_url is required")
 	}
@@ -90,6 +91,9 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 4*time.Minute)
 	defer cancelTimeout()
+
+	// 报错截图：任何一步失败，都在浏览器还活着时把当前页面截下来上传 OSS（第二层通用拦截）。
+	defer screenshot.OnErrorDefer(tabCtx, ctx, logger, "facebook_publish", req.WebsocketURL, &err)
 
 	if err := chromedputil.NavigateAndWaitBody(tabCtx, logger, "https://www.facebook.com/", "FB2"); err != nil {
 		return fmt.Errorf("FB2 %v", err)

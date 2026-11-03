@@ -1,4 +1,4 @@
-﻿package twitter
+package twitter
 
 import (
 	"context"
@@ -27,6 +27,13 @@ func FetchPosts(ctx context.Context, logger *logx.Logger, req scraper.FetchReque
 	}
 	if err := chromedp.Run(ctx, chromedp.Navigate(targetURL)); err != nil {
 		return scraper.FetchResult{}, fmt.Errorf("navigate to profile failed: %w", err)
+	}
+	time.Sleep(2 * time.Second)
+
+	// 1.5 退出登录检测
+	if loggedOut, reason := checkLoggedOut(ctx); loggedOut {
+		logger.Print("TW_FETCH", "账号已退出登录: "+reason)
+		return scraper.FetchResult{}, fmt.Errorf("账号已退出登录: %s", reason)
 	}
 
 	// 2. 等待页面主体加载(profile头部或推文列表出现)

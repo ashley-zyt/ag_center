@@ -12,6 +12,7 @@ import (
 
 	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/logx"
+	"minimax_pro/internal/screenshot"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
@@ -46,7 +47,7 @@ type PublishRequest struct {
 
 // PublishVideo 连接远程浏览器，打开上传页，上传视频、填写标题，点击发布，
 // 然后等待并关闭浏览器，最终删除本地视频文件
-func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) error {
+func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) (err error) {
 	if req.WebsocketURL == "" {
 		return errors.New("TT0 websocket_url is required")
 	}
@@ -92,6 +93,9 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 5*time.Minute)
 	defer cancelTimeout()
+
+	// 报错截图：任何一步失败，都在浏览器还活着时把当前页面截下来上传 OSS（第二层通用拦截）。
+	defer screenshot.OnErrorDefer(tabCtx, ctx, logger, "tiktok_publish", req.WebsocketURL, &err)
 
 	if err := chromedputil.NavigateAndWaitBody(tabCtx, logger, "https://www.tiktok.com/creator-center/upload", "TT2"); err != nil {
 		return fmt.Errorf("TT2 %v", err)

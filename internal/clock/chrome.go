@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"sync"
 	"time"
 
 	"minimax_pro/internal/logx"
@@ -141,11 +142,18 @@ func GetLockedProfilesHandler(logger *logx.Logger, host string, port int) http.H
 
 // ProfileStatusInfo 单个 profile 的完整状态信息（调试/运维查询用）。
 type ProfileStatusInfo struct {
-	ProfileID     string `json:"profile_id"`
-	Name          string `json:"name"`
-	Status        string `json:"status"`
-	DebugPort     string `json:"debug_port"`
-	WebsocketLink string `json:"websocket_link,omitempty"`
+	ProfileID     string   `json:"profile_id"`
+	Name          string   `json:"name"`
+	Status        string   `json:"status"`
+	Proxy         string   `json:"proxy,omitempty"`
+	DebugPort     string   `json:"debug_port"`
+	WebsocketLink string   `json:"websocket_link,omitempty"`
+	Folder        string   `json:"folder,omitempty"`
+	Tags          []string `json:"tags,omitempty"`
+	CloudID       string   `json:"cloud_id,omitempty"`
+	CloudGroup    string   `json:"cloud_group,omitempty"`
+	CreationDate  int64    `json:"creation_date,omitempty"`
+	ModifyDate    int64    `json:"modify_date,omitempty"`
 }
 
 // ListAllProfiles 返回所有 profile 的状态列表（按名称排序）。
@@ -173,10 +181,52 @@ func ListAllProfiles(ctx context.Context, logger *logx.Logger, host string, port
 			Status:        info.Status,
 			DebugPort:     info.DebugPort,
 			WebsocketLink: info.WebsocketLink,
+			Folder:        info.Folder,
+			Tags:          info.Tags,
+			CloudID:       info.CloudID,
+			CloudGroup:    info.CloudGroup,
+			CreationDate:  info.CreationDate,
+			ModifyDate:    info.ModifyDate,
 		})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+
+	// 并发获取每个 profile 绑定的代理（/profile/getinfo）。
+	// 代理查询逐 profile 一次请求，用独立超时 + 有限并发避免拖垮整体查询。
+	proxyCtx, cancelProxy := context.WithTimeout(ctx, 60*time.Second)
+	defer cancelProxy()
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 10) // 并发上限
+	for i := range result {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			detail, err := client.GetProfileInfo(proxyCtx, result[idx].ProfileID)
+			if err == nil && detail != nil {
+				result[idx].Proxy = detail.Proxy
+			}
+		}(i)
+	}
+	wg.Wait()
+
 	return result, nil
+}
+
+// ListAllProxies 返回 Undetectable 代理管理器中的代理列表。
+func ListAllProxies(ctx context.Context, logger *logx.Logger, host string, port int) (undetectable.Proxies, error) {
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if port == 0 {
+		port = 25325
+	}
+	client := undetectable.NewClient(host, port)
+	localCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	return client.ListProxies(localCtx)
 }
 
 // StopProfile 停止指定 profile。对 Locked 状态会先尝试 unlock 再 stop
@@ -242,7 +292,7 @@ func ListAllProfilesHandler(logger *logx.Logger, host string, port int) http.Han
 			_ = json.NewEncoder(w).Encode(map[string]any{"code": 405, "message": "仅支持 GET"})
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 		profiles, err := ListAllProfiles(ctx, logger, host, port)
 		if err != nil {
@@ -251,6 +301,27 @@ func ListAllProfilesHandler(logger *logx.Logger, host string, port int) http.Han
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "message": "success", "data": profiles})
+	}
+}
+
+// ProxiesHandler GET /api/browser/proxies —— 查询所有代理。
+func ProxiesHandler(logger *logx.Logger, host string, port int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 405, "message": "仅支持 GET"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		defer cancel()
+		proxies, err := ListAllProxies(ctx, logger, host, port)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 500, "message": "查询失败: " + err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "message": "success", "data": proxies})
 	}
 }
 

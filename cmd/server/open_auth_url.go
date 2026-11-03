@@ -97,14 +97,14 @@ import (
 //	不能用 Location —— 契约文档里写的 Location 方案会直接失败。
 
 // postformeAuthCallbackURL 检测到点击授权按钮后，回调 account_sys 告知「已点击完成授权」。
-// 与 taskResultURL 同 host（47.89.235.227:3366）。account_sys 无论是否当场确认都回 success，
+// 与 taskResultURL 同 host（agweb.juzhiic.com）。account_sys 无论是否当场确认都回 success，
 // 因此本回调 Best Effort、不重试。
-const postformeAuthCallbackURL = "http://47.89.235.227:3366/api/v1/postforme/auth_callback"
+const postformeAuthCallbackURL = "https://agweb.juzhiic.com/api/v1/postforme/auth_callback"
 
 // xAuthCallbackURL X（Twitter）OAuth 认证：截到授权码后回调 account_sys。
 // code 是一次性的、account_sys 侧无轮询（丢了就只能人工重来），所以这个是**必达**回调，
 // 失败要重试（见 xAuthCallbackRetries）。
-const xAuthCallbackURL = "http://47.89.235.227:3366/api/v1/x_auth/auth_callback"
+const xAuthCallbackURL = "https://agweb.juzhiic.com/api/v1/x_auth/auth_callback"
 
 // 授权模式：同一个 POST /accounts/open_auth_url 接口承载两种流程。
 const (

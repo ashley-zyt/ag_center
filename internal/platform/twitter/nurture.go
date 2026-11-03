@@ -1,4 +1,4 @@
-﻿package twitter
+package twitter
 
 import (
 	"context"
@@ -26,6 +26,11 @@ func (a *twitterActions) Tag() string {
 }
 
 func (a *twitterActions) CheckLogin(ctx context.Context) (string, error) {
+	// 退出登录检测（URL 重定向 + 登录文案）
+	if loggedOut, _ := checkLoggedOut(ctx); loggedOut {
+		return "not_logged_in", nil
+	}
+
 	var status string
 	checkLoginJs := `(function(){
 		var homeFeed = document.querySelector('div[data-testid="primaryColumn"]');

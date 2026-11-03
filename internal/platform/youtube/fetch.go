@@ -1,4 +1,4 @@
-﻿package youtube
+package youtube
 
 import (
 	"context"
@@ -25,6 +25,12 @@ func FetchYoutubePosts(ctx context.Context, logger *logx.Logger, req scraper.Fet
 	targetURL := "https://studio.youtube.com/"
 	if err := chromedp.Run(ctx, chromedp.Navigate(targetURL)); err != nil {
 		return scraper.FetchResult{}, fmt.Errorf("navigate to studio failed: %w", err)
+	}
+
+	// 2.1 退出登录检测（URL 跳转 accounts.google.com + 登录文案）
+	if loggedOut, reason := checkLoggedOut(ctx); loggedOut {
+		logger.Print("YT_FETCH", "账号已退出登录: "+reason)
+		return scraper.FetchResult{}, fmt.Errorf("账号已退出登录: %s", reason)
 	}
 
 	// 2.5 提取粉丝数：先获取当前Studio URL中的Channel ID，跳转到公开频道页提取订阅数，再返回Studio
@@ -439,6 +445,7 @@ func fetchVideoLikes(ctx context.Context, logger *logx.Logger, tag, fullDetailUR
 // YouTube 详情页存在多种链接格式, 已知:
 //   - https://www.youtube.com/watch?v=VIDEO_ID
 //   - https://www.youtube.com/shorts/VIDEO_ID
+//
 // 校验 videoID 后必须紧跟分隔符(参数/路径/锚点/结尾), 避免子串误判。
 func isTargetVideoURL(currentURL, videoID string) bool {
 	if videoID == "" || currentURL == "" {

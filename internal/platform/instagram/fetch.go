@@ -1,4 +1,4 @@
-﻿package instagram
+package instagram
 
 import (
 	"context"
@@ -22,6 +22,12 @@ func FetchInstagramPosts(ctx context.Context, logger *logx.Logger, req scraper.F
 		return scraper.FetchResult{}, err
 	}
 	time.Sleep(5 * time.Second)
+
+	// 1.5 退出登录检测
+	if loggedOut, reason := checkLoggedOut(ctx); loggedOut {
+		logger.Print("INS_FETCH", "账号已退出登录: "+reason)
+		return scraper.FetchResult{}, fmt.Errorf("账号已退出登录: %s", reason)
+	}
 
 	// 2. 切换至 Reels 视图
 	logger.Print("INS_FETCH", "正在定位并切换至 Reels 专属视频视图...")

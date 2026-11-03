@@ -11,6 +11,7 @@ import (
 
 	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/logx"
+	"minimax_pro/internal/screenshot"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/input"
@@ -46,7 +47,7 @@ type PublishRequest struct {
 	ProfileID        string
 }
 
-func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) error {
+func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) (err error) {
 	if req.WebsocketURL == "" {
 		return errors.New("YTB0 websocket_url is required")
 	}
@@ -83,18 +84,20 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 6*time.Minute)
 	defer cancelTimeout()
 
+	// 报错截图：任何一步失败，都在浏览器还活着时把当前页面截下来上传 OSS（第二层通用拦截）。
+	defer screenshot.OnErrorDefer(tabCtx, ctx, logger, "youtube_publish", req.WebsocketURL, &err)
+
 	if err := chromedputil.NavigateAndWaitBody(tabCtx, logger, "https://studio.youtube.com/channel/%s/videos/upload?d=ud&filter%%5B%%5D&sort=%%7B%%22columnType%%22%%3A%%22date%%22%%2C%%22sortOrder%%22%%3A%%22DESCENDING%%22%%7D", "YTB2"); err != nil {
 		return fmt.Errorf("YTB2 %v", err)
 	}
 	logger.Print("YTB2", "已打开YouTube Studio")
 
-	// 检查是否需要重新验证/登录
+	// 检查是否需要重新验证/登录（URL 跳转到 accounts.google.com 或 页面出现登录文案）
 	loginCheckCtx, cancelLoginCheck := context.WithTimeout(tabCtx, 5*time.Second)
-	var loginNodes []*cdp.Node
-	_ = chromedp.Run(loginCheckCtx, chromedp.Nodes(`//*[contains(text(), "Verify it’s you") or contains(text(), "Choose an account")]`, &loginNodes, chromedp.BySearch))
+	loggedOut, reason := checkLoggedOut(loginCheckCtx)
 	cancelLoginCheck()
-	if len(loginNodes) > 0 {
-		return errors.New("YTB2 youtube not logged in or verification required in this profile")
+	if loggedOut {
+		return errors.New("YTB2 youtube account logged out: " + reason)
 	}
 
 	if err := waitAndUploadFile(tabCtx, logger, absVideoPath); err != nil {
@@ -104,7 +107,7 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	// 检查上传后是否触发身份验证
 	verifyCtx, cancelVerify := context.WithTimeout(tabCtx, 10*time.Second)
 	var verifyNodes []*cdp.Node
-	_ = chromedp.Run(verifyCtx, chromedp.Nodes(`//*[contains(text(), "Verify it's you") or contains(text(), "To continue, we need to confirm it’s really you")]`, &verifyNodes, chromedp.BySearch))
+	_ = chromedp.Run(verifyCtx, chromedp.Nodes(`//*[contains(text(), "Verify it's you") or contains(text(), "To continue, we need to confirm it’s really you") or contains(text(), "available to other Google apps")]`, &verifyNodes, chromedp.BySearch))
 	cancelVerify()
 	if len(verifyNodes) > 0 {
 		return errors.New("YTB3 account verification required after upload")

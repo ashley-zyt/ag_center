@@ -77,18 +77,16 @@ type twitterMessenger struct {
 	logger *logx.Logger
 }
 
-func (m *twitterMessenger) Tag() string      { return "TW_MSG" }
+func (m *twitterMessenger) Tag() string { return "TW_MSG" }
 
 // CheckLogin 登录态检测: 未登录时访问私信页会被重定向到 /login 或渲染登录表单
 func (m *twitterMessenger) CheckLogin(ctx context.Context) (string, error) {
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	var loc string
-	if err := chromedp.Run(checkCtx, chromedp.Location(&loc)); err == nil {
-		if strings.Contains(loc, "x.com/login") || strings.Contains(loc, "twitter.com/login") {
-			return message.StatusNotLoggedIn, nil
-		}
+	// 退出登录检测（URL 重定向 + 登录文案）
+	if loggedOut, _ := checkLoggedOut(checkCtx); loggedOut {
+		return message.StatusNotLoggedIn, nil
 	}
 
 	var status string

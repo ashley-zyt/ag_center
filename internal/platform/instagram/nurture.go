@@ -27,6 +27,11 @@ func (a *instagramActions) Tag() string {
 }
 
 func (a *instagramActions) CheckLogin(ctx context.Context) (string, error) {
+	// 退出登录检测（URL 重定向 + 登录文案）
+	if loggedOut, _ := checkLoggedOut(ctx); loggedOut {
+		return "not_logged_in", nil
+	}
+
 	var currentURL string
 	if err := chromedp.Run(ctx, chromedp.Location(&currentURL)); err != nil {
 		return "", err
@@ -34,10 +39,6 @@ func (a *instagramActions) CheckLogin(ctx context.Context) (string, error) {
 	// 只要URL以 https://www.instagram.com/reels/ 开头就算已登录
 	if strings.HasPrefix(currentURL, "https://www.instagram.com/reels/") {
 		return "logged_in", nil
-	}
-	// 如果被重定向到登录页面
-	if strings.HasPrefix(currentURL, "https://www.instagram.com/accounts/") {
-		return "not_logged_in", nil
 	}
 	return "abnormal", nil
 }

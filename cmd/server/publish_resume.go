@@ -31,6 +31,7 @@ import (
 	"minimax_pro/internal/platform/tiktok"
 	"minimax_pro/internal/platform/twitter"
 	"minimax_pro/internal/platform/youtube"
+	"minimax_pro/internal/screenshot"
 	"minimax_pro/internal/undetectable"
 )
 
@@ -196,7 +197,20 @@ func runPublish(ctx context.Context, logger *logx.Logger, job publishJob, run pu
 		return "failed", err.Error(), startByNameResult{}
 	}
 
-	// 6. 平台发布 + 收尾
+	// 6. 超时看护：任务执行超过 publishTimeout 后，强制停止 profile 断开 CDP，
+	//    让可能卡住的 chromedp 操作返回，从而 runPublish 正常退出并释放并发额度与 profile 锁。
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		select {
+		case <-pubCtx.Done():
+			logger.Print("PUB", "发布任务执行超时，强制停止 Profile 释放资源: "+res.ProfileID)
+			stopProfileBestEffort(context.Background(), res)
+		case <-watchDone:
+		}
+	}()
+
+	// 7. 平台发布 + 收尾
 	status, info := run(pubCtx, logger, res, absVideoPath)
 	return status, info, res
 }
@@ -482,6 +496,8 @@ func claimReplay(taskID string) (context.Context, bool) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	taskCancels[taskID] = cancel
+	// 与 registerTask 一致：注入报错截图回调，让重放/恢复的任务也能把截图 URL 记回 taskID。
+	ctx = screenshot.WithShotSink(ctx, func(url string) { setTaskShot(taskID, url) })
 
 	if rec.Status != taskStatusQueued {
 		rec.Status = taskStatusQueued

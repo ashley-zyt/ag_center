@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"minimax_pro/internal/logx"
+	"minimax_pro/internal/screenshot"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
@@ -45,7 +46,7 @@ type PublishRequest struct {
 	ProfileID        string
 }
 
-func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) error {
+func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) (err error) {
 	if req.WebsocketURL == "" {
 		return errors.New("TW0 websocket_url is required")
 	}
@@ -88,6 +89,9 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 4*time.Minute)
 	defer cancelTimeout()
 
+	// 报错截图：任何一步失败，都在浏览器还活着时把当前页面截下来上传 OSS（第二层通用拦截）。
+	defer screenshot.OnErrorDefer(tabCtx, ctx, logger, "twitter_publish", req.WebsocketURL, &err)
+
 	if err := chromedputil.NavigateAndWaitBody(tabCtx, logger, "https://x.com/compose/tweet", "TW2"); err != nil {
 		return fmt.Errorf("TW2 %v", err)
 	}
@@ -95,6 +99,9 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 
 	loginCtx, cancelLogin := context.WithTimeout(tabCtx, 3*time.Second)
 	defer cancelLogin()
+	if loggedOut, reason := checkLoggedOut(loginCtx); loggedOut {
+		return errors.New("TW2 twitter not logged in in this profile: " + reason)
+	}
 	var loginInputs []*cdp.Node
 	_ = chromedp.Run(loginCtx, chromedp.Nodes(`input[name="text"]`, &loginInputs, chromedp.ByQuery))
 	if len(loginInputs) > 0 {

@@ -11,6 +11,7 @@ import (
 
 	"minimax_pro/internal/chromedputil"
 	"minimax_pro/internal/logx"
+	"minimax_pro/internal/screenshot"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
@@ -42,7 +43,7 @@ type PublishRequest struct {
 	ProfileID        string
 }
 
-func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) error {
+func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) (err error) {
 	if req.WebsocketURL == "" {
 		return errors.New("IG0 websocket_url is required")
 	}
@@ -95,6 +96,9 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	tabCtx, cancelTimeout := context.WithTimeout(tabCtx, 5*time.Minute)
 	defer cancelTimeout()
 
+	// 报错截图：任何一步失败，都在浏览器还活着时把当前页面截下来上传 OSS（第二层通用拦截）。
+	defer screenshot.OnErrorDefer(tabCtx, ctx, logger, "instagram_publish", req.WebsocketURL, &err)
+
 	logger.Print("IG2", "打开Instagram首页")
 	if err := chromedputil.NavigateAndWaitBody(tabCtx, logger, "https://www.instagram.com/", "IG2"); err != nil {
 		return fmt.Errorf("IG2 %v", err)
@@ -102,11 +106,10 @@ func PublishVideo(ctx context.Context, logger *logx.Logger, req PublishRequest) 
 	logger.Print("IG2", "已打开Instagram首页")
 
 	loginCtx, cancelLogin := context.WithTimeout(tabCtx, 5*time.Second)
-	var loginNodes []*cdp.Node
-	_ = chromedp.Run(loginCtx, chromedp.Nodes(`//*[contains(text(), "Log into Instagram") or contains(text(), "Create new account") or contains(text(), "Log in with Facebook") or contains(text(), "Enter your mobile number")]`, &loginNodes, chromedp.BySearch))
+	loggedOut, reason := checkLoggedOut(loginCtx)
 	cancelLogin()
-	if len(loginNodes) > 0 {
-		return errors.New("IG2 instagram not logged in in this profile")
+	if loggedOut {
+		return errors.New("IG2 instagram not logged in in this profile: " + reason)
 	}
 
 	// ==================== 【新增：人机验证(Captcha/Challenge)硬卡点拦截】 ====================

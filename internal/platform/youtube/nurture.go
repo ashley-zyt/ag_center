@@ -26,6 +26,11 @@ func (a *youtubeActions) Tag() string {
 }
 
 func (a *youtubeActions) CheckLogin(ctx context.Context) (string, error) {
+	// 退出登录检测（URL 跳转 accounts.google.com + 登录文案）
+	if loggedOut, _ := checkLoggedOut(ctx); loggedOut {
+		return "not_logged_in", nil
+	}
+
 	var status string
 	checkLoginJs := `(function(){
 		var avatarBtn = document.querySelector('button#avatar-btn');

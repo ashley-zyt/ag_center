@@ -44,11 +44,50 @@ type ProfileInfo struct {
 	Folder        string   `json:"folder"`
 	Tags          []string `json:"tags"`
 	CloudID       string   `json:"cloud_id"`
+	CloudGroup    string   `json:"cloud_group"`
 	CreationDate  int64    `json:"creation_date"`
 	ModifyDate    int64    `json:"modify_date"`
 }
 
 type Profiles map[string]ProfileInfo
+
+// ProxyInfo Undetectable 代理管理器中的单个代理条目（/proxies/list 返回）。
+type ProxyInfo struct {
+	Name         string `json:"name"`
+	Type         string `json:"type"`
+	Host         string `json:"host"`
+	Port         string `json:"port"`
+	Login        string `json:"login"`
+	Password     string `json:"password"`
+	IPChangeLink string `json:"ipchangelink"`
+}
+
+type Proxies map[string]ProxyInfo
+
+// ProfileDetail /profile/getinfo/{profileID} 返回的单个 profile 完整信息（含代理）。
+type ProfileDetail struct {
+	Name          string   `json:"name"`
+	Status        string   `json:"status"`
+	Proxy         string   `json:"proxy"`
+	Browser       string   `json:"browser"`
+	OS            string   `json:"os"`
+	Language      string   `json:"language"`
+	Screen        string   `json:"screen"`
+	UserAgent     string   `json:"useragent"`
+	Type          string   `json:"type"`
+	Notes         string   `json:"notes"`
+	ConfigID      string   `json:"configid"`
+	CPU           int      `json:"cpu"`
+	Memory        int      `json:"memory"`
+	CloudGroup    string   `json:"cloud_group"`
+	CloudID       string   `json:"cloud_id"`
+	DebugPort     string   `json:"debug_port"`
+	WebsocketLink string   `json:"websocket_link"`
+	Folder        string   `json:"folder"`
+	Tags          []string `json:"tags"`
+	CreationDate  int64    `json:"creation_date"`
+	ModifyDate    int64    `json:"modify_date"`
+}
 
 func (c *Client) do(ctx context.Context, method string, path string, query url.Values, body any) (*APIResponse, error) {
 	u, err := url.Parse(c.BaseURL)
@@ -130,6 +169,38 @@ func (c *Client) ListProfiles(ctx context.Context) (Profiles, error) {
 		return nil, err
 	}
 	return profiles, nil
+}
+
+// ListProxies 获取 Undetectable 代理管理器中的代理列表（GET /proxies/list）。
+func (c *Client) ListProxies(ctx context.Context) (Proxies, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/proxies/list", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("list proxies failed: code=%d status=%s data=%s", resp.Code, resp.Status, string(resp.Data))
+	}
+	var proxies Proxies
+	if err := json.Unmarshal(resp.Data, &proxies); err != nil {
+		return nil, err
+	}
+	return proxies, nil
+}
+
+// GetProfileInfo 获取单个 profile 的完整信息（GET /profile/getinfo/{profileID}），含代理绑定。
+func (c *Client) GetProfileInfo(ctx context.Context, profileID string) (*ProfileDetail, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/profile/getinfo/"+profileID, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("get profile info failed: code=%d status=%s data=%s", resp.Code, resp.Status, string(resp.Data))
+	}
+	var detail ProfileDetail
+	if err := json.Unmarshal(resp.Data, &detail); err != nil {
+		return nil, err
+	}
+	return &detail, nil
 }
 
 func FindProfileIDByName(profiles Profiles, name string) (string, error) {

@@ -59,12 +59,10 @@ func CommentOnTweet(ctx context.Context, logger *logx.Logger, targetURL, content
 	}
 	time.Sleep(3 * time.Second)
 
-	// 2. 登录态检测：未登录会被重定向到登录页
-	var loc string
-	_ = chromedp.Run(ctx, chromedp.Location(&loc))
-	if strings.Contains(loc, "/login") {
-		logger.Print(tag, "检测到账号未登录")
-		return CommentResult{Status: "not_logged_in", ErrorInfo: "账号未登录"}, errors.New("账号未登录")
+	// 2. 登录态检测：URL 重定向到登录页 或 页面出现登录文案
+	if loggedOut, reason := checkLoggedOut(ctx); loggedOut {
+		logger.Print(tag, "检测到账号未登录: "+reason)
+		return CommentResult{Status: "not_logged_in", ErrorInfo: "账号未登录: " + reason}, errors.New("账号未登录: " + reason)
 	}
 
 	// 3. 等待主贴出现

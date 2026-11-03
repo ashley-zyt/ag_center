@@ -33,6 +33,7 @@ import (
 	"minimax_pro/internal/platform/tiktok"
 	"minimax_pro/internal/platform/twitter"
 	"minimax_pro/internal/platform/youtube"
+	"minimax_pro/internal/screenshot"
 	"minimax_pro/internal/undetectable"
 
 	"github.com/chromedp/chromedp"
@@ -89,8 +90,8 @@ type AccountCheckResponse struct {
 }
 
 const (
-	accountListURL      = "http://47.89.235.227:3366/api/v1/check/accounts"
-	accountUpdateURL    = "http://47.89.235.227:3366/api/v1/check/update_account_status"
+	accountListURL      = "https://agweb.juzhiic.com/api/v1/check/accounts"
+	accountUpdateURL    = "https://agweb.juzhiic.com/api/v1/check/update_account_status"
 	accountCheckUA      = "Apifox/1.0.0 (https://apifox.com)"
 	accountDefaultHost  = "127.0.0.1"
 	accountDefaultPort  = 25325
@@ -101,17 +102,23 @@ const (
 	// overridden per-request via the FetchPostsRequest.UpdateAPIURL field or
 	// via the POSTS_UPDATE_API_URL environment variable. When empty, the
 	// update call is skipped and only logged.
-	accountPostsUpdateURL = "http://47.89.235.227:3366/api/v1/post_stats"
+	accountPostsUpdateURL = "https://agweb.juzhiic.com/api/v1/post_stats"
 
 	// accountStatsUpdateURL is the endpoint that receives batch account
 	// statistics (followers, total posts) after post scraping completes.
 	// Can be overridden via ACCOUNT_STATS_UPDATE_API_URL environment variable.
-	accountStatsUpdateURL = "http://47.89.235.227:3366/api/v1/account_stats/batch_update"
+	accountStatsUpdateURL = "https://agweb.juzhiic.com/api/v1/account_stats/batch_update"
+
+	// 香港 bucket 中转：杭州 OSS 下载失败时，让 account_sys 把视频迁移到香港 bucket
+	// （account-agic/timeout/，服务端内网 CopyObject，约 50s/文件），机器端改从香港下载
+	//（本机在香港，链路更稳），下载成功后立即删副本，避免双份存储费。
+	ossMigrateHKURL = "https://agweb.juzhiic.com/api/v1/oss/migrate_to_hk"
+	ossRemoveHKURL  = "https://agweb.juzhiic.com/api/v1/oss/remove_from_hk"
 )
 
 // publishTimeout 发布等长流程使用独立 background context 时的超时上限，
 // 避免因客户端/nginx 超时断开导致 r.Context() 被取消而中断发布与收尾。
-const publishTimeout = 15 * time.Minute
+const publishTimeout = 30 * time.Minute
 
 // fetchStallTimeout 抓取流程的"页面停留超时"监控阈值。
 // Facebook 抓取需在同一页面连续滚动多次(导航+等待+滚动约 40s+)，30s 会误判卡住，故放宽到 90s。
@@ -178,16 +185,6 @@ func downloadVideoFromOss(ctx context.Context, logger *logx.Logger, ossURL strin
 		return "", fmt.Errorf("invalid oss_url: %w", err)
 	}
 
-	resp, err := http.Get(ossURL)
-	if err != nil {
-		return "", fmt.Errorf("download failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
-	}
-
 	ext := filepath.Ext(parsedURL.Path)
 	if ext == "" {
 		ext = ".mp4"
@@ -197,7 +194,71 @@ func downloadVideoFromOss(ctx context.Context, logger *logx.Logger, ossURL strin
 	if err := os.MkdirAll(videoDir, os.ModePerm); err != nil {
 		return "", fmt.Errorf("create video directory failed: %w", err)
 	}
+
+	// 自定义 http.Client：海外服务器直连国内 OSS 跨国际链路不稳，
+	// 放宽 TLS 握手超时并给足整体下载时间，配合下方重试降低失败率。
+	client := &http.Client{
+		Timeout: 25 * time.Minute,
+		Transport: &http.Transport{
+			TLSHandshakeTimeout: 20 * time.Second,
+		},
+	}
+
+	// 只下载一次，失败即失败（不重试）
+	localPath, err := downloadVideoOnce(ctx, logger, client, ossURL, videoDir, ext)
+	if err != nil {
+		// 兜底：让 account_sys 把视频迁移到香港 bucket（服务端内网 CopyObject），
+		// 机器端在本机（香港机房）改从香港下载，绕开杭州跨境慢速链路。
+		logger.Print("DL", "杭州 OSS 下载失败，尝试迁移到香港 bucket 后重下: "+err.Error())
+		hkURL, migErr := migrateVideoToHK(ctx, logger, ossURL)
+		if migErr != nil {
+			return "", fmt.Errorf("%v; 迁移香港 bucket 失败: %v", err, migErr)
+		}
+		localPath, err = downloadVideoOnce(ctx, logger, client, hkURL, videoDir, ext)
+		if err != nil {
+			return "", fmt.Errorf("香港 bucket 下载失败: %w", err)
+		}
+		// 副本只服务于下载，本地落地后立即删（幂等，best effort）
+		removeVideoFromHK(logger, hkURL)
+	}
+	logger.Print("DL", "视频下载完成: "+localPath)
+	// 下载后统一检测编码，非 H.264+AAC 则转码，避免各平台上传报 "could not be read by your browser"
+	return transcodeIfNeeded(ctx, logger, localPath), nil
+}
+
+// downloadVideoOnce 单次下载视频到本地文件。优先 aria2c（多线程）→ curl.exe → Go http.Client。
+func downloadVideoOnce(ctx context.Context, logger *logx.Logger, client *http.Client, ossURL, videoDir, ext string) (string, error) {
 	localPath := filepath.Join(videoDir, fmt.Sprintf("video_%d%s", time.Now().UnixNano(), ext))
+
+	// 优先 aria2c：多线程分段下载，跨境高延迟链路上吞吐远高于单连接；未安装时自动跳过。
+	if err := downloadWithAria2(ctx, ossURL, localPath); err == nil {
+		return localPath, nil
+	} else {
+		logger.Print("DL", "aria2c 下载失败，回退 curl: "+err.Error())
+	}
+
+	// 回退 curl.exe：Windows 自带、免费，自带 --retry/--retry-connrefused 自动重试，
+	// 对 TLS 握手超时 / 连接被重置等瞬态传输错误比 Go 手动重试更稳。
+	if err := downloadWithCurl(ctx, ossURL, localPath); err == nil {
+		return localPath, nil
+	} else {
+		logger.Print("DL", "curl 下载失败，回退 Go 客户端: "+err.Error())
+	}
+
+	// 回退：Go http.Client 下载
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ossURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
+	}
 
 	out, err := os.Create(localPath)
 	if err != nil {
@@ -205,16 +266,159 @@ func downloadVideoFromOss(ctx context.Context, logger *logx.Logger, ossURL strin
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, resp.Body)
-	if err != nil {
+	if _, err := io.Copy(out, resp.Body); err != nil {
 		_ = os.Remove(localPath)
 		return "", fmt.Errorf("save file failed: %w", err)
 	}
-
-	logger.Print("DL", "视频下载完成: "+localPath)
-	// 下载后统一检测编码，非 H.264+AAC 则转码，避免各平台上传报 "could not be read by your browser"
-	localPath = transcodeIfNeeded(ctx, logger, localPath)
 	return localPath, nil
+}
+
+// migrateVideoToHK 调 account_sys 把源 OSS 视频同步迁移到香港 bucket（account-agic/timeout/），
+// 返回香港签名 URL（有效期 1 天）。服务端 CopyObject 约 50s/文件，超时给足 120s。
+// 接口幂等：香港已存在同名对象时直接返回签名 URL，不重复迁移。
+func migrateVideoToHK(ctx context.Context, logger *logx.Logger, ossURL string) (string, error) {
+	form := url.Values{"url": {ossURL}}
+	migCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(migCtx, http.MethodPost, ossMigrateHKURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+		Data    struct {
+			URL string `json:"url"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("解析迁移响应失败: %w", err)
+	}
+	if result.Type != "success" || result.Data.URL == "" {
+		return "", fmt.Errorf("%s", result.Message)
+	}
+	logger.Print("DL", "视频已迁移到香港 bucket: "+result.Data.URL)
+	return result.Data.URL, nil
+}
+
+// removeVideoFromHK 删除香港 bucket 中的视频副本（接口幂等）。
+// best effort：失败仅记日志不重试，漏删的副本靠 account_sys 侧生命周期/手工清理兜底。
+func removeVideoFromHK(logger *logx.Logger, hkURL string) {
+	form := url.Values{"url": {hkURL}}
+	rmCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(rmCtx, http.MethodPost, ossRemoveHKURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		logger.Print("DL", "构造删除香港副本请求失败: "+err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logger.Print("DL", "删除香港副本请求失败（漏删无害）: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || result.Type != "success" {
+		logger.Print("DL", "删除香港副本返回异常（漏删无害）: "+result.Message)
+		return
+	}
+	logger.Print("DL", "香港副本已删除")
+}
+
+// findAria2c 查找 aria2c 可执行文件：优先 PATH，找不到再兜底常见安装目录。
+func findAria2c() string {
+	if p, err := exec.LookPath("aria2c"); err == nil {
+		return p
+	}
+	candidates := []string{
+		`C:\aria2\aria2c.exe`,
+		`C:\ProgramData\chocolatey\bin\aria2c.exe`,
+		filepath.Join(os.Getenv("ProgramFiles"), "aria2", "aria2c.exe"),
+		filepath.Join(os.Getenv("ProgramFiles(x86)"), "aria2", "aria2c.exe"),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
+// downloadWithAria2 用 aria2c 多线程下载视频到 localPath。
+// aria2c 未安装时返回错误（调用方回退 curl / Go）。
+func downloadWithAria2(ctx context.Context, ossURL, localPath string) error {
+	aria2c := findAria2c()
+	if aria2c == "" {
+		return fmt.Errorf("aria2c 未找到（未安装），跳过")
+	}
+	dir := filepath.Dir(localPath)
+	name := filepath.Base(localPath)
+	cmd := exec.CommandContext(ctx, aria2c,
+		"-x", "16", // 每个服务器最大连接数
+		"-s", "16", // 分片数
+		"-k", "1M", // 每片最小 1MB
+		"--file-allocation=none",     // 不预分配磁盘，避免慢
+		"--allow-overwrite=true",     // 覆盖已存在文件
+		"--auto-file-renaming=false", // 不自动改名
+		"--max-tries=5",              // 重试 5 次
+		"--retry-wait=2",             // 重试间隔 2 秒
+		"--connect-timeout=20",       // 连接超时 20 秒
+		"--timeout=60",               // 单次超时 60 秒
+		"--console-log-level=error",  // 只输出错误
+		"--summary-interval=0",       // 不输出下载进度
+		"-d", dir,
+		"-o", name,
+		ossURL,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("aria2c 下载失败: %w; %s", err, string(output))
+	}
+	if fi, statErr := os.Stat(localPath); statErr != nil || fi.Size() == 0 {
+		_ = os.Remove(localPath)
+		return fmt.Errorf("aria2c 下载失败: 文件为空")
+	}
+	return nil
+}
+
+// downloadWithCurl 用系统 curl.exe 下载视频到 localPath。
+func downloadWithCurl(ctx context.Context, ossURL, localPath string) error {
+	cmd := exec.CommandContext(ctx, "curl.exe",
+		"-L",           // 跟随重定向
+		"--retry", "5", // 失败重试 5 次
+		"--retry-delay", "2", // 重试间隔 2 秒
+		"--retry-connrefused",     // 连接被拒绝也重试（兼容旧版 curl，7.52+；不用 --retry-all-errors，那是 7.71+ 才有）
+		"--connect-timeout", "20", // 连接超时 20 秒
+		"--speed-time", "60", // 60 秒内速度低于 speed-limit 判定停滞
+		"--speed-limit", "100", // 最低 100B/s（几乎完全停滞才中止，避免慢速海外链路被误判）
+		"-sS", // 静默，出错打印
+		"-o", localPath,
+		ossURL,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("curl 下载失败: %w; %s", err, string(output))
+	}
+	if fi, statErr := os.Stat(localPath); statErr != nil || fi.Size() == 0 {
+		_ = os.Remove(localPath)
+		return fmt.Errorf("curl 下载失败: 文件为空")
+	}
+	return nil
 }
 
 // findTool 查找 ffmpeg/ffprobe 可执行文件，优先 PATH，找不到再兜底常见安装目录。
@@ -885,7 +1089,7 @@ func isProfileLocked(errMsg string) bool {
 var (
 	undetectableStartMu       sync.Mutex
 	undetectableStartAt       time.Time
-	undetectableStartCooldown = 15 * time.Second
+	undetectableStartCooldown = 60 * time.Second // 启动后 1 分钟内不重复拉起，给 Undetectable 自动登录留时间
 )
 
 // Undetectable 不可用熔断：主程序没启动/崩溃时，短时间内所有任务快速失败，
@@ -1012,7 +1216,7 @@ func tryStartUndetectable(ctx context.Context, logger *logx.Logger, path string)
 	defer undetectableStartMu.Unlock()
 
 	if !undetectableStartAt.IsZero() && time.Since(undetectableStartAt) < undetectableStartCooldown {
-		logger.Print("BOOT", "距上次启动 Undetectable 不足 15 秒，跳过重复启动，等待其自愈")
+		logger.Print("BOOT", "距上次启动 Undetectable 不足 1 分钟，跳过重复启动，等待其自动登录")
 		return nil
 	}
 	undetectableStartAt = time.Now()
@@ -1455,6 +1659,9 @@ func executeFetchPosts(ctx context.Context, logger *logx.Logger, req FetchPostsR
 		cancelStall()
 		cancelFetch()
 
+		// 报错截图：单个账号采集失败时，在该账号标签页还活着时截下当前页面。
+		screenshot.CaptureIfError(tabCtx, bgCtx, logger, "fetch_"+acc.Platform, startRes.Info.WebsocketLink, fetchErr != nil)
+
 		if fetchErr != nil {
 			if watcher.Stalled() {
 				res.StalledURL = watcher.URL()
@@ -1698,6 +1905,9 @@ func handleSendSingleMessage(logger *logx.Logger) http.HandlerFunc {
 			}
 			sendRes.ErrorInfo = scraper.SanitizeString(sendRes.ErrorInfo)
 
+			// 报错截图：私信失败时在浏览器还活着时截下当前页面。
+			screenshot.CaptureIfError(browserCtx, bgCtx, logger, "send_message_"+req.Platform, startRes.Info.WebsocketLink, sendErr != nil)
+
 			stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID, startRes.Info.WebsocketLink)
 
 			var outcome *message.SendOutcome
@@ -1862,6 +2072,9 @@ func handleCheckReply(logger *logx.Logger) http.HandlerFunc {
 				SinceIncomingCount: req.SinceIncomingCount,
 			})
 
+			// 报错截图：判断回复失败时在浏览器还活着时截下当前页面。
+			screenshot.CaptureIfError(browserCtx, bgCtx, logger, "check_reply_"+req.Platform, startRes.Info.WebsocketLink, checkErr != nil)
+
 			stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID, startRes.Info.WebsocketLink)
 
 			for i := range checkRes.Replies {
@@ -2016,6 +2229,9 @@ func executeComment(ctx context.Context, logger *logx.Logger, req CommentRequest
 	commentCtx, cancelComment := context.WithTimeout(browserCtx, 5*time.Minute)
 	defer cancelComment()
 	commentRes, commentErr := commentByPlatform(commentCtx, logger, req.Platform, req.TargetURL, req.CommentContent)
+
+	// 报错截图：评论失败时在浏览器还活着时截下当前页面。
+	screenshot.CaptureIfError(browserCtx, bgCtx, logger, "twitter_comment", startRes.Info.WebsocketLink, commentErr != nil)
 
 	stopProfileWithCleanup(bgCtx, logger, browserCtx, startRes.Host, startRes.Port, startRes.ProfileID, startRes.Info.WebsocketLink)
 
@@ -2294,6 +2510,9 @@ func main() {
 				WaitSeconds:      req.WaitSeconds,
 				UndetectablePath: req.UndetectablePath,
 			})
+
+			// 报错截图：养号失败时在浏览器还活着时截下当前页面。
+			screenshot.CaptureIfError(browserCtx, bgCtx, logger, "nurture_"+req.Platform, res.Info.WebsocketLink, nurtureErr != nil)
 
 			// 6. 关闭浏览器 + 释放占用
 			stopProfileWithCleanup(bgCtx, logger, browserCtx, res.Host, res.Port, res.ProfileID, res.Info.WebsocketLink)
@@ -2708,10 +2927,11 @@ func main() {
 
 	mux.HandleFunc("/api/browser/locked", chrome.GetLockedProfilesHandler(logger, "127.0.0.1", 25325))
 
-	// 调试/运维：查询所有 profile 状态 + 单独停止/解锁指定 profile
+	// 调试/运维：查询所有 profile 状态 + 单独停止/解锁指定 profile + 查询代理列表
 	mux.HandleFunc("/api/browser/profiles", chrome.ListAllProfilesHandler(logger, "127.0.0.1", 25325))
 	mux.HandleFunc("/api/browser/stop", chrome.StopProfileHandler(logger, "127.0.0.1", 25325))
 	mux.HandleFunc("/api/browser/unlock", chrome.UnlockProfileHandler(logger, "127.0.0.1", 25325))
+	mux.HandleFunc("/api/browser/proxies", chrome.ProxiesHandler(logger, "127.0.0.1", 25325))
 
 	// 鉴权：API Key 认证 + HMAC-SHA256 请求签名，保护所有发布/消息/账号接口。
 	authCfg, err := auth.LoadConfig()

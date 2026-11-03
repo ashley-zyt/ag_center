@@ -15,6 +15,7 @@ import (
 
 	"minimax_pro/internal/config"
 	"minimax_pro/internal/logx"
+	"minimax_pro/internal/screenshot"
 )
 
 // ===== 全局并发控制 =====
@@ -58,6 +59,31 @@ var (
 	clearedTasks  = make(map[string]bool)
 	taskRecordsMu sync.Mutex
 )
+
+// taskShots 记录每个任务"报错截图"的 OSS URL（taskID -> url）。
+// 截图在各执行链的报错点产生，最终由 finalizeAsyncTask 取出塞进回调 payload。
+var (
+	taskShots   = make(map[string]string)
+	taskShotsMu sync.Mutex
+)
+
+func setTaskShot(taskID, url string) {
+	if taskID == "" || url == "" {
+		return
+	}
+	taskShotsMu.Lock()
+	taskShots[taskID] = url
+	taskShotsMu.Unlock()
+}
+
+// takeTaskShot 取出并删除指定任务的截图 URL。
+func takeTaskShot(taskID string) string {
+	taskShotsMu.Lock()
+	defer taskShotsMu.Unlock()
+	url := taskShots[taskID]
+	delete(taskShots, taskID)
+	return url
+}
 
 const (
 	taskStatusQueued  = "queued"
@@ -115,6 +141,9 @@ func newTaskID() string {
 func registerTask(taskType, profileName, ref, batch string, batchTotal int, payload string, notify *DingtalkNotify) (string, context.Context) {
 	taskID := newTaskID()
 	ctx, cancel := context.WithCancel(context.Background())
+	// 注入报错截图回调：任务执行链上任何"报错截图"都会通过它把 OSS URL 记到本 taskID 名下，
+	// 供 finalizeAsyncTask 在回调 account_sys 时一并带出。
+	ctx = screenshot.WithShotSink(ctx, func(url string) { setTaskShot(taskID, url) })
 	now := time.Now()
 
 	var webhook, keyword, owner string
@@ -272,17 +301,17 @@ func isRetryableBrowserError(msg string) bool {
 // ===== 任务结果回调 =====
 
 // taskResultURL 任务完成后的回调地址（已与 account_sys 确认）。
-const taskResultURL = "http://47.89.235.227:3366/api/v1/browser_tasks/result"
+const taskResultURL = "https://agweb.juzhiic.com/api/v1/browser_tasks/result"
 
 // machineRestartedURL 「机器重启上报」地址（与任务回调指向同一台 account_sys）。
 // 本机进程启动时上报一次，account_sys 收到后会立即重置本机丢失的异步任务，
 // 不必再等 check_timeout_tasks 的 45 分钟兜底窗口。
-const machineRestartedURL = "http://47.89.235.227:3366/api/v1/browser_tasks/machine_restarted"
+const machineRestartedURL = "https://agweb.juzhiic.com/api/v1/browser_tasks/machine_restarted"
 
 // commentTaskResultURL 评论任务完成后的回调地址（account_sys 评论专用接口）。
 // 与通用 browser_tasks/result 不同：评论任务走 /api/v1/comment_tasks/result，
 // 回传字段为 task_id(CommentTask 主键 id) + status + message。
-const commentTaskResultURL = "http://47.89.235.227:3366/api/v1/comment_tasks/result"
+const commentTaskResultURL = "https://agweb.juzhiic.com/api/v1/comment_tasks/result"
 
 // TaskResultPayload 任务完成回调的 payload。
 type TaskResultPayload struct {
@@ -297,9 +326,10 @@ type TaskResultPayload struct {
 
 // commentTaskResultPayload 评论任务完成回调的 payload（account_sys 评论专用接口）。
 type commentTaskResultPayload struct {
-	TaskID  string `json:"task_id"`           // CommentTask 主键 id
-	Status  string `json:"status"`            // success / failed
-	Message string `json:"message,omitempty"` // 失败原因
+	TaskID        string `json:"task_id"`                  // CommentTask 主键 id
+	Status        string `json:"status"`                   // success / failed
+	Message       string `json:"message,omitempty"`        // 失败原因
+	ScreenshotURL string `json:"screenshot_url,omitempty"` // 报错截图 OSS URL（可选）
 }
 
 // extractCommentTaskID 从 ref 解析 CommentTask 主键 id。
@@ -331,10 +361,19 @@ func finalizeAsyncTask(logger *logx.Logger, taskID, taskType, profileName, ref, 
 	}
 	finishTask(taskID, finalStatus, info)
 
-	// 评论任务走 account_sys 评论专用回传接口（task_id=CommentTask 主键 id + status + message）；
+	// 取出本任务报错截图 URL（若有）。
+	shotURL := takeTaskShot(taskID)
+	// 截图 URL 按 account_sys 契约放在 result 字段里（仅失败任务携带）：
+	// 失败时 result = {"screenshot_url": "..."}，成功任务 result 保持原有内容。
+	if status != "success" && shotURL != "" {
+		result = map[string]string{"screenshot_url": shotURL}
+	}
+
+	// 评论任务走 account_sys 评论专用回传接口（task_id=CommentTask 主键 id + status + message，
+	// 截图 URL 走顶层 screenshot_url，因为该接口无 result 字段）；
 	// 其余任务走通用 browser_tasks/result 接口。
 	if taskType == "twitter_comment" {
-		callbackCommentTaskResult(context.Background(), logger, taskID, ref, status, info)
+		callbackCommentTaskResult(context.Background(), logger, taskID, ref, status, info, shotURL)
 	} else {
 		callbackTaskResult(context.Background(), logger, TaskResultPayload{
 			TaskID:      taskID,
@@ -387,8 +426,8 @@ func callbackTaskResult(ctx context.Context, logger *logx.Logger, payload TaskRe
 }
 
 // callbackCommentTaskResult 评论任务完成后回调 account_sys 评论专用接口。
-// 回传 task_id(从 ref 解析 CommentTask 主键 id) + status + message（Best Effort：失败仅打日志）。
-func callbackCommentTaskResult(ctx context.Context, logger *logx.Logger, taskID, ref, status, message string) {
+// 回传 task_id(从 ref 解析 CommentTask 主键 id) + status + message + screenshot_url（Best Effort：失败仅打日志）。
+func callbackCommentTaskResult(ctx context.Context, logger *logx.Logger, taskID, ref, status, message, shotURL string) {
 	if commentTaskResultURL == "" {
 		return
 	}
@@ -403,7 +442,7 @@ func callbackCommentTaskResult(ctx context.Context, logger *logx.Logger, taskID,
 		return
 	}
 
-	payload := commentTaskResultPayload{TaskID: commentTaskID, Status: status, Message: message}
+	payload := commentTaskResultPayload{TaskID: commentTaskID, Status: status, Message: message, ScreenshotURL: shotURL}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		logger.Print("TASK_CB", "序列化评论任务回调失败: "+err.Error())

@@ -58,9 +58,15 @@ var (
 	undetectableAlertKeyword  = ""
 	undetectableAlertCooldown = 10 * time.Minute
 
+	// 钉钉告警静默窗口：晚上 10 点到早上 9 点之间不发送，
+	// 若异常持续到早上 9 点仍未恢复，则在退出静默窗口后补发一条。
+	undetectableAlertSilentStart = 22
+	undetectableAlertSilentEnd   = 9
+
 	undetectableAlertMu sync.Mutex
 	lastAlertState      undetectableState
 	lastAlertAt         time.Time
+	pendingSilentAlert  bool // 静默窗口期间有异常待通知
 )
 
 func init() {
@@ -75,6 +81,12 @@ func init() {
 	}
 	if n := config.GetInt("UNDETECTABLE_ALERT_COOLDOWN", 0); n > 0 {
 		undetectableAlertCooldown = time.Duration(n) * time.Second
+	}
+	if n := config.GetInt("UNDETECTABLE_ALERT_SILENT_START", 0); n >= 0 && n <= 23 {
+		undetectableAlertSilentStart = n
+	}
+	if n := config.GetInt("UNDETECTABLE_ALERT_SILENT_END", 0); n >= 0 && n <= 23 {
+		undetectableAlertSilentEnd = n
 	}
 }
 
@@ -204,9 +216,16 @@ func watchdogTick(logger *logx.Logger, cfg watchdogConfig) {
 	}
 }
 
+// inSilentWindow 判断当前时间是否处于钉钉告警静默窗口（默认晚上 22 点 ~ 早上 9 点）。
+func inSilentWindow(now time.Time) bool {
+	hour := now.Hour()
+	return hour >= undetectableAlertSilentStart || hour < undetectableAlertSilentEnd
+}
+
 // maybeAlertUndetectable 根据状态变化发送钉钉告警（配了 UNDETECTABLE_ALERT_WEBHOOK 才发）。
 // 防轰炸：状态从 normal 变异常立即告警；异常持续期间按冷却期（默认 10 分钟）最多告警一次；
 // 状态恢复 normal 时发一条「已恢复」。
+// 静默窗口：晚上 10 点 ~ 早上 9 点不发送；若异常持续到早上 9 点仍未恢复，退出静默窗口后补发一条。
 func maybeAlertUndetectable(logger *logx.Logger, state undetectableState) {
 	if undetectableAlertWebhook == "" {
 		return // 未配置告警 webhook，静默
@@ -216,32 +235,56 @@ func maybeAlertUndetectable(logger *logx.Logger, state undetectableState) {
 	defer undetectableAlertMu.Unlock()
 
 	now := time.Now()
+	silent := inSilentWindow(now)
 
 	if state == stateNormal {
-		// 从异常恢复：发恢复通知并重置追踪
-		if lastAlertState != stateUnknown && lastAlertState != stateNormal {
-			lastAlertState = stateNormal
-			lastAlertAt = now
+		// 从异常恢复：重置追踪（恢复通知同样受静默窗口约束）
+		wasAbnormal := lastAlertState != stateUnknown && lastAlertState != stateNormal
+		pendingSilentAlert = false
+		lastAlertState = stateNormal
+		lastAlertAt = now
+		if wasAbnormal && !silent {
 			go sendUndetectableAlert(logger, stateNormal, "Undetectable 已恢复正常")
 		}
 		return
 	}
 
-	// 异常状态：状态变化立即告警，持续异常按冷却期告警
+	// 异常状态
+	if silent {
+		// 静默窗口：不发送，仅标记「有异常待通知」
+		pendingSilentAlert = true
+		lastAlertState = state
+		return
+	}
+
+	// 退出静默窗口后，若静默期间有异常仍未恢复，补发一条
+	if pendingSilentAlert {
+		pendingSilentAlert = false
+		lastAlertState = state
+		lastAlertAt = now
+		go sendUndetectableAlert(logger, state, alertDetail(state))
+		return
+	}
+
+	// 正常告警：状态变化立即告警，持续异常按冷却期告警
 	if state == lastAlertState && now.Sub(lastAlertAt) < undetectableAlertCooldown {
 		return
 	}
 	lastAlertState = state
 	lastAlertAt = now
+	go sendUndetectableAlert(logger, state, alertDetail(state))
+}
 
-	detail := ""
+// alertDetail 返回状态对应的告警详情文案。
+func alertDetail(state undetectableState) string {
 	switch state {
 	case stateNotLoggedIn:
-		detail = "主程序进程存在但本地 API 不可用（疑似未登录或进程残留），已尝试自动重启，若仍异常请人工登录"
+		return "主程序进程存在但本地 API 不可用（疑似未登录或进程残留），已尝试自动重启，若仍异常请人工登录"
 	case stateNotRunning:
-		detail = "主程序未运行或已卡退"
+		return "主程序未运行或已卡退"
+	default:
+		return ""
 	}
-	go sendUndetectableAlert(logger, state, detail)
 }
 
 // sendUndetectableAlert 发送一条 Undetectable 状态告警到钉钉（Best Effort）。

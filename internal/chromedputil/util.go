@@ -2,6 +2,7 @@ package chromedputil
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -36,6 +37,51 @@ func pageTargets(ctx context.Context) ([]*target.Info, error) {
 		}
 	}
 	return pages, nil
+}
+
+// PageLoggedOut 检测当前页面是否已退出登录。
+// urlKeywords: 当前 URL 包含任一关键词即判定退出登录
+// textKeywords: 页面正文包含任一关键词即判定退出登录（忽略大小写）
+// 返回 (loggedOut bool, reason string)。
+func PageLoggedOut(ctx context.Context, urlKeywords, textKeywords []string) (bool, string) {
+	// 1. URL 检测
+	if len(urlKeywords) > 0 {
+		var loc string
+		if err := chromedp.Run(ctx, chromedp.Location(&loc)); err == nil {
+			for _, k := range urlKeywords {
+				if strings.Contains(loc, k) {
+					return true, "URL包含 " + k
+				}
+			}
+		}
+	}
+
+	// 2. 页面文案检测（JS 一次性匹配所有关键词，忽略大小写）
+	if len(textKeywords) > 0 {
+		normalized := make([]string, 0, len(textKeywords))
+		for _, k := range textKeywords {
+			normalized = append(normalized, strings.ToLower(strings.TrimSpace(k)))
+		}
+		kb, err := json.Marshal(normalized)
+		if err == nil {
+			js := fmt.Sprintf(`(function(){
+				var t=document.body?(document.body.innerText||""):"";
+				t=t.toLowerCase();
+				t=t.replace(/\u2019/g,"'").replace(/\u2018/g,"'");
+				var kws=%s;
+				for(var i=0;i<kws.length;i++){
+					if(kws[i] && t.indexOf(kws[i])>=0){return kws[i];}
+				}
+				return "";
+			})()`, string(kb))
+			var matched string
+			if err := chromedp.Run(ctx, chromedp.Evaluate(js, &matched)); err == nil && matched != "" {
+				return true, "页面包含 " + matched
+			}
+		}
+	}
+
+	return false, ""
 }
 
 // browserExecutor 从 chromedp context 中取出 browser executor, 用于执行浏览器级 CDP 命令。
